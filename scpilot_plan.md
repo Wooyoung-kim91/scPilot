@@ -433,8 +433,14 @@ B1~B7엔 장시간 도구 없음, scVI 실측 후 설계(과설계 회피). `lon
       evidence는 `.uns["scpilot_annotation"]["tier1"]`. grade A. 검증: fixture 4 tests + **실데이터(9k): 라벨분포 타당,
       mean_conf 0.858, circular_risk 27/35 정확 플래그**. **→ benchmark `label_key`=major_cell_type 확보.**
       (celltypist/quick-Harmony 추가 consensus 소스는 선택 — anchor는 marker score로 충분히 검증됨.)
-- [ ] **B9. `core/integrate.py`** — ⛔**선행 하드게이트: ToolSpec 잡 생명주기(start/get_job_status/get_job_result/
-      cancel_job) 확장 + 디리스크③ scVI CPU 타이밍 스파이크**(첫 장시간 도구 — 실측 후 설계, 과설계 회피).
+- [x] **B9. `core/integrate.py`** — ✅**완료(2026-06-10)**: `integrate_scvi`(**사전학습 모델 LOAD + get_latent, 학습 X →
+      grade A·동기·잡모델 불필요**; 기본 `~/data/scpilot_run/models/scvi_GSM`, scvi 1.4.2 일치, n_latent 30) +
+      `integrate_harmony`(harmonypy 직접호출 + `np.asarray(Z_corr).T` 우회). **카테고리 게이트**: 모델이 아는 batch(GSM 31개)
+      외 샘플 있으면 data_gate_failed(비-PDAC 거부). 검증: fixture 5 tests + 실데이터(integrate_scvi→cluster(X_scVI)→
+      X_scVI/X_umap_scvi/leiden_scvi 보존). 모델 scpilot_run/models로 vendoring. scVI>Harmony(벤치마크 확인).
+      ⏳**B9b(후속, 별도게이트)**: 사전모델 없는 데이터용 scVI **학습** + ToolSpec 잡 생명주기 + 디리스크③ CPU 타이밍 —
+      이 PDAC 데이터엔 학습 불필요라 디리스크③ 무의미.
+      (구 항목) `harmony_integrate` + `scvi.model.SCVI(accelerator="cpu")` **잡 모델**. 검증(서브샘플): 임베딩·CPU 시간/peak-mem·fallback.
       `harmony_integrate` + `scvi.model.SCVI(accelerator="cpu")` **잡 모델**. 검증(서브샘플): 임베딩·CPU 시간/peak-mem·fallback.
       ⚠️**harmony API(PoC 발견)**: scanpy 1.11.5의 `sc.external.pp.harmony_integrate`는 harmonypy 0.2.0 **torch 출력과 비호환**
       (`Z_corr.T` shape 오류), `sc.pp.harmony_integrate`(native harmony2)는 1.11.5에 **없음** → **`harmonypy.run_harmony` 직접

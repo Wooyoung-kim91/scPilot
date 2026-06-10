@@ -59,7 +59,7 @@ def _ensure_loaded() -> None:
         return
     _LOADED = True
     from scpilot.core import (io, state, qc, preprocess, cluster,  # noqa: F401
-                              markers, plots, annotate)
+                              markers, plots, annotate, integrate)
 
 
 def get(name: str) -> ToolSpec:
