@@ -404,12 +404,20 @@ B1~B7엔 장시간 도구 없음, scVI 실측 후 설계(과설계 회피). `lon
       **batch-aware 분포 요약**(global + per-sample 표)) + `qc_filter`(min_genes/max_pct_mt/max_doublet 컷오프·per-sample
       kept/removed). 둘 다 mutating·checkpoint. 검증: fixture 5 tests + 실데이터 서브샘플(35 samples). scqc 원본 미수정.
       (ambient RNA는 raw droplet 필요 — 추후.)
-- [ ] **B4. `core/preprocess.py`** — normalize/log1p/HVG(seurat_v3, **counts·scikit-misc preflight 게이트**,
-      batch-aware)/scale/PCA → 분산설명비·HVG 후보 요약.
-- [ ] **B5. `core/plots.py` (scqc `plotting.py` 베다링)** — vendored auto-fit figure 하네스 위에 umap/qc/violin/dotplot →
-      PNG(절대경로+메타). (annotation dotplot에 선행 필요.)
-- [ ] **B6. `core/cluster.py`** — neighbors → leiden(igraph) → umap. 검증: **구조 불변식**(키/shape/클러스터수 허용오차).
-- [ ] **B7. `core/markers.py`** — `rank_genes_groups` → 클러스터별 **pos/neg marker + 크기 + sample 분포** 표.
+- [x] **B4. `core/preprocess.py`** — ✅**완료(2026-06-10)**: `preprocess` — counts에서 시작 normalize/log1p(+lognorm 레이어)
+      /HVG(seurat_v3, batch-aware, counts·skmisc)/PCA(mask_var=HVG, 대용량 scale 회피) → variance_ratio·n_hvg·elbow 제안 요약.
+      counts 불변·x_state=log1p 기록. invalid_state 게이트(counts 없으면). grade B(PCA). 검증: chain 테스트.
+- [ ] **B5. `core/plots.py` (scqc `plotting.py` 베다링)** — vendored `fit_and_save` auto-fit 하네스 위에
+      umap/qc/violin/dotplot/pca → PNG(절대경로+메타). **plot 스타일 정책(사용자 확정 2026-06-10)**:
+      ① 각 패키지 튜토리얼 스타일 그대로 — scanpy는 `sc.pl.*`, scib는 scib 자체 plotter, 나머지도 자기 plot 도구를 빌더로
+      → 같은 `fit_and_save`에 태워 **동일 로직 공유**. ② 저장 크기 = 컬럼 단위 **min 0.5×0.5, max는 방향유연
+      {1×1.5(세로)·1.5×1(가로)·1×1} — 양쪽 동시 >1 금지**(현 vendored 기본 h≤1.0을 이 제약으로 조정). ③ 잘림 발생 시
+      축·텍스트·레전드·제목을 **능동 조절**(knob ladder)해 저장 크기 안에서 미리 layout한 figure처럼 구분 가능하게,
+      고정 캔버스 저장(`bbox_inches='tight'` 미사용), 불만족 시 warning. 메타(가로/세로/dpi)는 `Artifact`로.
+- [x] **B6. `core/cluster.py`** — ✅**완료(2026-06-10)**: `cluster` — neighbors→leiden(igraph)→umap on `use_rep`
+      (X_pca 기본, 통합 임베딩도 동일 도구). cluster 수/크기 반환, invalid_state 게이트(임베딩 없으면). grade B. 검증: 구조 불변식.
+- [x] **B7. `core/markers.py`** — ✅**완료(2026-06-10)**: `markers` — rank_genes_groups(Wilcoxon, lognorm 레이어) →
+      클러스터별 top marker 표(미리보기) + 크기 + **sample 분포(단일환자 지배 클러스터 플래그)** + 전체 랭킹 CSV artifact. grade A.
 - [ ] **B8. `core/annotate.py` (Tier 1 broad, consensus)** — unintegrated marker + celltypist + quick-Harmony 라벨의
       **agreement/confidence** 산출 → `obs["major_cell_type"]`(unknown 허용, Epithelial/T·NK/B·Plasma/Myeloid/Stromal/
       Endothelial/Mast/Mixed-Artifact). marker 충돌 검출. circular-risk 플래그. **→ benchmark `label_key` 확보.**
