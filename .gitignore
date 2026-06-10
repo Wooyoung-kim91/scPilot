@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# 가상환경
+.venv/
+venv/
+
+# 대용량 데이터 / 분석 산출물 (git에 넣지 않음)
+*.h5ad
+*.h5
+*.loom
+sessions/
+*.png
+*.csv
+
+# OS / 에디터
+.DS_Store
