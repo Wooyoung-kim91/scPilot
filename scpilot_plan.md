@@ -422,9 +422,12 @@ B1~B7엔 장시간 도구 없음, scVI 실측 후 설계(과설계 회피). `lon
       (X_pca 기본, 통합 임베딩도 동일 도구). cluster 수/크기 반환, invalid_state 게이트(임베딩 없으면). grade B. 검증: 구조 불변식.
 - [x] **B7. `core/markers.py`** — ✅**완료(2026-06-10)**: `markers` — rank_genes_groups(Wilcoxon, lognorm 레이어) →
       클러스터별 top marker 표(미리보기) + 크기 + **sample 분포(단일환자 지배 클러스터 플래그)** + 전체 랭킹 CSV artifact. grade A.
-- [ ] **B8. `core/annotate.py` (Tier 1 broad, consensus)** — unintegrated marker + celltypist + quick-Harmony 라벨의
-      **agreement/confidence** 산출 → `obs["major_cell_type"]`(unknown 허용, Epithelial/T·NK/B·Plasma/Myeloid/Stromal/
-      Endothelial/Mast/Mixed-Artifact). marker 충돌 검출. circular-risk 플래그. **→ benchmark `label_key` 확보.**
+- [x] **B8. `core/annotate.py` (Tier 1 broad)** — ✅**완료(2026-06-10, 디리스크① 반영)**: `annotate_broad` —
+      **per-cell marker score(배치무관 anchor, BROAD_MARKERS 패널)** → 클러스터 다수결 + confidence → `obs["major_cell_type"]`
+      (저신뢰=Mixed-Artifact) + `obs["major_confidence"]`. marker 충돌 + **단일-batch 지배 클러스터 circular-risk 플래그**,
+      evidence는 `.uns["scpilot_annotation"]["tier1"]`. grade A. 검증: fixture 4 tests + **실데이터(9k): 라벨분포 타당,
+      mean_conf 0.858, circular_risk 27/35 정확 플래그**. **→ benchmark `label_key`=major_cell_type 확보.**
+      (celltypist/quick-Harmony 추가 consensus 소스는 선택 — anchor는 marker score로 충분히 검증됨.)
 - [ ] **B9. `core/integrate.py`** — ⛔**선행 하드게이트: ToolSpec 잡 생명주기(start/get_job_status/get_job_result/
       cancel_job) 확장 + 디리스크③ scVI CPU 타이밍 스파이크**(첫 장시간 도구 — 실측 후 설계, 과설계 회피).
       `harmony_integrate` + `scvi.model.SCVI(accelerator="cpu")` **잡 모델**. 검증(서브샘플): 임베딩·CPU 시간/peak-mem·fallback.
