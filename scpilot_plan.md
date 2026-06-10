@@ -352,8 +352,11 @@ tool은 한 번에 하나씩 추가하고, **추가할 때마다 `scpilot step`(
       `r_available`(R+renv: Slingshot/Monocle3), celltypist/cytotrace 가용성. LLM은 플래그 false면 해당 도구 선택 불가.
 - [ ] **A3. `session.py` (온디스크 1급)** — `session_id`/manifest/이력로그/단계별 `.h5ad` 체크포인트 + file lock.
       인메모리는 캐시. AnnData provenance(`.uns["scpilot"]`)·불변식 헬퍼.
-- [ ] **A4. `schemas.py`** — 공통 구조화 결과(`status/summary/artifacts/checkpoint/warnings/error_code/...`) +
-      표 행수 제한·미리보기·artifact 경로 규약. 잡 모델 결과 스키마(시도/경과/peak-mem/fallback) 포함.
+- [x] **A4. `schemas.py`** — ✅**완료(2026-06-10, 동결)**: `ToolResult`(status/summary/tables/artifacts/checkpoint/
+      warnings/suggested_next_tools/**determinism_grade**/params/provenance/error_code/recoverable) + `Artifact`(절대경로+meta)
+      + `TablePreview`(행수 캡+full CSV 포인터) + 잡 스키마(`JobStatus`/`FallbackAttempt`) + `success()`/`error()`/
+      `artifact_csv/png()`/`table_preview()` 생성자 + `_sanitize`(numpy/NaN/Path→strict JSON). 표준 `ERROR_CODES`.
+      검증: `tests/test_schemas.py` 7 passed (JSON 직렬화·numpy/NaN 정화·표 캡·artifact 절대경로·잡 스키마).
 - [ ] **A5. `cli.py` 골격 + `step`** — Typer 엔트리포인트 + `step` 디스패치.
 - [ ] **A6. MCP 최소 서버 조기 도입** — `mcp_server.py`에 읽기전용 `inspect_h5ad` 1개 tool만 노출,
       **Claude Code + Codex 양쪽에서 stdio 호환 스파이크**(도구 인식·짧은 호출·긴 호출 취소·stderr 위생·재연결).
