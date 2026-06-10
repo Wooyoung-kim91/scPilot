@@ -295,14 +295,43 @@ activation/exhaustion/cycling/IFN state 점수 → trajectory → review. **line
 
 tool은 한 번에 하나씩 추가하고, **추가할 때마다 `scpilot step`(LLM 없이 결정론적)으로 검증** 후 다음으로 진행.
 각 core 함수는 AnnData를 받아 처리하고 **요약 dict** 를 반환한다는 계약을 공통으로 따른다.
+(체크 표기: `[ ]` 미착수 · `[~]` 부분 진행 · `[x]` 완료)
 
-> **최우선 디리스크 5 (Codex)**: ①scib `label_key`(Tier1 consensus) 유효성 ②잡 모델의 Claude Code+Codex MCP 동작
-> ③scVI CPU 서브샘플 실현성(benchmark 편입 전) ④CNV preflight·reference 선택(PDAC Tier2/3 전) ⑤run-log `decision`
-> 스키마 완전성(재귀/선택 도구 추가 전 동결). 위 순서로 먼저 검증.
+> **최우선 디리스크 5 (Codex)** — 현황(2026-06-10): ①scib `label_key`(Tier1 consensus) 유효성 ⏳**미검증(조기 PoC 필요)**
+> ②잡 모델의 Claude Code+Codex MCP 동작 ⏳**미검증(A6 스파이크)** ③scVI CPU 서브샘플 실현성 ⏳**미검증(조기 PoC)**
+> ④CNV preflight·reference 선택 ✅**설계+PoC 검증 완료**(B12-pre) ⑤run-log `decision` 스키마 완전성 ⏳**설계 미완(A7서 동결)**.
+> → ④를 PoC로 깬 방식 그대로 ①·③도 조기 PoC로 검증.
+
+### 진행 현황 + 재검토 (2026-06-10, 구현 착수 전 점검)
+
+**✅ 완료된 사전작업 (코드 구현 전 토대)**
+- env `scpilot` 생성(scRNAseq 복제) + 누락분 설치(scikit-misc/mcp/anthropic/celltypist/gtfparse/pybiomart). numpy 2.x 호환 검증.
+- proto `git init`(branch main). 계획서 전역 rename(scpilot). 메모리 기록(프로젝트·scqc자산·블로커).
+- **scqc_pipeline 연계 전략 확정**: upstream(io/qc/merge) 위임 + 하네스/io/plotting/metaschema **베다링**.
+- **디리스크 ④ CNV 좌표 주석 설계+PoC 검증 완료**(B12-pre): protein-coding 커버리지 89.8% 실측.
+
+**⏳ 남은 핵심 위험 (구현 중 조기 PoC/스파이크로 검증)**
+- ① **Tier1 consensus 라벨**(과학적으로 가장 미묘): cross-GSE 배치 파편화↔scib 과보정 순환참조. 실데이터 PoC로 검증.
+- ② **MCP 잡 모델**(Claude Code+Codex stdio start/poll/cancel): A6 스파이크로 조기 검증.
+- ③ **scVI CPU 타이밍**(180k셀): 서브샘플 runtime/peak-mem 실측.
+
+**🔧 열린 결정 2개 (착수 전/중 확정)**
+1. **scqc qc 확장 방식** — B3-ⓐ scrublet·batch-aware를 (a) 실제 scqc 수정→merged 재생성 vs (b) scpilot 후처리.
+   ⚠️ (a)는 "베다링=독립" 결정보다 결합이 큼 → 방식 명시 필요.
+2. **세션 모델** — MVP는 단일 `out_dir`(scqc식, 권장) vs 처음부터 멀티클라이언트 세션(A3). 멀티클라이언트는 **연기 권장**.
+
+**📐 착수 전 보완 필요(미명세)**
+- **재귀 레지스트리 ↔ 잡 모델 동거 설계**(C1 진짜 난점): 선형 `run_stage` 위에 compartment 재귀 + 장시간 잡을 어떻게 표현할지.
+- **테스트 fixture 고정**: PDAC ~2k셀 서브샘플을 1회 생성·고정 → 전 B단계 회귀 기준.
+- **annotation에 시간예산 집중**: B8(Tier1)·B13(Tier3)이 가치·난도 모두 최대. 프롬프트 추출(E1)은 그 후.
+
+**🎯 권장 빌드 순서(MVP 임계경로)**: A1 스캐폴딩+베다링+doctor → A6 MCP 스파이크(②) → A7 하네스+decision 동결(⑤)
+→ 조기 PoC(①·③) → B 도구 하나씩. **MVP 루프** = merged 진입→전처리→cluster→Tier1→Harmony→benchmark→최종cluster
+→Tier3→report를 **MCP로 끝까지 1회**. CNV/trajectory/scVI/DE·멀티클라이언트·E단계는 그 다음(과설계 회피).
 
 ### Phase A — 기반 + 위험 조기 검증 (LLM 무관)
-- [ ] **A1. 스캐폴딩** — `pyproject.toml`, 패키지 골격, 콘솔스크립트 `scpilot`,
-      env에 `mcp`/`anthropic`/`typer`/`scikit-misc`/`pytest` 설치.
+- [~] **A1. 스캐폴딩** — `pyproject.toml`, 패키지 골격, 콘솔스크립트 `scpilot`,
+      env에 `mcp`/`anthropic`/`typer`/`scikit-misc`/`pytest` 설치. ✅**의존성 설치 완료** / ⏳pyproject·골격·콘솔스크립트 미착수.
       **선택(Tier2/3·궤적)**: `celltypist`/`infercnvpy`/**`gtfparse`(infercnvpy GTF 좌표주석 필수 옵션의존 — 실측 확인)**/
       `scvelo`/`cellrank`/`palantir`/`cytotrace` + R(Slingshot/Monocle3) (있을 때만 도구 활성, `doctor`로 게이트).
       (현 scpilot env엔 celltypist·infercnvpy·gtfparse·pybiomart 설치 완료.)
@@ -352,7 +381,8 @@ tool은 한 번에 하나씩 추가하고, **추가할 때마다 `scpilot step`(
       를 Tier2/3 입력으로 고정(B6 재사용).
 - [ ] **B11. `core/compartment.py`** — **compartment 계획 tool**(실 카운트·coverage·marker, 임계 미달 분기 차단) +
       subset 재처리 **두 모드**(marker용 expression 재정규화·HVG / 클러스터링용 integration-aware) + batch-mixing 진단.
-- [ ] **B12-pre. `annotate_genomic_positions` (좌표 주석 — CNV의 필수 preflight 서브툴)** — 현 데이터 `var`엔 좌표가
+- [~] **B12-pre. `annotate_genomic_positions` (좌표 주석 — CNV의 필수 preflight 서브툴)** — ✅**설계+PoC 검증 완료**(아래),
+      ⏳tool 구현·step·MCP 노출 미착수. 현 데이터 `var`엔 좌표가
       없으므로(symbol만, `n_cells`뿐) CNV 전 반드시 수행. infercnvpy `genomic_position_from_gtf(gtf_gene_id="gene_name")`로
       `var[chromosome,start,end]` 채움. **설계 핵심**:
       - **좌표 소스**: 기본 = **고정 릴리스 GENCODE GRCh38 GTF 1회 다운로드 → sha256 content-addressed 캐시·재사용**
