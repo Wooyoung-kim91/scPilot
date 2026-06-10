@@ -23,8 +23,11 @@ Layout::
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import pprint
+import shutil
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -43,6 +46,55 @@ XState = Literal["raw_counts", "normalized", "log1p", "scaled", "unknown"]
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _pkg_dir() -> Path:
+    import scpilot
+    return Path(scpilot.__file__).resolve().parent
+
+
+def scpilot_source_hash() -> str:
+    """sha256 over all scpilot package .py source (stable, order-independent)."""
+    h = hashlib.sha256()
+    for p in sorted(_pkg_dir().rglob("*.py")):
+        h.update(p.relative_to(_pkg_dir()).as_posix().encode())
+        h.update(p.read_bytes())
+    return h.hexdigest()[:16]
+
+
+_REPRO_TEMPLATE = '''#!/usr/bin/env python
+"""Standalone reproduction of step `{stage}` (scpilot) — auto-written per checkpoint.
+
+Re-runs this one tool with its recorded params, starting from the recorded input
+state, against the pinned source snapshot. Provenance:
+{prov}
+
+Input  state : {input_cp}
+Output (orig): {output_cp}
+"""
+import sys
+from pathlib import Path
+
+# pin imports to the exact scpilot source used for the original artifact
+sys.path.insert(0, str(Path(__file__).resolve().parent / "{snapshot_rel}"))
+
+from scpilot import tools
+from scpilot.repro import set_global_seed
+from scpilot.session import Session
+
+TOOL = "{stage}"
+PARAMS = {params}
+INPUT_CHECKPOINT = r"{input_cp}"
+SEED = {seed}
+
+if __name__ == "__main__":
+    set_global_seed(SEED)
+    repro_dir = Path(__file__).resolve().parent.parent / ("repro_" + Path(__file__).stem.replace(".repro", ""))
+    sess = Session.create(str(repro_dir), input_path=INPUT_CHECKPOINT, exist_ok=True)
+    sess.load_input()
+    result = tools.run(TOOL, sess, **PARAMS)
+    print(result.status, result.checkpoint)
+'''
 
 
 def counts_fingerprint(adata) -> dict | None:
@@ -85,6 +137,7 @@ class Checkpoint:
     created_at: str
     fingerprint: dict | None = None
     x_state: str = "unknown"
+    repro: str | None = None      # path to the standalone reproduction script
 
 
 @dataclass
@@ -124,6 +177,10 @@ class Session:
     @property
     def logs_dir(self) -> Path:
         return self.out / "logs"
+
+    @property
+    def code_dir(self) -> Path:
+        return self.out / "code"
 
     @property
     def run_log_path(self) -> Path:
@@ -254,11 +311,17 @@ class Session:
         self._ensure_dirs()
         idx = len(self.manifest.checkpoints)
         cid = f"{idx:02d}_{stage}"
+        # input state for this step = prior checkpoint (or the session input) — for repro
+        prior = self.manifest.checkpoints[-1]["path"] if self.manifest.checkpoints \
+            else self.manifest.input.get("path", "")
         path = self.checkpoints_dir / f"{cid}.h5ad"
         with atomic_path(path) as tmp:
             a.write_h5ad(tmp, compression=compression)
+        # save the exact code that produced this step (source snapshot + standalone repro)
+        repro_path = self._write_repro(cid, stage, params or {}, prior, str(path))
         cp = Checkpoint(id=cid, stage=stage, path=str(path), created_at=_now(),
-                        fingerprint=_fingerprint(path), x_state=self.manifest.x_state)
+                        fingerprint=_fingerprint(path), x_state=self.manifest.x_state,
+                        repro=repro_path)
         self.manifest.checkpoints.append(cp.__dict__)
         self.manifest.stage = stage
         if self.manifest.counts_fingerprint is None:
@@ -269,6 +332,42 @@ class Session:
 
     def latest_checkpoint(self) -> dict | None:
         return self.manifest.checkpoints[-1] if self.manifest.checkpoints else None
+
+    # ---------- per-step executed code (source snapshot + standalone repro) ----------
+    def _snapshot_source(self) -> str:
+        """Copy the scpilot package source into code/scpilot-<ver>-<hash>/ (dedup by hash).
+
+        Returns the snapshot dir name (relative to code_dir) so repro scripts can pin it.
+        """
+        snap_name = f"scpilot-{__version__}-{scpilot_source_hash()}"
+        dst = self.code_dir / snap_name
+        if not dst.exists():
+            dst.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(_pkg_dir(), dst / "scpilot",
+                            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        return snap_name
+
+    def _write_repro(self, cid: str, stage: str, params: dict, input_cp: str,
+                     output_cp: str) -> str:
+        """Write code/<cid>.repro.py — a standalone script reproducing this step."""
+        self.code_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_rel = f"{self._snapshot_source()}"
+        prov = build_provenance()
+        prov_comment = "\n".join(
+            f"  {k}: {prov.get(k)}" for k in ("scpilot_version", "source_hash", "git_commit", "command", "timestamp"))
+        text = _REPRO_TEMPLATE.format(
+            stage=stage,
+            prov=prov_comment,
+            input_cp=input_cp,
+            output_cp=output_cp,
+            snapshot_rel=snapshot_rel,
+            params=pprint.pformat(params, indent=4, width=100, sort_dicts=True),
+            seed=int(params.get("seed", 0)) if isinstance(params, dict) else 0,
+        )
+        path = self.code_dir / f"{cid}.repro.py"
+        with atomic_path(path) as tmp:
+            tmp.write_text(text)
+        return str(path)
 
     # ---------- append-only logs ----------
     def log_run(self, record: dict) -> None:

@@ -100,6 +100,22 @@ def test_counts_fingerprint_and_invariant(tmp_path):
         s.assert_invariants(b)
 
 
+def test_checkpoint_writes_repro_and_source_snapshot(tmp_path):
+    inp = tmp_path / "input.h5ad"
+    _tiny_adata().write_h5ad(inp)
+    s = Session.create(tmp_path / "sess", input_path=str(inp))
+    s.load_input()
+    cp = s.checkpoint("preprocess", params={"n_pcs": 15, "seed": 0})
+    # per-step repro script + a pinned source snapshot exist
+    assert cp.repro and Path(cp.repro).exists()
+    code = tmp_path / "sess" / "code"
+    assert (code / "00_preprocess.repro.py").exists()
+    snaps = [p for p in code.iterdir() if p.name.startswith("scpilot-")]
+    assert snaps and (snaps[0] / "scpilot" / "session.py").exists()  # full package snapshotted
+    text = Path(cp.repro).read_text()
+    assert 'TOOL = "preprocess"' in text and "INPUT_CHECKPOINT" in text and "n_pcs" in text
+
+
 def test_invariant_catches_counts_value_drift(tmp_path):
     # Codex review 2.1: value drift that preserves shape/nnz must be caught via content hash
     a = _tiny_adata()
