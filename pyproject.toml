@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scpilot"
+version = "0.0.1"
+description = "LLM-driven scRNA-seq analysis pipeline (MCP server + CLI agent)"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "wykim", email = "wykim91@kbsi.re.kr" }]
+
+# NOTE: the scientific stack is provided by the conda env `scpilot` (cloned from
+# scRNAseq). Install editable with `pip install -e . --no-deps` so pip does NOT
+# re-resolve / upgrade the verified numpy-2.x-compatible env. The list below is
+# documentation of what the package expects to be importable.
+dependencies = [
+    "typer>=0.12",
+    "pyyaml",
+    "mcp",
+    "anthropic",
+    "scanpy>=1.11",
+    "anndata>=0.12",
+    "numpy>=2",
+    "pandas",
+    "scipy",
+    "scikit-misc",
+    "matplotlib",
+    "seaborn",
+    "leidenalg",
+    "igraph",
+    "harmonypy",
+    "scvi-tools",
+    "scrublet",
+    "scib-metrics",
+]
+
+[project.optional-dependencies]
+# Tier 2/3 + trajectory tools — gated at runtime by `scpilot doctor`.
+extra = ["infercnvpy", "gtfparse", "pybiomart", "celltypist"]
+dev = ["pytest"]
+
+[project.scripts]
+scpilot = "scpilot.cli:app"
+
+[tool.setuptools.packages.find]
+include = ["scpilot*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

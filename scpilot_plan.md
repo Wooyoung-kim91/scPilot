@@ -137,7 +137,12 @@ scpilot/
     agent.py           # 에이전트 루프 (Anthropic tool-runner) + 단계별 system prompt
     prompts.py         # 오케스트레이션/annotation/해석/DE 설계용 프롬프트
   cli.py               # Typer CLI 엔트리포인트
-pyproject.toml         # 패키지/의존성/콘솔 스크립트 정의
+  vendor/              # scqc_pipeline 베다링 (독립 진화) — VENDORING.md 참조
+    harness.py         #   재현성 primitive: atomic_path/provenance/StageReport/init_runtime (+ scqc run_stage/Pipeline=참고용)
+    config.py          #   PipelineConfig(profile+CLI 우선순위, per-stage config hash)
+    io_10x.py          #   robust 10x 리더 (CellRanger v2/v3·gzip·h5 fallback)
+    plotting.py        #   auto-fit 출판품질 figure 하네스
+pyproject.toml         # 패키지/의존성/콘솔 스크립트 정의 (`scpilot`)
 ```
 
 ### LLM 계층 (Claude API) — **모드 2(선택적 자체구동) 전용**
@@ -330,8 +335,10 @@ tool은 한 번에 하나씩 추가하고, **추가할 때마다 `scpilot step`(
 →Tier3→report를 **MCP로 끝까지 1회**. CNV/trajectory/scVI/DE·멀티클라이언트·E단계는 그 다음(과설계 회피).
 
 ### Phase A — 기반 + 위험 조기 검증 (LLM 무관)
-- [~] **A1. 스캐폴딩** — `pyproject.toml`, 패키지 골격, 콘솔스크립트 `scpilot`,
-      env에 `mcp`/`anthropic`/`typer`/`scikit-misc`/`pytest` 설치. ✅**의존성 설치 완료** / ⏳pyproject·골격·콘솔스크립트 미착수.
+- [x] **A1. 스캐폴딩** — ✅**완료(2026-06-10)**: `pyproject.toml`(console script `scpilot`, `pip install -e . --no-deps`로
+      env 보호), 패키지 골격(core/ 16 stub + schemas/tools/session/mcp_server + llm/ + cli.py Typer 6 subcommand),
+      **scqc primitive 베다링**(`scpilot/vendor/`: harness/config/io_10x/plotting, scqc@debef308 — `vendor/VENDORING.md` 참조).
+      의존성 설치 완료. 검증: `scpilot version`·`--help`·vendor primitive import·전 stub import OK.
       **선택(Tier2/3·궤적)**: `celltypist`/`infercnvpy`/**`gtfparse`(infercnvpy GTF 좌표주석 필수 옵션의존 — 실측 확인)**/
       `scvelo`/`cellrank`/`palantir`/`cytotrace` + R(Slingshot/Monocle3) (있을 때만 도구 활성, `doctor`로 게이트).
       (현 scpilot env엔 celltypist·infercnvpy·gtfparse·pybiomart 설치 완료.)
