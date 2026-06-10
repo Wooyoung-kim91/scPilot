@@ -330,8 +330,9 @@ tool은 한 번에 하나씩 추가하고, **추가할 때마다 `scpilot step`(
 - ③ **scVI CPU 타이밍**(180k셀): 서브샘플 runtime/peak-mem 실측.
 
 **🔧 열린 결정 2개 (착수 전/중 확정)**
-1. **scqc qc 확장 방식** — B3-ⓐ scrublet·batch-aware를 (a) 실제 scqc 수정→merged 재생성 vs (b) scpilot 후처리.
-   ⚠️ (a)는 "베다링=독립" 결정보다 결합이 큼 → 방식 명시 필요.
+1. ~~**scqc qc 확장 방식**~~ ✅**확정(2026-06-10, Codex 2차의견 반영): (b) scpilot 내부 소유.** scqc 원본 미수정(베다링=독립
+   정합). B3에서 merged를 `obs[sample_id]`로 **그룹분리→그룹별 scrublet→doublet score를 merged에 기록**해 per-sample
+   의미론 보존(merged 단일 scrublet 금지).
 2. ~~**세션 모델**~~ ✅**확정(2026-06-10)**: 단일 `out_dir`(A3 구현 완료). 멀티클라이언트/lock 연기.
 
 **📐 착수 전 보완 필요(미명세)**
@@ -339,9 +340,15 @@ tool은 한 번에 하나씩 추가하고, **추가할 때마다 `scpilot step`(
 - **테스트 fixture 고정**: PDAC ~2k셀 서브샘플을 1회 생성·고정 → 전 B단계 회귀 기준.
 - **annotation에 시간예산 집중**: B8(Tier1)·B13(Tier3)이 가치·난도 모두 최대. 프롬프트 추출(E1)은 그 후.
 
-**🎯 권장 빌드 순서(MVP 임계경로)**: A1 스캐폴딩+베다링+doctor → A6 MCP 스파이크(②) → A7 하네스+decision 동결(⑤)
-→ 조기 PoC(①·③) → B 도구 하나씩. **MVP 루프** = merged 진입→전처리→cluster→Tier1→Harmony→benchmark→최종cluster
-→Tier3→report를 **MCP로 끝까지 1회**. CNV/trajectory/scVI/DE·멀티클라이언트·E단계는 그 다음(과설계 회피).
+**🎯 권장 빌드 순서(MVP 임계경로)**: ✅Phase A 완료(A1~A7) → **B1~B7 순차** → ⛔**B7-B8 하드게이트: 디리스크① Tier1
+consensus PoC**(cross-GSE 파편화↔scib 과보정) → B8 → ⛔**B8-B9 스파이크: 디리스크③ scVI CPU 타이밍** → B9~. **MVP 루프**
+= merged 진입→전처리→cluster→Tier1→Harmony→benchmark→최종cluster→Tier3→report를 **MCP로 끝까지 1회**. CNV/trajectory/
+scVI/DE·멀티클라이언트·E단계는 그 다음(과설계 회피).
+
+**🧱 착수 직전 정비 완료(2026-06-10, Codex 2차의견 반영)**: ① `RunLogRecord.summary` 필드 추가 + `ReplayExecutor` 타입
+명시(동결 스키마가 replay diff 지원). ② **MCP 서버를 `tools.REGISTRY` 기반 동적 빌드**로 — `@register` 한 줄이면 step·MCP·
+replay 자동 노출(이중등록 제거). ③ **ToolSpec 잡 생명주기(start/status/cancel/result)는 B9 직전 하드게이트로 연기** —
+B1~B7엔 장시간 도구 없음, scVI 실측 후 설계(과설계 회피). `long_running` 플래그만 자리표시.
 
 ### Phase A — 기반 + 위험 조기 검증 (LLM 무관)
 - [x] **A1. 스캐폴딩** — ✅**완료(2026-06-10)**: `pyproject.toml`(console script `scpilot`, `pip install -e . --no-deps`로
@@ -391,10 +398,10 @@ tool은 한 번에 하나씩 추가하고, **추가할 때마다 `scpilot step`(
       scqc 소유. 검증: scqc 산출 `PDAC_merged_qc.h5ad` 적재 → shape·layers 요약.
 - [ ] **B2. `core/state.py`** — 단계 감지(raw/HVG/clustered/annotated) → 재진입점. 검증: 두 PDAC 파일 판정.
       (scpilot 진입점은 merged이므로 raw/HVG/clustered 위주.)
-- [ ] **B3. QC — 두 갈래**: ⓐ **upstream(scqc qc stage 확장)**: scrublet per-sample + %ribo + stress/dissociation +
-      **mixed-lineage(EPCAM+CD3D 공발현) 플래그** + **batch-aware 분포 요약** 반환 → scqc 산출에 반영(merge 前 per-sample).
-      ⓑ **scpilot `core/qc.py`**: merged에서 그 QC 요약을 소비해 LLM cutoff 결정·재필터 + Tier0 artifact 판정.
-      (선택) ambient RNA 평가(raw droplet 有 시), 미수행 시 경고.
+- [ ] **B3. `core/qc.py` (Tier 0 artifact) — scpilot 내부 소유(결정#1 확정)**: scqc 원본 미수정. merged를
+      `obs[sample_id]`로 **그룹분리 → 그룹별 scrublet → doublet score를 merged에 기록**(per-sample 의미론 보존, 단일 scrublet
+      금지) + calculate_qc_metrics(%MT/%ribo) + stress/dissociation·**mixed-lineage(EPCAM+CD3D 공발현) 플래그** +
+      **batch-aware 분포 요약** 반환 → LLM cutoff 결정·재필터. (선택) ambient RNA 평가(raw droplet 有 시), 미수행 시 경고.
 - [ ] **B4. `core/preprocess.py`** — normalize/log1p/HVG(seurat_v3, **counts·scikit-misc preflight 게이트**,
       batch-aware)/scale/PCA → 분산설명비·HVG 후보 요약.
 - [ ] **B5. `core/plots.py` (scqc `plotting.py` 베다링)** — vendored auto-fit figure 하네스 위에 umap/qc/violin/dotplot →
@@ -404,8 +411,9 @@ tool은 한 번에 하나씩 추가하고, **추가할 때마다 `scpilot step`(
 - [ ] **B8. `core/annotate.py` (Tier 1 broad, consensus)** — unintegrated marker + celltypist + quick-Harmony 라벨의
       **agreement/confidence** 산출 → `obs["major_cell_type"]`(unknown 허용, Epithelial/T·NK/B·Plasma/Myeloid/Stromal/
       Endothelial/Mast/Mixed-Artifact). marker 충돌 검출. circular-risk 플래그. **→ benchmark `label_key` 확보.**
-- [ ] **B9. `core/integrate.py`** — `harmony_integrate` + `scvi.model.SCVI(accelerator="cpu")` **잡 모델**.
-      검증(서브샘플): 임베딩 생성·CPU 시간/peak-mem·fallback 스키마 동작.
+- [ ] **B9. `core/integrate.py`** — ⛔**선행 하드게이트: ToolSpec 잡 생명주기(start/get_job_status/get_job_result/
+      cancel_job) 확장 + 디리스크③ scVI CPU 타이밍 스파이크**(첫 장시간 도구 — 실측 후 설계, 과설계 회피).
+      `harmony_integrate` + `scvi.model.SCVI(accelerator="cpu")` **잡 모델**. 검증(서브샘플): 임베딩·CPU 시간/peak-mem·fallback.
 - [ ] **B10. `core/benchmark.py`** — `Benchmarker(label_key=major_cell_type, batch_key=...)` **2-tier**,
       kNN 고비용 지표 기본 off, **overcorrection 경고·조건별 조성** 포함. 검증(서브샘플): 점수표.
 - [ ] **B10.5. 최종 cluster (명시)** — 선정 임베딩으로 neighbors→leiden→umap, **final-cluster 키 + 임베딩 provenance**

@@ -25,6 +25,11 @@ import random
 from pathlib import Path
 from typing import Any, Callable
 
+# A replay executor re-runs ONE logged tool from its run-log record (which carries
+# the recorded `params`/`tool`/`determinism_grade`) and returns the NEW summary dict
+# to diff against the recorded `summary`. The tool registry (plan C1/A5) provides one.
+ReplayExecutor = Callable[[dict], dict]   # (run_log_record) -> new_summary
+
 # Default tolerances per determinism grade (plan A7).
 GRADE_TOLERANCE = {
     "A": {"rtol": 0.0, "cluster_tol": 0},     # params/env identical
@@ -149,7 +154,7 @@ def _read_jsonl(path: Path) -> list[dict]:
     return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
 
 
-def replay_session(out_dir: str, *, executor: Callable[[dict], dict] | None = None) -> dict:
+def replay_session(out_dir: str, *, executor: "ReplayExecutor | None" = None) -> dict:
     """Replay a session's run log deterministically (no LLM).
 
     ``executor(record) -> new_summary`` re-runs one logged tool with its recorded

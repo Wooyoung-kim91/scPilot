@@ -38,34 +38,59 @@ def _configure_io() -> logging.Logger:
 
 
 def build_server():
-    """Create and return the FastMCP server with the A6 read-only tool registered."""
+    """Create the FastMCP server, exposing EVERY tool in the registry dynamically.
+
+    Tools register themselves in ``scpilot.tools.REGISTRY`` at import time; this
+    function wraps each as an MCP tool that opens/creates a Session and dispatches
+    through the registry. So adding a B-tool (``@register(...)``) auto-exposes it
+    over MCP — no edits here. Session working dir comes from a ``workdir`` arg
+    (defaults next to the input) so MCP callers get the same on-disk session model.
+    """
+    from pathlib import Path
+
     from mcp.server.fastmcp import FastMCP
 
-    from scpilot import __version__
-    from scpilot.core.io import inspect_h5ad
+    from scpilot import __version__, tools
+    from scpilot.session import Session
+
+    # ensure core tool modules are imported so they register (A5: inspect; B-tools later)
+    import scpilot.core.io  # noqa: F401
 
     lg = _configure_io()
     mcp = FastMCP("scpilot")
 
-    @mcp.tool()
-    def inspect_h5ad_tool(path: str) -> dict:
-        """Read-only summary of an .h5ad file: shape, layers, obs schema, embeddings,
-        uns keys, genomic-coordinate readiness. Does not load the X matrix. Returns
-        the scpilot ToolResult as JSON.
+    def _make_handler(name: str):
+        def handler(input: str, workdir: str = "", params: dict | None = None) -> dict:
+            from scpilot import schemas as S
+            lg.info("tool=%s input=%s", name, input)
+            try:
+                wd = workdir or str(Path(input).resolve().parent / f"{Path(input).stem}_scpilot")
+                session = Session.create(wd, input_path=input)
+                return tools.run(name, session, **(params or {})).to_dict()
+            except Exception as exc:  # noqa: BLE001 — MCP must return a structured error, not throw
+                lg.exception("tool %s failed", name)
+                return S.error(name, "internal", f"{type(exc).__name__}: {exc}").to_dict()
+        return handler
 
-        Args:
-            path: absolute path to a .h5ad file on the server's filesystem.
-        """
-        lg.info("inspect_h5ad path=%s", path)
-        result = inspect_h5ad(path)
-        return result.to_dict()
+    for spec in tools.REGISTRY.values():
+        handler = _make_handler(spec.name)
+        handler.__name__ = f"{spec.name}_tool"
+        handler.__doc__ = (
+            f"{spec.description}\n\n"
+            "Args:\n"
+            "    input: absolute path to a .h5ad on the server filesystem.\n"
+            "    workdir: optional session directory (defaults next to input).\n"
+            "    params: optional tool parameters (dict)."
+        )
+        mcp.tool(name=f"{spec.name}_tool")(handler)
 
     @mcp.tool()
     def scpilot_version() -> dict:
         """Return the scpilot version (cheap connectivity check)."""
         return {"scpilot_version": __version__}
 
-    lg.info("scpilot MCP server ready (v%s) — tools: inspect_h5ad_tool, scpilot_version", __version__)
+    names = [f"{s.name}_tool" for s in tools.REGISTRY.values()] + ["scpilot_version"]
+    lg.info("scpilot MCP server ready (v%s) — tools: %s", __version__, ", ".join(names))
     return mcp
 
 

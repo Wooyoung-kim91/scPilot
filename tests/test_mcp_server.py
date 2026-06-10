@@ -39,25 +39,27 @@ def _tiny_h5ad(path):
     a.write_h5ad(path)
 
 
-async def _drive(h5ad_path):
+async def _drive(h5ad_path, workdir):
     params = StdioServerParameters(command=sys.executable, args=["-m", "scpilot", "mcp"])
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             names = {t.name for t in (await session.list_tools()).tools}
             ver = _parse(await session.call_tool("scpilot_version", {}))
-            ok = _parse(await session.call_tool("inspect_h5ad_tool", {"path": h5ad_path}))
-            err = _parse(await session.call_tool("inspect_h5ad_tool", {"path": "/no/such.h5ad"}))
+            ok = _parse(await session.call_tool(
+                "inspect_tool", {"input": h5ad_path, "workdir": f"{workdir}/ok"}))
+            err = _parse(await session.call_tool(
+                "inspect_tool", {"input": f"{workdir}/missing.h5ad", "workdir": f"{workdir}/err"}))
             return names, ver, ok, err
 
 
 def test_mcp_stdio_tool_discovery_and_call(tmp_path):
     h5ad = tmp_path / "tiny.h5ad"
     _tiny_h5ad(h5ad)
-    names, ver, ok, err = asyncio.run(_drive(str(h5ad)))
+    names, ver, ok, err = asyncio.run(_drive(str(h5ad), str(tmp_path)))
 
-    # tool discovery
-    assert {"inspect_h5ad_tool", "scpilot_version"} <= names
+    # registry-driven tool discovery (inspect auto-exposed as inspect_tool)
+    assert {"inspect_tool", "scpilot_version"} <= names
     # short call
     assert ver["scpilot_version"]
     # read-only inspect returns a valid ToolResult summary

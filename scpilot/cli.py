@@ -94,7 +94,7 @@ def step(
 
     result = spec.fn(session, **params)
     session.log_run(S.RunLogRecord(
-        tool=stage, status=result.status, params=params, seed=seed,
+        tool=stage, status=result.status, params=params, summary=result.summary, seed=seed,
         determinism_grade=result.determinism_grade,
         output_checkpoint=result.checkpoint, error_code=result.error_code,
         duration_s=result.duration_s, lib_versions={"seed_record": seed_rec},

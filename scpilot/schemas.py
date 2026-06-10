@@ -266,11 +266,16 @@ class DecisionEvent:
 
 @dataclass
 class RunLogRecord:
-    """One mutating-tool run in the append-only run log (plan A7). FROZEN shape."""
+    """One mutating-tool run in the append-only run log (plan A7). FROZEN shape.
+
+    ``summary`` carries the tool's structural-invariant numbers so ``replay`` can
+    diff a re-run against the recorded values without re-loading checkpoints.
+    """
     tool: str
     status: Status = "success"
     stage: str | None = None
     params: dict = field(default_factory=dict)
+    summary: dict = field(default_factory=dict)   # structural invariants for replay diff
     seed: int | None = None
     input_checkpoint: str | None = None
     output_checkpoint: str | None = None
