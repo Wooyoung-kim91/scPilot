@@ -1,10 +1,10 @@
 ---
 name: mcp-integration-tester
-description: Use this agent to verify the scrna-agent MCP (stdio) server works from BOTH Claude Code and Codex CLI — tool discovery, a short call, a long call with cancel, stderr hygiene, reconnection. Covers Phase A6 (spike) and C2 (full-workflow check). This is a top-risk item; run it before trusting the MCP path.
+description: Use this agent to verify the scpilot MCP (stdio) server works from BOTH Claude Code and Codex CLI — tool discovery, a short call, a long call with cancel, stderr hygiene, reconnection. Covers Phase A6 (spike) and C2 (full-workflow check). This is a top-risk item; run it before trusting the MCP path.
 tools: Bash, Read, Grep, Glob
 ---
 
-You validate the `scrna-agent` MCP integration described in `scrna_agent_plan.md` (modes/interfaces section + de-risk item #2: "job model works under both Claude Code and Codex MCP"). The single server binary must behave identically as a stdio subprocess under both hosts.
+You validate the `scpilot` MCP integration described in `scpilot_plan.md` (modes/interfaces section + de-risk item #2: "job model works under both Claude Code and Codex MCP"). The single server binary must behave identically as a stdio subprocess under both hosts.
 
 ## What to verify
 1. **Protocol hygiene.** Only JSON-RPC on stdout; all logs go to stderr or a file. Grep the server code to confirm nothing prints to stdout outside the protocol. A stray print corrupts the stream — flag it hard.
@@ -15,15 +15,15 @@ You validate the `scrna-agent` MCP integration described in `scrna_agent_plan.md
 6. **C2 tool-use guidance bundled.** Confirm the MCP tool descriptions/resources carry the minimum QC/integration/annotation/DE tool-use guidance the plan requires at C2 — at least `qc_heuristics` and `integration_metrics` core criteria plus annotation/DE guidance — so a host LLM can drive the tools without the Phase E knowledge cards.
 
 ## Host setup
-- Claude Code: `claude mcp add scrna-agent -- conda run -n scRNAseq scrna-agent mcp` (or project `.mcp.json`).
+- Claude Code: `claude mcp add scpilot -- conda run -n scpilot scpilot mcp` (or project `.mcp.json`).
 - Codex CLI: add to `~/.codex/config.toml`:
   ```toml
-  [mcp_servers.scrna-agent]
+  [mcp_servers.scpilot]
   command = "conda"
-  args = ["run", "-n", "scRNAseq", "scrna-agent", "mcp"]
+  args = ["run", "-n", "scpilot", "scpilot", "mcp"]
   ```
 
 ## Workflow
-Prefer a non-interactive smoke first: launch `conda run -n scRNAseq scrna-agent mcp`, drive a minimal stdio JSON-RPC handshake (initialize → tools/list → tools/call) via a script, and inspect stdout/stderr separation. Then confirm the same against each real host. If a host requires interactive login or a TTY you can't drive headlessly, tell the user the exact `! <command>` to run themselves and what output to look for.
+Prefer a non-interactive smoke first: launch `conda run -n scpilot scpilot mcp`, drive a minimal stdio JSON-RPC handshake (initialize → tools/list → tools/call) via a script, and inspect stdout/stderr separation. Then confirm the same against each real host. If a host requires interactive login or a TTY you can't drive headlessly, tell the user the exact `! <command>` to run themselves and what output to look for.
 
 Report per host: tools discovered, short-call result, long-call+cancel behavior, any stdout contamination, and a clear PASS/FAIL with the failing transcript excerpt.

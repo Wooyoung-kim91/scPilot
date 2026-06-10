@@ -1,4 +1,4 @@
-# Plan: `scrna-agent` — LLM-Driven scRNA-seq Analysis (MCP + CLI)
+# Plan: `scpilot` — LLM-Driven scRNA-seq Analysis (MCP + CLI)
 
 ## Context
 
@@ -11,7 +11,7 @@ LLM의 역할(전부): ① 파이프라인 오케스트레이션 + 파라미터 
 ③ 조건비교 DE, ④ 결과 해석 + 리포트.
 
 ### 현재 환경 (확인 완료)
-- conda env `scRNAseq` (Python 3.11): `scanpy 1.11.5`, `anndata 0.12.14`, `leidenalg`, `harmonypy 0.2.0`,
+- 작업 env `scpilot` (Python 3.11): `scanpy 1.11.5`, `anndata 0.12.14`, `leidenalg`, `harmonypy 0.2.0`,
   `scvi-tools 1.4.2`, `scrublet`, `scib-metrics`(설치됨), numpy 2.4.
 - **GPU 미탑재 (추후 추가 예정)** → scVI는 현 조건상 **CPU 모드**(`accelerator="cpu"`)로 진행.
   학습이 느리므로 검증 단계는 서브샘플 + epoch 축소. GPU 추가 시 `accelerator` 인자만 `"auto"`로 전환.
@@ -25,8 +25,7 @@ LLM의 역할(전부): ① 파이프라인 오케스트레이션 + 파라미터 
   upstream 재실행은 raw merged에서), 조건비교용 `PDAC_pancreas_primary_vs_normal.h5ad`.
   ⚠️ `var`에 **chromosome/start/end 좌표 없음**(n_cells만) → CNV(B12) 전 좌표 주석 단계 선행 필수.
 - `claude` CLI 설치됨 (`~/.local/bin/claude`). proto는 **git 저장소로 초기화 완료**(branch `main`, 2026-06-10).
-- **product 이름 = `scpilot`** (CLI/패키지/env 공통). 본 문서 구판의 `scrna-agent`/`scRNAseq`/`uns["scrna_agent"]`
-  표기는 `scpilot`/`scpilot`/`uns["scpilot"]`로 갱신 예정(전역 rename 대기).
+- **product 이름 = `scpilot`** (CLI/패키지/env/`uns["scpilot"]` 공통). 2026-06-10 전역 rename 완료.
 
 ### 핵심 설계 아이디어
 LLM은 **데이터를 직접 보지 않고**, 서버가 보유한 AnnData에 대해 tool을 호출한다.
@@ -80,7 +79,7 @@ scpilot은 그 batch-aware QC 산출을 진입 데이터로 상속.
   error_code?, recoverable?, suggested_next_tools?}` 형태. 표(marker/DE/benchmark)는 **행수 제한 + 미리보기**,
   전체는 CSV/PNG **artifact 경로(절대경로 + 메타)** 로. PNG는 호스트 파일시스템 가시성 차이 고려해 경로+메타 반환.
 - **AnnData 불변식**: `layers["counts"]` 불변 / `.X`의 의미(정규화 여부)를 단계마다 기록 / 통합 임베딩은 `.obsm`에만 /
-  모든 mutating tool은 `.uns["scrna_agent"]`에 provenance(파라미터·시드·버전) 기록.
+  모든 mutating tool은 `.uns["scpilot"]`에 provenance(파라미터·시드·버전) 기록.
 - **재현성**: 난수 시드 고정·기록. 회귀검증은 정확값이 아니라 **구조 불변식**(키 존재, shape 일치,
   클러스터 수 허용오차 내)으로.
 
@@ -96,8 +95,8 @@ LLM 주도 탐색은 비결정적이므로, **결정적으로 재현 가능한 "
 4. **Provenance / run log + 결정 이벤트**: 모든 mutating tool이 (params·seed·lib버전·입력/출력 체크포인트 ID)를
    append-only run log에 기록. **추가로 `decision` 이벤트를 1급으로**: LLM이 고른 통합방법·resolution·annotation 전략·
    compartment 분기·CNV fallback·trajectory 선택을 (후보·선택·근거·confidence·입력 요약 artifact ID·하위 params)로 기록.
-   `.uns["scrna_agent"]`에는 **압축 포인터/현재상태만**(무한 증식 방지), 전체 로그·결정·대형 요약은 세션 파일에 artifact ID로.
-5. **결정적 리플레이**: `scrna-agent replay <session>` — run log + **decision 이벤트를 소비**(LLM 재질의 X)해 그대로
+   `.uns["scpilot"]`에는 **압축 포인터/현재상태만**(무한 증식 방지), 전체 로그·결정·대형 요약은 세션 파일에 artifact ID로.
+5. **결정적 리플레이**: `scpilot replay <session>` — run log + **decision 이벤트를 소비**(LLM 재질의 X)해 그대로
    재실행 → 등급별 tolerance로 구조 diff. (= LLM 탐색 ↔ 재현 가능 레시피 분리.)
 6. **테스트/회귀 하네스(pytest, 적극 사용)**: **각 tool 구현 시점마다** tiny fixture로 단위 + 구조불변식 테스트
    함께 작성(TDD식). CI 가능. step-by-step 빌드의 "검증" = 이 하네스.
@@ -108,7 +107,7 @@ LLM 주도 탐색은 비결정적이므로, **결정적으로 재현 가능한 "
 ## 아키텍처
 
 ```
-scrna_agent/
+scpilot/
   core/                # 순수 분석 함수 (AnnData in/out, LLM 비의존)
     io.py              # load_10x / load_h5ad / save; 입력형식 감지
     state.py           # AnnData 단계 감지 (어디까지 처리됐나) → 전체 파이프라인 재진입점 결정
@@ -143,7 +142,7 @@ pyproject.toml         # 패키지/의존성/콘솔 스크립트 정의
 
 ### LLM 계층 (Claude API) — **모드 2(선택적 자체구동) 전용**
 - 1순위 통합은 MCP(모드 1)이고 거기선 호스트 에이전트가 LLM을 제공하므로 이 계층은 불필요.
-  아래는 API 키를 가진 사용자가 `scrna-agent run`으로 자율 실행할 때만 동작.
+  아래는 API 키를 가진 사용자가 `scpilot run`으로 자율 실행할 때만 동작.
 - 기본 모델 **`claude-opus-4-8`**, `thinking={"type":"adaptive"}`, `output_config={"effort":"high"}`.
 - 에이전트 루프는 Anthropic Python SDK **tool-runner**(`client.beta.messages.tool_runner`, `@beta_tool`) 사용 —
   tool 실행 → 결과 피드백 → 반복을 SDK가 처리. 핵심 단계(annotation 라벨 등)는 structured output 스키마로 강제.
@@ -171,7 +170,7 @@ trajectory/state → **consistency review**.
 
 **메타데이터 스키마(obs, 분리 보관)**: `major_cell_type` / `fine_cell_type` / `facs_style_label`(예 `CD8+ PD-1+ T cells`) /
 `malignancy` / `cell_state`(cycling·exhausted·EMT-like·hypoxia 등) / `trajectory_state` / `confidence` / `review_required`.
-**evidence_for/against·confounders·cluster키·parent-child**는 `.uns["scrna_agent"]["annotation_tree"]`에. (FACS식=표시용,
+**evidence_for/against·confounders·cluster키·parent-child**는 `.uns["scpilot"]["annotation_tree"]`에. (FACS식=표시용,
 biological 라벨=계산용 — 쌍으로.) 면역 워크플로(독립/ TME): CD45+ 선택 → broad lineage → lineage별 subcluster → subtype →
 activation/exhaustion/cycling/IFN state 점수 → trajectory → review. **lineage와 state를 단일 비가역 라벨로 섞지 말 것.**
 
@@ -179,7 +178,7 @@ activation/exhaustion/cycling/IFN state 점수 → trajectory → review. **line
 - **Tool ≠ Skill**: tool은 실행함수, skill은 LLM에게 *언제·어떻게 쓸지* 알려주는 도메인 지식 문서.
 - **결정**: 강점(지식 외부화·편집성, 토큰 효율, MCP/CLI 일관성, 재사용)이 단점(전달경로 이원화,
   CLI 네이티브 런타임 부재, 유지보수 이중화, 초기 과설계)보다 큼 → **채택**. 단점은 **단일 소스+이중 전달**로 회피.
-- **단일 소스**: `scrna_agent/knowledge/*.md` 에 지식 카드를 한 벌만 작성
+- **단일 소스**: `scpilot/knowledge/*.md` 에 지식 카드를 한 벌만 작성
   (예: `qc_heuristics.md`, `integration_metrics.md`, `de_design.md`, 그리고 **`annotation_strategy.md`·`cancer_markers.md`·
   `immune_markers.md`·`facs_labels.md`는 `cancer_scrnaseq_annotation_strategy.md`의 Tier 설계·marker 패널·FACS 매핑을
   그대로 카드화**).
@@ -234,7 +233,7 @@ activation/exhaustion/cycling/IFN state 점수 → trajectory → review. **line
    compartment마다 **batch-mixing 진단** 통과 후에야 fine 클러스터 채택. 작은 클러스터는 최소크기·merge·
    "insufficient evidence" 라벨 규칙.
    라벨은 **분리 저장(문서 스키마)**: `major_cell_type`·`fine_cell_type`·`facs_style_label`·`malignancy`·`cell_state`·
-   `trajectory_state`·`confidence`·`review_required`. **권위 계층/증거는 `.uns["scrna_agent"]["annotation_tree"]`**
+   `trajectory_state`·`confidence`·`review_required`. **권위 계층/증거는 `.uns["scpilot"]["annotation_tree"]`**
    (parent-child·cluster키·evidence_for/against·confounders·provenance); obs 컬럼은 셀 단위 접근용.
    - **면역(PBMC/림프절 등)**: T3 = subset 후 TF·function 기반 세분화 → FACS식(`CD8+ PD-1+ T cells`).
    - **암(예: PDAC)**: ① broad → ② **CNV 추론으로 malignancy 먼저 확정**(fine epithelial 라벨은 이 필드에서 파생,
@@ -264,28 +263,28 @@ activation/exhaustion/cycling/IFN state 점수 → trajectory → review. **line
 **LLM·크레덴셜은 호스트 에이전트가 제공** → 우리 쪽 API 키 불필요.
 (도구가 "요약만 반환" 설계라 어떤 호스트 LLM이 구동해도 토큰 효율·재현성 유지.)
 
-`pyproject.toml` 콘솔 스크립트 `scrna-agent`, 세 가지 모드:
+`pyproject.toml` 콘솔 스크립트 `scpilot`, 세 가지 모드:
 
-- **모드 1 (1순위) — MCP 서버**: `scrna-agent mcp`
+- **모드 1 (1순위) — MCP 서버**: `scpilot mcp`
   표준 MCP(stdio) 서버 기동. **Claude Code·Codex·기타 MCP 클라이언트**가 붙어 대화형으로 도구 구동.
   우리 API 키 불필요(호스트가 LLM 제공). 향후 HTTP/SSE transport도 옵션으로 추가 가능.
-- **모드 2 (선택) — 자체구동 CLI 에이전트**: `scrna-agent run <input> [--workdir] [--goal] [--effort high]`
+- **모드 2 (선택) — 자체구동 CLI 에이전트**: `scpilot run <input> [--workdir] [--goal] [--effort high]`
   Anthropic API(`claude-opus-4-8`)로 8단계 자율 수행 + 리포트. **API 키 있을 때만**. 배치/재현 파이프라인용.
-- **모드 3 — 결정론적 단일 단계**: `scrna-agent step <stage> <input>`
+- **모드 3 — 결정론적 단일 단계**: `scpilot step <stage> <input>`
   특정 단계만 LLM 없이 실행. 디버그/회귀검증용.
-- **모드 4 — 결정적 리플레이**: `scrna-agent replay <session>`
+- **모드 4 — 결정적 리플레이**: `scpilot replay <session>`
   기록된 run log(파라미터만, LLM 없이)를 그대로 재실행 → 원본과 구조불변식 diff. 재현성 하네스의 핵심.
 
 ### MCP 등록 설정 (호스트별)
-서버 실행 커맨드(공통, conda env 활성화 포함): `conda run -n scRNAseq scrna-agent mcp`
+서버 실행 커맨드(공통, conda env 활성화 포함): `conda run -n scpilot scpilot mcp`
 
-- **Claude Code**: `claude mcp add scrna-agent -- conda run -n scRNAseq scrna-agent mcp`
+- **Claude Code**: `claude mcp add scpilot -- conda run -n scpilot scpilot mcp`
   (또는 프로젝트 `.mcp.json`의 `mcpServers`에 `command`/`args` 등록).
 - **Codex CLI**: `~/.codex/config.toml` 에
   ```toml
-  [mcp_servers.scrna-agent]
+  [mcp_servers.scpilot]
   command = "conda"
-  args = ["run", "-n", "scRNAseq", "scrna-agent", "mcp"]
+  args = ["run", "-n", "scpilot", "scpilot", "mcp"]
   ```
 - 두 호스트 모두 동일 서버 바이너리를 stdio 서브프로세스로 띄우므로 **단일 구현으로 호환**.
 - 검증 시 두 에이전트 각각에서 도구 목록 인식 + QC 도구 1회 호출까지 확인.
@@ -294,7 +293,7 @@ activation/exhaustion/cycling/IFN state 점수 → trajectory → review. **line
 
 ## To-Do List (step-by-step tool 빌드)
 
-tool은 한 번에 하나씩 추가하고, **추가할 때마다 `scrna-agent step`(LLM 없이 결정론적)으로 검증** 후 다음으로 진행.
+tool은 한 번에 하나씩 추가하고, **추가할 때마다 `scpilot step`(LLM 없이 결정론적)으로 검증** 후 다음으로 진행.
 각 core 함수는 AnnData를 받아 처리하고 **요약 dict** 를 반환한다는 계약을 공통으로 따른다.
 
 > **최우선 디리스크 5 (Codex)**: ①scib `label_key`(Tier1 consensus) 유효성 ②잡 모델의 Claude Code+Codex MCP 동작
@@ -302,16 +301,16 @@ tool은 한 번에 하나씩 추가하고, **추가할 때마다 `scrna-agent st
 > 스키마 완전성(재귀/선택 도구 추가 전 동결). 위 순서로 먼저 검증.
 
 ### Phase A — 기반 + 위험 조기 검증 (LLM 무관)
-- [ ] **A1. 스캐폴딩** — `pyproject.toml`, 패키지 골격, 콘솔스크립트 `scrna-agent`,
+- [ ] **A1. 스캐폴딩** — `pyproject.toml`, 패키지 골격, 콘솔스크립트 `scpilot`,
       env에 `mcp`/`anthropic`/`typer`/`scikit-misc`/`pytest` 설치.
       **선택(Tier2/3·궤적)**: `celltypist`/`infercnvpy`/`scvelo`/`cellrank`/`palantir`/`cytotrace`
       + R(Slingshot/Monocle3) (있을 때만 도구 활성, `doctor`로 게이트).
-- [ ] **A2. 환경 preflight** — `scrna-agent doctor`: 전 의존성(scvi/scrublet/jax|torch/numba/igraph/scib/scikit-misc)
+- [ ] **A2. 환경 preflight** — `scpilot doctor`: 전 의존성(scvi/scrublet/jax|torch/numba/igraph/scib/scikit-misc)
       import + 버전 출력 + tiny smoke test. **numpy 2.x 호환 조기 확인**, 실패 시 actionable 가이드.
       **capability 플래그 산출**: `velocity_available`(spliced/unspliced 有), `cnv_available`(infercnvpy + `var` 좌표),
       `r_available`(R+renv: Slingshot/Monocle3), celltypist/cytotrace 가용성. LLM은 플래그 false면 해당 도구 선택 불가.
 - [ ] **A3. `session.py` (온디스크 1급)** — `session_id`/manifest/이력로그/단계별 `.h5ad` 체크포인트 + file lock.
-      인메모리는 캐시. AnnData provenance(`.uns["scrna_agent"]`)·불변식 헬퍼.
+      인메모리는 캐시. AnnData provenance(`.uns["scpilot"]`)·불변식 헬퍼.
 - [ ] **A4. `schemas.py`** — 공통 구조화 결과(`status/summary/artifacts/checkpoint/warnings/error_code/...`) +
       표 행수 제한·미리보기·artifact 경로 규약. 잡 모델 결과 스키마(시도/경과/peak-mem/fallback) 포함.
 - [ ] **A5. `cli.py` 골격 + `step`** — Typer 엔트리포인트 + `step` 디스패치.
@@ -393,14 +392,14 @@ tool은 한 번에 하나씩 추가하고, **추가할 때마다 `scrna-agent st
 
 ## 검증 (End-to-End)
 
-- **단계별(LLM 무관)**: 처리완료 파일로 회귀 — `scrna-agent step cluster PDAC_merged_qc_log1p_hvg_umap.h5ad`
+- **단계별(LLM 무관)**: 처리완료 파일로 회귀 — `scpilot step cluster PDAC_merged_qc_log1p_hvg_umap.h5ad`
   → **구조 불변식**(키 존재, shape 일치, 클러스터 수 허용오차, 시드 기록)으로 검증(정확값 비교 X — 결정성 등급 기준).
 - **벤치마크 경로**: `PDAC_merged_qc.h5ad`(raw)에서 Harmony vs scVI vs unintegrated scib-metrics 점수표 산출.
   scVI는 CPU 모드라 느리므로 **서브샘플 + epoch 축소로 먼저 검증**, 시간/메모리 로깅 후 전량은 선택적.
   (GPU 추가 후 `accelerator="auto"`로 전환해 전량 재실행.)
 - **MCP 경로(핵심)**: Claude Code **와 Codex CLI** 양쪽에 서버 등록 → 각 에이전트가 도구 목록을 인식하고
   대화로 QC→annotation까지 도구 호출이 도는지 확인(우리 API 키 없이 호스트 LLM으로).
-- **CLI 자율 경로**: 소규모 서브샘플 h5ad로 `scrna-agent run` 풀 파이프라인 → 리포트(PNG+해석) 생성 확인.
+- **CLI 자율 경로**: 소규모 서브샘플 h5ad로 `scpilot run` 풀 파이프라인 → 리포트(PNG+해석) 생성 확인.
   토큰 사용·tool 호출 횟수 로깅으로 비용 점검.
 - **Annotation 타당성**: LLM 라벨을 알려진 PDAC marker(EPCAM/KRT, PTPRC, COL1A1 등)와 대조 검수.
 
