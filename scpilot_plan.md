@@ -37,7 +37,14 @@ LLM은 **데이터를 직접 보지 않고**, 서버가 보유한 AnnData에 대
 결정하고 다음 tool을 호출한다. 이 "tool은 요약만 반환, 데이터는 서버에 상주" 패턴이 토큰 효율과 재현성의 핵심.
 동일한 tool 집합을 **MCP 서버(클라이언트 LLM 구동)** 와 **CLI 에이전트(Anthropic API 자체 구동)** 둘 다에서 재사용.
 
-### scqc_pipeline 연계 — upstream 위임 + 하네스 베다링 (2026-06-10 분석 반영)
+### ⚠️ 아키텍처 전환 (2026-06-10, 사용자 결정 A): scpilot = **raw 10x부터 end-to-end**
+초기엔 "scqc=upstream 위임, scpilot=merged부터" 경계였으나, **사용자가 단일 도구(raw→분석)를 원해 scqc의 upstream을
+scpilot에 흡수**. 구현: scqc primitive(io_10x·metaschema·config·harness)를 베다링하고, `core/ingest.py` `ingest` 도구가
+profile(raw 10x+metadata)→harmonize→per-sample read+cell QC→merge→normalize(counts+scale.data)를 한 번에 수행
+→ 세션에 merged 적재 → 이후 qc_metrics/preprocess/... 다운스트림. (이미 merged h5ad가 있으면 ingest 생략하고 그 파일로 세션 생성.)
+검증: 합성 10x 유닛테스트 + 실 raw 2-GSM(5842셀) end-to-end. **아래 "scqc 연계" 절은 베다링 정책 부분만 유효**(경계 위임은 폐기).
+
+### scqc_pipeline 베다링 (하네스/io/metaschema/plotting 재사용 — 위 흡수의 토대)
 옆 디렉토리 `/home/wykim/data/PDAC/scqc_pipeline/`(~2600 LOC, 성숙한 재현 가능 QC→merge CLI, 계약 단일소스
 `HARNESS.md`)가 **본 계획 Phase A의 상당 부분과 B1/B5·upstream QC/merge를 이미 구현**해 둠. 재구현은 명백한 중복이므로
 아래 경계로 분업한다.
