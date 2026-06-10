@@ -307,7 +307,9 @@ tool은 한 번에 하나씩 추가하고, **추가할 때마다 `scpilot step`(
       + R(Slingshot/Monocle3) (있을 때만 도구 활성, `doctor`로 게이트).
 - [ ] **A2. 환경 preflight** — `scpilot doctor`: 전 의존성(scvi/scrublet/jax|torch/numba/igraph/scib/scikit-misc)
       import + 버전 출력 + tiny smoke test. **numpy 2.x 호환 조기 확인**, 실패 시 actionable 가이드.
-      **capability 플래그 산출**: `velocity_available`(spliced/unspliced 有), `cnv_available`(infercnvpy + `var` 좌표),
+      **capability 플래그 산출**: `velocity_available`(spliced/unspliced 有),
+      **`cnv_available` = infercnvpy import OK AND 좌표소스 가용(GTF 캐시 존재 OR `--gtf` 제공 OR biomart 도달+pybiomart)
+      AND `var`에 매핑 가능 식별자(symbol/ensembl) 존재**(좌표 주석 단계 B12-pre 성공 가능성 게이트),
       `r_available`(R+renv: Slingshot/Monocle3), celltypist/cytotrace 가용성. LLM은 플래그 false면 해당 도구 선택 불가.
 - [ ] **A3. `session.py` (온디스크 1급)** — `session_id`/manifest/이력로그/단계별 `.h5ad` 체크포인트 + file lock.
       인메모리는 캐시. AnnData provenance(`.uns["scpilot"]`)·불변식 헬퍼.
@@ -349,9 +351,28 @@ tool은 한 번에 하나씩 추가하고, **추가할 때마다 `scpilot step`(
       를 Tier2/3 입력으로 고정(B6 재사용).
 - [ ] **B11. `core/compartment.py`** — **compartment 계획 tool**(실 카운트·coverage·marker, 임계 미달 분기 차단) +
       subset 재처리 **두 모드**(marker용 expression 재정규화·HVG / 클러스터링용 integration-aware) + batch-mixing 진단.
-- [ ] **B12. `core/cnv.py` (Tier 2 malignancy, fine보다 선행)** — infercnvpy: `var` 좌표·정렬·build 게이트 +
-      reference 점검(없으면 fallback/skip) + epithelial/후보 **범위한정** + 잡 모델. **CNV+tumor marker+normal-epi ref+
-      patient expansion** 통합 → `obs["malignancy"]∈{malignant,non_malignant,uncertain,not_applicable}`(confidence).
+- [ ] **B12-pre. `annotate_genomic_positions` (좌표 주석 — CNV의 필수 preflight 서브툴)** — 현 데이터 `var`엔 좌표가
+      없으므로(symbol만, `n_cells`뿐) CNV 전 반드시 수행. infercnvpy `genomic_position_from_gtf(gtf_gene_id="gene_name")`로
+      `var[chromosome,start,end]` 채움. **설계 핵심**:
+      - **좌표 소스**: 기본 = **고정 릴리스 GENCODE GRCh38 GTF 1회 다운로드 → sha256 content-addressed 캐시·재사용**
+        (결정성 등급 A). 대체 = 사용자 `--gtf`(정렬 ref면 최선), offline 불가 시 biomart `hgnc_symbol`(등급 B, 네트워크·
+        Ensembl 버전 의존으로 플래그). `--genome-build {GRCh38(기본),GRCh37}` provenance 기록.
+      - **2-pass symbol 매핑(make_unique 안전 역연산)**: Pass1 = `var_names` 원본을 `gene_name`에 매칭(→ `HLA-A`/`NKX2-1`
+        등 실제 하이픈 유전자 정상 매핑). Pass2 = Pass1 실패 + `^(.+)-\d+$` 패턴만 base symbol로 재매핑(중복 suffix 회수);
+        그 외 미매핑은 `chromosome=NaN`(infercnvpy 자동 제외). **단순 trailing `-\d+` strip 금지**(실제 하이픈 유전자 훼손).
+      - **chromosome 명명 `chr` prefix로 통일**(infercnvpy `exclude_chromosomes=('chrX','chrY')` 기본과 정합).
+      - **커버리지 게이트 + 요약 반환**: `{n_genes_total, n_mapped, mapped_fraction, make_unique_recovered, n_unmapped,
+        genome_build, source(type/name/sha256), reproducibility_grade, per_chromosome_gene_counts, unmapped_kind(noncoding/
+        clone 비중), unmapped_preview}`. `frac≥0.7` 정상 / `0.5~0.7` 경고(미매핑이 lncRNA/AS/MIR 위주면 무해, build 불일치면
+        의심) / `<0.5` 강한 경고 + build 재확인·사용자 GTF 제안. ⚠️ **다중 GSE build 불일치**는 매핑률로 감지.
+      - **불변식**: `var` 컬럼 추가만(비파괴) — `layers["counts"]`·`.X` 의미 불변. provenance(GTF 해시·build·매핑률)는
+        `.uns["scpilot"]`. replay는 등급별 tolerance.
+- [ ] **B12. `core/cnv.py` (Tier 2 malignancy, fine보다 선행)** — **B12-pre 좌표 주석 통과 후** infercnvpy `tl.infercnv`:
+      reference 선택(본 데이터 `condition=Normal` 14,169셀 → 정상 췌장상피 또는 확실한 비악성 immune/stromal을 `reference_cat`;
+      깨끗한 normal-epi ref 없으면 immune/stromal·외부ref·advisory-only·skip 택1) + epithelial/후보 **범위한정** + 잡 모델.
+      **CNV+tumor marker+normal-epi ref+patient expansion** 통합 →
+      `obs["malignancy"]∈{malignant,non_malignant,uncertain,not_applicable}`(confidence).
+      `cnv_available=false`면 CNV 증거 없이 marker+ref+expansion만 → Tier5에서 `review_required`.
 - [ ] **B13. `core/annotate.py` (Tier 3 fine)** — compartment·malignancy에서 세분 → `obs["fine_cell_type"]` +
       `obs["facs_style_label"]`(예 `CD8+ PD-1+ T cells`) + evidence_for/against·confounders를 `.uns[...annotation_tree]`에.
       **LLM이 조직/질환 맥락으로 전략 결정**, 작은 클러스터 merge·insufficient-evidence 규칙.

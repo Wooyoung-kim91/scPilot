@@ -19,3 +19,6 @@ sessions/
 
 # OS / 에디터
 .DS_Store
+
+# PoC/캐시 산출물
+.cache/
