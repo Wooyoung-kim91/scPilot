@@ -79,9 +79,9 @@ def test_qc_filter_subsets_cells(tmp_path):
     assert r.summary["n_cells_before"] == n_before
     assert r.summary["n_cells_after"] <= n_before
     assert set(r.summary["per_sample"]) == {"s1", "s2"}
-    # high min_genes removes (almost) everything
+    # cutoffs that remove everything -> recoverable error, NOT an empty checkpoint
     s2 = _session_with(_qc_fixture(), tmp_path / "b")
     tools.run("qc_metrics", s2, run_scrublet=False)
     r2 = tools.run("qc_filter", s2, min_genes=10_000, max_pct_mt=100.0)
-    assert r2.summary["n_cells_after"] == 0
-    assert r2.warnings  # fully-removed-sample warning
+    assert r2.status == "error" and r2.error_code == "convergence_failed"
+    assert r2.recoverable is True

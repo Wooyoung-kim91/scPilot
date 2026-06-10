@@ -32,10 +32,13 @@ def markers(session, *, groupby: str = "leiden", n_genes: int = 25, layer: str |
     use_layer = layer if (layer and layer in adata.layers) else None
     warnings = [] if use_layer else [f"layer '{layer}' absent — ranking on X"]
 
+    # rank ALL genes so the CSV artifact is a genuine full ranking (Codex review 1.5);
+    # the inline preview is capped separately by n_genes.
     sc.tl.rank_genes_groups(adata, groupby=groupby, method="wilcoxon", layer=use_layer,
-                            use_raw=False, n_genes=min(n_genes, adata.n_vars))
+                            use_raw=False, n_genes=adata.n_vars)
     rg = adata.uns["rank_genes_groups"]
     groups = list(rg["names"].dtype.names)
+    preview_n = min(n_genes, adata.n_vars)
 
     # full long-form table + capped per-cluster top markers
     rows, top_by_cluster = [], []
@@ -61,7 +64,8 @@ def markers(session, *, groupby: str = "leiden", n_genes: int = 25, layer: str |
     top_df = pd.DataFrame(top_by_cluster)
     summary = {
         "groupby": groupby, "n_clusters": len(groups), "method": "wilcoxon",
-        "n_genes_per_cluster": min(n_genes, adata.n_vars),
+        "preview_genes_per_cluster": preview_n,
+        "csv_is_full_ranking": True, "n_genes_ranked": int(adata.n_vars),
         "layer": use_layer,
         "single_sample_dominated_clusters": [
             r["cluster"] for r in top_by_cluster if r["n_samples"] == 1],
@@ -71,7 +75,8 @@ def markers(session, *, groupby: str = "leiden", n_genes: int = 25, layer: str |
                                 description="full rank_genes_groups ranking")]
 
     cp = session.checkpoint("markers", x_state=session.manifest.x_state,
-                            params={"groupby": groupby, "n_genes": n_genes, "layer": use_layer})
+                            params={"groupby": groupby, "n_genes": n_genes, "layer": use_layer,
+                                    "sample_key": sample_key})
     return S.success("markers", summary=summary, tables=tables, artifacts=artifacts,
                      warnings=warnings, checkpoint=cp.path, determinism_grade="A",
                      duration_s=round(time.time() - t0, 3),

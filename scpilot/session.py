@@ -44,17 +44,34 @@ def _now() -> str:
 
 
 def counts_fingerprint(adata) -> dict | None:
-    """Cheap fingerprint of ``layers['counts']`` to detect accidental mutation.
+    """Fingerprint of ``layers['counts']`` to detect accidental mutation.
 
-    Avoids hashing 6GB: uses shape + dtype + nnz (sparse) / size (dense). A7 may
-    strengthen this with a content hash for archival.
+    Avoids hashing the whole 6GB: shape + dtype + nnz PLUS a cheap *content* hash
+    over a deterministic sample of the data values (so value drift that preserves
+    nnz/shape is still caught — Codex review 2.1).
     """
     if "counts" not in getattr(adata, "layers", {}):
         return None
+    import hashlib
+    import numpy as np
+
     m = adata.layers["counts"]
     fp = {"shape": [int(adata.n_obs), int(adata.n_vars)], "dtype": str(getattr(m, "dtype", "?"))}
     nnz = getattr(m, "nnz", None)
     fp["nnz"] = int(nnz) if nnz is not None else int(getattr(m, "size", 0))
+    # content hash over a deterministic stride sample of the nonzero/data values
+    data = getattr(m, "data", None)            # sparse: nonzero values
+    if data is None:
+        data = np.asarray(m).ravel()           # dense
+    data = np.asarray(data)
+    if data.size:
+        stride = max(1, data.size // 20000)    # cap the sample at ~20k values
+        sample = np.ascontiguousarray(data[::stride])
+        h = hashlib.sha256()
+        h.update(str(sample.dtype).encode())
+        h.update(sample.tobytes())
+        fp["content_sha"] = h.hexdigest()[:16]
+        fp["content_n"] = int(sample.size)
     return fp
 
 
@@ -215,10 +232,14 @@ class Session:
         ref = self.manifest.counts_fingerprint
         if ref is not None:
             cur = counts_fingerprint(adata)
-            if cur is not None and (cur["shape"][0] != ref["shape"][0] or cur["nnz"] != ref["nnz"]):
-                # cells may be filtered legitimately; only flag gene/value-count drift on same cells
-                if cur["shape"][1] != ref["shape"][1] and cur["shape"][0] == ref["shape"][0]:
-                    raise AssertionError(f"invariant violated: counts changed {ref} -> {cur}")
+            if cur is not None:
+                # genes must never change; cells may shrink via legitimate filtering
+                if cur["shape"][1] != ref["shape"][1]:
+                    raise AssertionError(f"invariant violated: gene count changed {ref['shape']} -> {cur['shape']}")
+                # value drift on the SAME cell set (no filtering) → counts was mutated
+                if cur["shape"][0] == ref["shape"][0] and ref.get("content_sha") \
+                        and cur.get("content_sha") and cur["content_sha"] != ref["content_sha"]:
+                    raise AssertionError("invariant violated: counts values changed (content hash drift)")
 
     # ---------- checkpoints ----------
     def checkpoint(self, stage: str, *, adata=None, x_state: str | None = None,

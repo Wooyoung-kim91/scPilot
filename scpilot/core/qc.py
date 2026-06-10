@@ -38,7 +38,13 @@ def _dist(series) -> dict:
 
 
 def _per_sample_scrublet(adata, sample_key: str, *, seed: int = 0):
-    """Run scrublet per sample on the counts layer; return (scores, preds, skipped)."""
+    """Run scrublet per sample on the counts layer; return (scores, preds, skipped).
+
+    Builds a MINIMAL temporary AnnData from the counts slice only (no extra
+    layers/obs/var) so 35× per-sample copies don't duplicate the full 40k-gene
+    object on the 180k-cell merge (Codex review 2.2).
+    """
+    import anndata as ad
     import numpy as np
     import scanpy as sc
 
@@ -46,21 +52,20 @@ def _per_sample_scrublet(adata, sample_key: str, *, seed: int = 0):
     scores = np.full(n, np.nan, dtype=float)
     preds = np.zeros(n, dtype=bool)
     skipped = []
-    use_counts = "counts" in adata.layers
-    for sid in adata.obs[sample_key].astype(str).unique():
-        idx = np.where(adata.obs[sample_key].astype(str).values == sid)[0]
+    counts = adata.layers["counts"] if "counts" in adata.layers else adata.X
+    sample_vals = adata.obs[sample_key].astype(str).values
+    for sid in np.unique(sample_vals):
+        idx = np.where(sample_vals == sid)[0]
         if idx.size < 30:                       # scrublet needs enough cells
-            skipped.append({"sample": sid, "n_cells": int(idx.size), "reason": "too_few_cells"})
+            skipped.append({"sample": str(sid), "n_cells": int(idx.size), "reason": "too_few_cells"})
             continue
-        sub = adata[idx].copy()
-        if use_counts:
-            sub.X = sub.layers["counts"].copy()
+        sub = ad.AnnData(X=counts[idx, :].copy())   # minimal: counts slice only
         try:
             sc.pp.scrublet(sub, random_state=seed)
             scores[idx] = sub.obs["doublet_score"].to_numpy()
             preds[idx] = sub.obs["predicted_doublet"].to_numpy()
         except Exception as exc:  # noqa: BLE001 — degrade gracefully per sample
-            skipped.append({"sample": sid, "n_cells": int(idx.size), "reason": f"{type(exc).__name__}"})
+            skipped.append({"sample": str(sid), "n_cells": int(idx.size), "reason": f"{type(exc).__name__}"})
     return scores, preds, skipped
 
 
@@ -78,19 +83,23 @@ def qc_metrics(session, *, sample_key: str = "sample_id", mito_prefix: str = "MT
     warnings: list[str] = []
 
     # --- QC metrics on COUNTS (X may be normalized on the merged object) ---
-    if "counts" in adata.layers:
-        x_backup = adata.X
-        adata.X = adata.layers["counts"]
-    else:
-        x_backup = None
-        warnings.append("no 'counts' layer — QC metrics computed on X (assumed counts)")
+    # exception-safe swap: restore X in finally so a failure can't leave X bound
+    # to the counts layer with silently-wrong downstream semantics (Codex review 1.2)
     up = adata.var_names.str.upper()
     adata.var["mt"] = up.str.startswith(mito_prefix.upper())
     adata.var["ribo"] = up.str.startswith(_RIBO_PREFIXES)
-    sc.pp.calculate_qc_metrics(adata, qc_vars=["mt", "ribo"], inplace=True,
-                               percent_top=None, log1p=False)
-    if x_backup is not None:
-        adata.X = x_backup
+    has_counts = "counts" in adata.layers
+    if not has_counts:
+        warnings.append("no 'counts' layer — QC metrics computed on X (assumed counts)")
+    x_backup = adata.X if has_counts else None
+    try:
+        if has_counts:
+            adata.X = adata.layers["counts"]
+        sc.pp.calculate_qc_metrics(adata, qc_vars=["mt", "ribo"], inplace=True,
+                                   percent_top=None, log1p=False)
+    finally:
+        if x_backup is not None:
+            adata.X = x_backup
 
     # --- mixed-lineage (EPCAM + CD3D co-expression) on counts ---
     present = [g for g in _MIXED_LINEAGE_GENES if g in adata.var_names]
@@ -187,6 +196,17 @@ def qc_filter(session, *, min_genes: int = 200, max_pct_mt: float = 20.0,
     if drop_predicted_doublets and "predicted_doublet" in adata.obs:
         keep &= ~adata.obs["predicted_doublet"].fillna(False).astype(bool)
 
+    # guard: cutoffs that remove EVERYTHING must not checkpoint an empty object
+    # (downstream PCA/clustering would fail opaquely) — Codex review 2.3
+    if not bool(keep.values.any()):
+        return S.error("qc_filter", "convergence_failed",
+                       "all cells removed by cutoffs — relax thresholds", recoverable=True,
+                       summary={"n_cells_before": int(n0),
+                                "cutoffs": {"min_genes": min_genes, "max_pct_mt": max_pct_mt,
+                                            "min_counts": min_counts, "max_doublet_score": max_doublet_score,
+                                            "drop_predicted_doublets": drop_predicted_doublets}},
+                       suggested_next_tools=["qc_metrics"])
+
     # per-sample kept/removed (batch-aware reporting)
     per_sample = {}
     if sample_key in adata.obs.columns:
@@ -212,7 +232,8 @@ def qc_filter(session, *, min_genes: int = 200, max_pct_mt: float = 20.0,
     if empty:
         warnings.append(f"{len(empty)} sample(s) fully removed by cutoffs: {empty[:5]}")
 
-    cp = session.checkpoint("qc_filter", x_state=session.manifest.x_state, params=summary["cutoffs"])
+    cp = session.checkpoint("qc_filter", x_state=session.manifest.x_state,
+                            params={**summary["cutoffs"], "sample_key": sample_key})
     return S.success("qc_filter", summary=summary, warnings=warnings, checkpoint=cp.path,
                      determinism_grade="A", duration_s=round(time.time() - t0, 3),
                      suggested_next_tools=["preprocess"])

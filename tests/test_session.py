@@ -98,3 +98,16 @@ def test_counts_fingerprint_and_invariant(tmp_path):
     del b.layers["counts"]
     with pytest.raises(AssertionError):
         s.assert_invariants(b)
+
+
+def test_invariant_catches_counts_value_drift(tmp_path):
+    # Codex review 2.1: value drift that preserves shape/nnz must be caught via content hash
+    a = _tiny_adata()
+    s = Session.create(tmp_path / "sess")
+    s.set_adata(a)
+    s.manifest.counts_fingerprint = counts_fingerprint(a)
+    s.assert_invariants(a)                       # unchanged -> ok
+    # mutate a nonzero count value in place (same shape, same nnz)
+    a.layers["counts"].data[0] += 7.0
+    with pytest.raises(AssertionError):
+        s.assert_invariants(a)

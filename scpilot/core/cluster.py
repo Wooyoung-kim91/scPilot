@@ -48,7 +48,8 @@ def cluster(session, *, use_rep: str = "X_pca", n_neighbors: int = 15, n_pcs: in
     }
     cp = session.checkpoint("cluster", x_state=session.manifest.x_state,
                             params={"use_rep": use_rep, "n_neighbors": n_neighbors,
-                                    "n_pcs": use_pcs, "resolution": resolution, "seed": seed})
+                                    "n_pcs": use_pcs, "resolution": resolution, "seed": seed,
+                                    "key_added": key_added})
     return S.success("cluster", summary=summary, checkpoint=cp.path, determinism_grade="B",
                      duration_s=round(time.time() - t0, 3),
                      suggested_next_tools=["markers"])
