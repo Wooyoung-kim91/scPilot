@@ -369,7 +369,11 @@ tool은 한 번에 하나씩 추가하고, **추가할 때마다 `scpilot step`(
       + `TablePreview`(행수 캡+full CSV 포인터) + 잡 스키마(`JobStatus`/`FallbackAttempt`) + `success()`/`error()`/
       `artifact_csv/png()`/`table_preview()` 생성자 + `_sanitize`(numpy/NaN/Path→strict JSON). 표준 `ERROR_CODES`.
       검증: `tests/test_schemas.py` 7 passed (JSON 직렬화·numpy/NaN 정화·표 캡·artifact 절대경로·잡 스키마).
-- [ ] **A5. `cli.py` 골격 + `step`** — Typer 엔트리포인트 + `step` 디스패치.
+- [x] **A5. `cli.py` 골격 + `step`** — ✅**완료(2026-06-10)**: `tools.py` **최소 레지스트리**(`register`/`get`/`run`/
+      `list_tools`, `ToolSpec` name/fn/mutating/long_running; 계약 `fn(session,**params)->ToolResult`; `inspect` 등록) +
+      `cli step <stage> <input> [--workdir/-w][--param/-p k=v][--seed]` 디스패치(세션 생성→시드 핀→tool 실행→run_log 기록→
+      ToolResult JSON, exit by status). 검증: `step inspect`로 실데이터 end-to-end(stdout 순수 JSON·run_log·manifest),
+      미등록 stage 에러. `tests/test_tools.py` 5 passed. **B 도구는 이 레지스트리에 register하면 step/MCP/replay 자동 연결.**
 - [x] **A6. MCP 최소 서버 조기 도입** — ✅**완료(2026-06-10)**: `mcp_server.py`(FastMCP)에 읽기전용 `inspect_h5ad_tool`
       + `scpilot_version`, `init_runtime()` 기동, stdout=프로토콜만·로그 stderr. `core/io.py inspect_h5ad`(backed='r', ToolResult).
       cli `mcp` + `__main__.py`. **MCP SDK stdio 클라이언트 end-to-end 검증**(`tests/test_mcp_server.py` 1 passed).

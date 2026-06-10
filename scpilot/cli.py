@@ -62,11 +62,69 @@ def mcp() -> None:
 
 @app.command()
 def step(
-    stage: str = typer.Argument(..., help="core stage name, e.g. cluster"),
+    stage: str = typer.Argument(..., help="tool/stage name (e.g. inspect)"),
     inp: str = typer.Argument(..., metavar="INPUT", help="input .h5ad path"),
+    workdir: str = typer.Option(None, "--workdir", "-w", help="session working directory"),
+    param: list[str] = typer.Option(None, "--param", "-p", help="k=v tool param (repeatable)"),
+    seed: int = typer.Option(0, "--seed", help="global RNG seed"),
 ) -> None:
-    """Run a single deterministic stage with no LLM (plan A5/mode 3). Stub."""
-    _todo(f"step {stage}")
+    """Run a single tool deterministically, no LLM (plan A5 / mode 3).
+
+    Dispatches ``stage`` through the tool registry against an on-disk Session and
+    prints the ToolResult as JSON. Used for debug + structural-invariant regression.
+    """
+    import json
+    from pathlib import Path
+
+    from scpilot import schemas as S
+    from scpilot import tools
+    from scpilot.repro import set_global_seed
+    from scpilot.session import Session
+
+    try:
+        spec = tools.get(stage)
+    except KeyError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+
+    params = _parse_params(param or [])
+    seed_rec = set_global_seed(seed)
+    wd = workdir or str(Path.cwd() / "scpilot_session")
+    session = Session.create(wd, input_path=inp)
+
+    result = spec.fn(session, **params)
+    session.log_run(S.RunLogRecord(
+        tool=stage, status=result.status, params=params, seed=seed,
+        determinism_grade=result.determinism_grade,
+        output_checkpoint=result.checkpoint, error_code=result.error_code,
+        duration_s=result.duration_s, lib_versions={"seed_record": seed_rec},
+    ).to_dict())
+
+    typer.echo(json.dumps(result.to_dict(), indent=2))
+    raise typer.Exit(code=0 if result.status == "success" else 1)
+
+
+def _parse_params(items: list[str]) -> dict:
+    """Parse repeated ``k=v`` options into a dict (int/float/bool/str inferred)."""
+    out: dict = {}
+    for it in items:
+        if "=" not in it:
+            raise typer.BadParameter(f"--param must be k=v, got: {it}")
+        k, v = it.split("=", 1)
+        out[k.strip()] = _coerce(v.strip())
+    return out
+
+
+def _coerce(v: str):
+    low = v.lower()
+    if low in ("true", "false"):
+        return low == "true"
+    for cast in (int, float):
+        try:
+            return cast(v)
+        except ValueError:
+            pass
+    return v
 
 
 @app.command()
