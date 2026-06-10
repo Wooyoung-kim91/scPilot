@@ -42,8 +42,14 @@ def version() -> None:
 
 @app.command()
 def doctor() -> None:
-    """Environment / capability preflight (plan A2). Stub."""
-    _todo("doctor")
+    """Environment / capability preflight (plan A2): deps + capability flags + smoke, as JSON."""
+    import json
+
+    from scpilot.doctor import run as run_doctor
+
+    report = run_doctor()
+    typer.echo(json.dumps(report, indent=2))
+    raise typer.Exit(code=0 if report["ok"] else 1)
 
 
 @app.command()

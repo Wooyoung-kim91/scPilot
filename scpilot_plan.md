@@ -342,8 +342,10 @@ tool은 한 번에 하나씩 추가하고, **추가할 때마다 `scpilot step`(
       **선택(Tier2/3·궤적)**: `celltypist`/`infercnvpy`/**`gtfparse`(infercnvpy GTF 좌표주석 필수 옵션의존 — 실측 확인)**/
       `scvelo`/`cellrank`/`palantir`/`cytotrace` + R(Slingshot/Monocle3) (있을 때만 도구 활성, `doctor`로 게이트).
       (현 scpilot env엔 celltypist·infercnvpy·gtfparse·pybiomart 설치 완료.)
-- [ ] **A2. 환경 preflight** — `scpilot doctor`: 전 의존성(scvi/scrublet/jax|torch/numba/igraph/scib/scikit-misc)
-      import + 버전 출력 + tiny smoke test. **numpy 2.x 호환 조기 확인**, 실패 시 actionable 가이드.
+- [x] **A2. 환경 preflight** — ✅**완료(2026-06-10, `scpilot/doctor.py`)**: `scpilot doctor`가 의존성 probe + 버전 +
+      tiny smoke(normalize/log1p/**HVG seurat_v3**/pca) + capability 플래그를 **compact JSON(stdout 순수)**로 반환,
+      `ok` 따라 exit 0/1. 실측: ok=true, cnv_available=true, velocity=false, r=true, smoke ok. **numpy 2.x 호환 조기 확인**,
+      실패 시 actionable 가이드.
       **capability 플래그 산출**: `velocity_available`(spliced/unspliced 有),
       **`cnv_available` = infercnvpy import OK AND 좌표소스 가용(GTF 캐시 존재 OR `--gtf` 제공 OR biomart 도달+pybiomart)
       AND `var`에 매핑 가능 식별자(symbol/ensembl) 존재**(좌표 주석 단계 B12-pre 성공 가능성 게이트),
