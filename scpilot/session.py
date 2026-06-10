@@ -267,14 +267,19 @@ class Session:
 
     @property
     def adata(self):
-        """The cached working AnnData; lazily load the latest checkpoint if absent."""
+        """The cached working AnnData. Lazily load the latest checkpoint, else the
+        session input — so step-by-step CLI runs (each a fresh process) resume from
+        the on-disk state without an explicit `load` call."""
         if self._adata is None:
             cp = self.latest_checkpoint()
-            if cp is None:
-                raise RuntimeError("no working AnnData and no checkpoint to load; call load_input first")
-            import anndata as ad
-            self._adata = ad.read_h5ad(cp["path"])
-            self._refresh_counts_state()
+            if cp is not None:
+                import anndata as ad
+                self._adata = ad.read_h5ad(cp["path"])
+                self._refresh_counts_state()
+            elif self.manifest.input.get("path"):
+                self.load_input()                     # first mutating step: load the input
+            else:
+                raise RuntimeError("no working AnnData, no checkpoint, and no session input")
         return self._adata
 
     def set_adata(self, adata) -> None:
