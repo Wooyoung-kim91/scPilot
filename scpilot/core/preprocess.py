@@ -1,8 +1,9 @@
 """Preprocessing: normalize → log1p → HVG (seurat_v3) → PCA — scpilot plan B4.
 
 Starts from the immutable ``counts`` layer (so the step is reproducible regardless
-of what X currently holds), writes log-normalized values to X + a ``lognorm`` layer
-(kept for marker/annotation use), selects HVGs with ``seurat_v3`` (counts-based,
+of what X currently holds), writes log-normalized values to X + a ``scale.data``
+layer (project convention; kept for marker/annotation use), selects HVGs with
+``seurat_v3`` (counts-based,
 needs scikit-misc; batch-aware via ``hvg_batch_key``), and runs PCA on the HVGs.
 
 No global ``sc.pp.scale`` — densifying 40k genes × 180k cells is infeasible and
@@ -48,7 +49,9 @@ def preprocess(session, *, target_sum: float = 1e4, n_top_genes: int = 2000,
     adata.X = adata.layers["counts"].copy()
     sc.pp.normalize_total(adata, target_sum=target_sum)
     sc.pp.log1p(adata)
-    adata.layers["lognorm"] = adata.X.copy()
+    # project convention (matches scqc merged): raw counts stay in `counts`,
+    # normalize_total+log1p values are stored in `scale.data` (kept for markers/annotation)
+    adata.layers["scale.data"] = adata.X.copy()
 
     # --- HVG (seurat_v3, counts-based; batch-aware if a valid key is given) ---
     batch_key = hvg_batch_key
@@ -75,7 +78,7 @@ def preprocess(session, *, target_sum: float = 1e4, n_top_genes: int = 2000,
         "variance_ratio": vr[:50],
         "cumulative_variance_at_n_pcs": round(cum, 4),
         "suggested_n_pcs_elbow": suggested,
-        "x_state": "log1p", "lognorm_layer": "lognorm",
+        "x_state": "log1p", "normalized_layer": "scale.data",
     }
     cp = session.checkpoint("preprocess", x_state="log1p",
                             params={"target_sum": target_sum, "n_top_genes": n_top,

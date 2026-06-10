@@ -41,7 +41,7 @@ def test_preprocess(tmp_path):
     assert sm["n_hvg"] > 0 and sm["n_hvg"] <= 100
     assert sm["x_state"] == "log1p"
     assert "X_pca" in s.adata.obsm
-    assert "lognorm" in s.adata.layers
+    assert "scale.data" in s.adata.layers      # project convention: log-norm layer
     assert len(sm["variance_ratio"]) == sm["n_pcs"]
     assert 1 <= sm["suggested_n_pcs_elbow"] <= sm["n_pcs"]
     assert r.determinism_grade == "B"
@@ -71,7 +71,8 @@ def test_cluster_and_markers_chain(tmp_path):
     rc = tools.run("cluster", s, resolution=0.5)
     assert rc.status == "success"
     assert rc.summary["n_clusters"] >= 2          # two planted groups
-    assert rc.summary["has_umap"] is True
+    assert rc.summary["cluster_key"] == "leiden"  # baseline keeps canonical name
+    assert "X_umap" in rc.summary["embeddings_present"]
     assert sum(rc.summary["cluster_sizes"].values()) == s.adata.n_obs
 
     rm = tools.run("markers", s, n_genes=15)
@@ -83,6 +84,22 @@ def test_cluster_and_markers_chain(tmp_path):
     from pathlib import Path
     assert Path(rm.artifacts[0].path).exists()
     rm.to_dict()
+
+
+def test_cluster_preserves_reductions_per_model(tmp_path):
+    """All reductions kept per model, before+after integration (user requirement)."""
+    s = _session(tmp_path)
+    tools.run("preprocess", s, n_top_genes=100, n_pcs=20)
+    tools.run("cluster", s, use_rep="X_pca")                 # baseline: X_umap / leiden
+    # simulate an integration embedding, then cluster on it
+    s.adata.obsm["X_scVI"] = s.adata.obsm["X_pca"][:, :10].copy()
+    rc = tools.run("cluster", s, use_rep="X_scVI")
+    a = s.adata
+    # baseline reductions still present AND model-specific ones added (not overwritten)
+    assert "X_umap" in a.obsm and "X_umap_scvi" in a.obsm
+    assert "leiden" in a.obs and "leiden_scvi" in a.obs
+    assert rc.summary["umap_key"] == "X_umap_scvi"
+    assert rc.summary["cluster_key"] == "leiden_scvi"
 
 
 def test_registry_has_b4_b7():

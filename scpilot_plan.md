@@ -84,6 +84,11 @@ scpilot은 그 batch-aware QC 산출을 진입 데이터로 상속.
   전체는 CSV/PNG **artifact 경로(절대경로 + 메타)** 로. PNG는 호스트 파일시스템 가시성 차이 고려해 경로+메타 반환.
 - **AnnData 불변식**: `layers["counts"]` 불변 / `.X`의 의미(정규화 여부)를 단계마다 기록 / 통합 임베딩은 `.obsm`에만 /
   모든 mutating tool은 `.uns["scpilot"]`에 provenance(파라미터·시드·버전) 기록.
+- **레이어 규약(사용자 확정 2026-06-10)**: `layers["counts"]`=raw count(보존·불변), `layers["scale.data"]`=
+  `normalize_total`+`log1p` 값(log-normalized; marker/annotation 계산용). scqc merged의 기존 규약과 일치.
+- **차원축소 보존 규약(사용자 확정 2026-06-10)**: PCA/UMAP 등 **모든 reduction을 통합 전후·모델별로 전부 보존**(덮어쓰기 금지).
+  obsm: `X_pca`·`X_umap`(baseline) / `X_harmony`·`X_umap_harmony` / `X_scVI`·`X_umap_scvi` …; obs: `leiden`·`leiden_<model>`;
+  uns/obsp neighbors도 `neighbors_<model>`로 네임스페이스. (cluster 도구가 use_rep에서 suffix 자동 도출, baseline은 canonical.)
 - **재현성**: 난수 시드 고정·기록. 회귀검증은 정확값이 아니라 **구조 불변식**(키 존재, shape 일치,
   클러스터 수 허용오차 내)으로.
 

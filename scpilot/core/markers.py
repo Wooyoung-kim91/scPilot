@@ -17,7 +17,7 @@ from scpilot.tools import register
 @register("markers", mutating=True,
           description="rank_genes_groups (Wilcoxon) per cluster → top markers table + per-cluster size/sample "
                       "spread; full ranking as CSV artifact (plan B7).")
-def markers(session, *, groupby: str = "leiden", n_genes: int = 25, layer: str | None = "lognorm",
+def markers(session, *, groupby: str = "leiden", n_genes: int = 25, layer: str | None = "scale.data",
             sample_key: str = "sample_id", **params) -> S.ToolResult:
     import numpy as np
     import pandas as pd

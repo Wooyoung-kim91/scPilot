@@ -36,7 +36,7 @@ UNS_ANNO = "scpilot_annotation"
           description="Tier 1 broad cell type → obs['major_cell_type'] from per-cell marker scores "
                       "(batch-agnostic anchor) aggregated to clusters; flags circular-risk / marker-conflict (plan B8).")
 def annotate_broad(session, *, groupby: str = "leiden", batch_key: str = "GSE",
-                   layer: str | None = "lognorm", min_confidence: float = 0.5,
+                   layer: str | None = "scale.data", min_confidence: float = 0.5,
                    conflict_margin: float = 0.1, circular_frac: float = 0.8,
                    **params) -> S.ToolResult:
     import numpy as np
