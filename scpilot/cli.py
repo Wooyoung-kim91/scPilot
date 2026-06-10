@@ -84,8 +84,17 @@ def run(
 def replay(
     session: str = typer.Argument(..., help="session directory to replay"),
 ) -> None:
-    """Deterministic replay from the run log (plan mode 4). Stub."""
-    _todo("replay")
+    """Deterministic replay from the run log, no LLM (plan A7 / mode 4).
+
+    Without a tool registry (plan C1/A5) this runs in dry-run mode: validates and
+    reports the recorded run log + decisions. Emits a JSON report.
+    """
+    import json
+
+    from scpilot.repro import replay_session
+
+    report = replay_session(session)  # executor wired once the registry exists
+    typer.echo(json.dumps(report, indent=2))
 
 
 if __name__ == "__main__":

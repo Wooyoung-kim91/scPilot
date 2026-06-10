@@ -220,6 +220,83 @@ def artifact_png(path: str, *, width_in: float | None = None, height_in: float |
 
 
 # --------------------------------------------------------------------------- #
+# Reproducibility harness schemas — scpilot plan A7 (FROZEN before B11+)
+# --------------------------------------------------------------------------- #
+# Canonical decision types the LLM/orchestrator records. Free-form str is allowed,
+# but new recurring kinds SHOULD be added here so replay/audit stay consistent.
+DECISION_TYPES = (
+    "qc_cutoff",                # QC thresholds (min_genes/max_pct_mt/...)
+    "hvg_npcs",                 # n HVGs / n PCs
+    "integration_method",       # unintegrated | harmony | scvi
+    "clustering_resolution",    # leiden resolution
+    "tier1_consensus_label",    # broad major_cell_type consensus (de-risk ①)
+    "compartment_branch",       # which compartments to recurse into
+    "malignancy_call",          # Tier 2 malignant/non/uncertain
+    "cnv_reference",            # reference cells chosen for inferCNV
+    "cnv_fallback",             # CNV fallback path taken
+    "trajectory_method",        # PAGA | slingshot | ... (gated)
+    "annotation_strategy",      # tissue/disease-adaptive strategy choice
+    "de_design",                # pseudobulk vs cell-level, grouping
+)
+
+# Required keys for a decision event (validated by validate_decision).
+_DECISION_REQUIRED = ("decision_type", "choice", "candidates", "rationale")
+
+
+@dataclass
+class DecisionEvent:
+    """A first-class LLM decision (plan A7). Append to the session decision log.
+
+    FROZEN shape — recorded so ``scpilot replay`` can re-run a pipeline WITHOUT
+    re-querying the LLM (it consumes the recorded ``choice``/``params``).
+    """
+    decision_type: str                       # ∈ DECISION_TYPES (or free str)
+    choice: Any                              # selected option (str or dict)
+    candidates: list = field(default_factory=list)   # options considered (name + metrics)
+    rationale: str = ""                      # short reasoning
+    confidence: float | None = None          # 0..1
+    input_summary_ref: str | None = None     # artifact/checkpoint id the call was based on
+    params: dict = field(default_factory=dict)       # downstream params implied by the choice
+    stage: str | None = None                 # tool/stage that prompted it
+    alternatives_rejected: list = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return _sanitize(dataclasses.asdict(self))
+
+
+@dataclass
+class RunLogRecord:
+    """One mutating-tool run in the append-only run log (plan A7). FROZEN shape."""
+    tool: str
+    status: Status = "success"
+    stage: str | None = None
+    params: dict = field(default_factory=dict)
+    seed: int | None = None
+    input_checkpoint: str | None = None
+    output_checkpoint: str | None = None
+    determinism_grade: DeterminismGrade | None = None
+    recipe_hash: str | None = None
+    lib_versions: dict = field(default_factory=dict)
+    duration_s: float | None = None
+    error_code: str | None = None
+
+    def to_dict(self) -> dict:
+        return _sanitize(dataclasses.asdict(self))
+
+
+def validate_decision(d: dict) -> list[str]:
+    """Return a list of problems (empty == valid) for a decision-event dict."""
+    problems = [f"missing required key: {k}" for k in _DECISION_REQUIRED if k not in d]
+    if "confidence" in d and d["confidence"] is not None:
+        c = d["confidence"]
+        if not isinstance(c, (int, float)) or not (0.0 <= float(c) <= 1.0):
+            problems.append("confidence must be in [0,1]")
+    if "candidates" in d and not isinstance(d["candidates"], list):
+        problems.append("candidates must be a list")
+    return problems
+
+
+# --------------------------------------------------------------------------- #
 # JSON sanitizer (numpy scalars/arrays, Path, set, non-finite floats)
 # --------------------------------------------------------------------------- #
 def _sanitize(obj: Any) -> Any:

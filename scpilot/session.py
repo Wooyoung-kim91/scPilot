@@ -255,8 +255,19 @@ class Session:
         self.manifest.n_runs += 1
         self.save()
 
-    def log_decision(self, record: dict) -> None:
-        """Append one LLM decision event to decisions.jsonl (schema frozen in A7)."""
+    def log_decision(self, record: dict, *, validate: bool = True) -> None:
+        """Append one LLM decision event to decisions.jsonl (schema frozen in A7).
+
+        Accepts a dict or a ``schemas.DecisionEvent``. Validates against the frozen
+        decision schema by default (raises on missing required keys).
+        """
+        if hasattr(record, "to_dict"):
+            record = record.to_dict()
+        if validate:
+            from scpilot.schemas import validate_decision
+            problems = validate_decision(record)
+            if problems:
+                raise ValueError(f"invalid decision event: {problems}")
         rec = {"ts": _now(), "session_id": self.manifest.session_id, **record}
         self._append_jsonl(self.decisions_path, rec)
 

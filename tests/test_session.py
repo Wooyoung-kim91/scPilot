@@ -72,8 +72,9 @@ def test_run_and_decision_logs_append(tmp_path):
     s = Session.create(tmp_path / "sess")
     s.log_run({"tool": "cluster", "status": "success", "params": {"resolution": 0.5}})
     s.log_run({"tool": "markers", "status": "success"})
-    s.log_decision({"decision": "integration_method", "choice": "harmony",
-                    "candidates": ["harmony", "scvi"], "confidence": 0.8})
+    s.log_decision({"decision_type": "integration_method", "choice": "harmony",
+                    "candidates": ["harmony", "scvi"], "rationale": "best scib bio-conservation",
+                    "confidence": 0.8})
     runs = [json.loads(l) for l in s.run_log_path.read_text().splitlines()]
     assert len(runs) == 2
     assert runs[0]["tool"] == "cluster" and "ts" in runs[0]

@@ -24,6 +24,10 @@ LLM의 역할(전부): ① 파이프라인 오케스트레이션 + 파라미터 
   `PDAC_merged_qc_log1p_hvg_umap.h5ad` (**2000 HVG로 subset**, PCA/Leiden/UMAP 有, **annotation 없음** → 회귀검증 전용,
   upstream 재실행은 raw merged에서), 조건비교용 `PDAC_pancreas_primary_vs_normal.h5ad`.
   ⚠️ `var`에 **chromosome/start/end 좌표 없음**(n_cells만) → CNV(B12) 전 좌표 주석 단계 선행 필수.
+- **raw upstream 테스트 데이터** `~/progenesis/Transcriptomics/scRNAseq/`(= scqc `input_root`): per-sample 10x 원본
+  3개 GSE(`PDAC_GSE155698`·`GSE197177`·`GSE205013`, CellRanger v3 `barcodes/features/matrix.tsv.gz`) +
+  `PDAC_GSE_metadata_combined.csv`(GSM/local_matrix_dir/GSE/condition…) + 원본 노트북. scqc가 이걸 소비해 merged 생성.
+  → **scpilot 테스트 전략**: 단일 GSE/GSM(작은 단위)로 io_10x·scqc qc 확장(scrublet) 검증, **tiny fixture는 1개 GSM 서브샘플**로 고정.
 - `claude` CLI 설치됨 (`~/.local/bin/claude`). proto는 **git 저장소로 초기화 완료**(branch `main`, 2026-06-10).
 - **product 이름 = `scpilot`** (CLI/패키지/env/`uns["scpilot"]` 공통). 2026-06-10 전역 rename 완료.
 
@@ -366,17 +370,17 @@ tool은 한 번에 하나씩 추가하고, **추가할 때마다 `scpilot step`(
       `artifact_csv/png()`/`table_preview()` 생성자 + `_sanitize`(numpy/NaN/Path→strict JSON). 표준 `ERROR_CODES`.
       검증: `tests/test_schemas.py` 7 passed (JSON 직렬화·numpy/NaN 정화·표 캡·artifact 절대경로·잡 스키마).
 - [ ] **A5. `cli.py` 골격 + `step`** — Typer 엔트리포인트 + `step` 디스패치.
-- [~] **A6. MCP 최소 서버 조기 도입** — ✅**프로토콜 검증 완료(2026-06-10)** / ⏳호스트 등록은 사용자 단계.
-      `mcp_server.py`(FastMCP)에 읽기전용 `inspect_h5ad_tool` + `scpilot_version` 노출, `init_runtime()` 기동,
-      stdout=프로토콜만·로그 stderr. `core/io.py inspect_h5ad`(backed='r', ToolResult 반환). cli `mcp` 와이어링 + `__main__.py`.
-      **MCP SDK stdio 클라이언트로 end-to-end 검증**(tools/list·short call·실데이터 read·error-path·stderr 위생):
-      `tests/test_mcp_server.py` 1 passed. **디리스크 ② 핵심 발견: `conda run`(캡처) 실패 → 직접 바이너리/`--no-capture-output`**
-      (등록 섹션 갱신). 남은 것: Claude Code+Codex 실등록·긴호출 취소·재연결.
-- [ ] **A7. 재현성 하네스 토대 (scqc `harness.py` 베다링 기반)** — scqc의 `run_stage`/`StageReport`/`is_fresh`/`atomic_path`/
-      provenance·소스스냅샷·`repro.py`/`init_runtime`을 vendored 시작점으로. **여기에 scpilot 확장**: 전역 시드 제어 유틸,
-      append-only run log + **`decision` 이벤트 스키마(Phase A에서 동결)**, `.uns["scpilot"]` 압축 포인터,
-      `scpilot replay <session>`(LLM·decision 소비, **결정성 등급별 tolerance diff** — scqc엔 없음), **pytest 스캐폴드**.
-      결정스키마는 재귀/선택 도구 추가 **전에** 고정. 이후 B마다 테스트 동반.
+- [x] **A6. MCP 최소 서버 조기 도입** — ✅**완료(2026-06-10)**: `mcp_server.py`(FastMCP)에 읽기전용 `inspect_h5ad_tool`
+      + `scpilot_version`, `init_runtime()` 기동, stdout=프로토콜만·로그 stderr. `core/io.py inspect_h5ad`(backed='r', ToolResult).
+      cli `mcp` + `__main__.py`. **MCP SDK stdio 클라이언트 end-to-end 검증**(`tests/test_mcp_server.py` 1 passed).
+      **Codex(전역) + Claude Code(user scope) 실등록 + `✔ Connected` 확인.** 디리스크② 핵심 발견: `conda run`(캡처) 실패
+      → 직접 env 바이너리 경로 등록(등록 섹션 갱신). (긴호출 취소·재연결은 잡 모델 C1에서.)
+- [x] **A7. 재현성 하네스 토대** — ✅**완료(2026-06-10)**: `scpilot/repro.py`(전역 시드 제어 `set_global_seed`:
+      numpy/random/torch/scvi; 경량 해시 `dataset_fingerprint`/`recipe_hash`; 등급별 tolerance 구조 diff `compare_summaries`
+      A/B/C; `replay_session` 드라이버) + **`decision` 이벤트 스키마 + run-log 스키마 동결**(`schemas.DecisionEvent`/
+      `RunLogRecord` + `DECISION_TYPES` + `validate_decision`) + `session.log_decision` 검증 연결 + `scpilot replay`(현재
+      dry-run; executor는 tool 레지스트리 C1/A5서 연결) + pytest. **decision 스키마 동결 완료 → B11+ 진행 가능.**
+      검증: `tests/test_repro.py` 7 passed(시드 결정성·해시·등급 tolerance·decision 검증·replay). provenance stamp는 A3(session).
 
 ### Phase B — core tool 단계별 구현 (annotation→benchmark 순서, 각 단계 = tool + step + MCP 동시 검증)
 - [ ] **B1. `core/io.py` (scqc `io_10x.py` 베다링)** — load_h5ad/save + vendored robust 10x 리더. load_10x/merge 자체는
