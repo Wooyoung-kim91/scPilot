@@ -62,38 +62,53 @@ def scpilot_source_hash() -> str:
     return h.hexdigest()[:16]
 
 
-_REPRO_TEMPLATE = '''#!/usr/bin/env python
-"""Standalone reproduction of step `{stage}` (scpilot) — auto-written per checkpoint.
+_PIPELINE_TEMPLATE = '''#!/usr/bin/env python
+"""Full scpilot pipeline — AUTO-GENERATED; reproduces the ENTIRE analysis from the input.
 
-Re-runs this one tool with its recorded params, starting from the recorded input
-state, against the pinned source snapshot. Provenance:
+Read top->bottom for the whole flow: each step is one tool call with its resolved
+params, in execution order. The ACTUAL implementation of every tool used is inlined
+(as comments) at the bottom so the full code is verifiable in one file; the exact
+importable source is also pinned under {snapshot_rel}/.
+
+Provenance:
 {prov}
 
-Input  state : {input_cp}
-Output (orig): {output_cp}
+Input: {input_cp}
 """
 import sys
 from pathlib import Path
 
-# pin imports to the exact scpilot source used for the original artifact
+# pin imports to the exact scpilot source that produced this analysis
 sys.path.insert(0, str(Path(__file__).resolve().parent / "{snapshot_rel}"))
 
 from scpilot import tools
 from scpilot.repro import set_global_seed
 from scpilot.session import Session
 
-TOOL = "{stage}"
-PARAMS = {params}
-INPUT_CHECKPOINT = r"{input_cp}"
+INPUT = r"{input_cp}"
 SEED = {seed}
 
-if __name__ == "__main__":
+
+def main():
     set_global_seed(SEED)
-    repro_dir = Path(__file__).resolve().parent.parent / ("repro_" + Path(__file__).stem.replace(".repro", ""))
-    sess = Session.create(str(repro_dir), input_path=INPUT_CHECKPOINT, exist_ok=True)
+    sess = Session.create(str(Path(__file__).resolve().parent.parent / "repro_pipeline"),
+                          input_path=INPUT, exist_ok=True)
     sess.load_input()
-    result = tools.run(TOOL, sess, **PARAMS)
-    print(result.status, result.checkpoint)
+    # ============================== FLOW ==============================
+{flow}
+    return sess
+
+
+if __name__ == "__main__":
+    s = main()
+    print("pipeline reproduced through stage:", s.manifest.stage)
+
+
+# ====================================================================
+# TOOL IMPLEMENTATIONS — the actual code executed at each step above
+# (inlined for inspection; the runnable copy is in {snapshot_rel}/)
+# ====================================================================
+{sources}
 '''
 
 
@@ -137,7 +152,7 @@ class Checkpoint:
     created_at: str
     fingerprint: dict | None = None
     x_state: str = "unknown"
-    repro: str | None = None      # path to the standalone reproduction script
+    params: dict = field(default_factory=dict)   # resolved params (for the full-pipeline script)
 
 
 @dataclass
@@ -152,6 +167,7 @@ class Manifest:
     counts_fingerprint: dict | None = None
     stage: str | None = None                            # last completed stage
     checkpoints: list = field(default_factory=list)     # list[dict] (Checkpoint asdict)
+    pipeline_script: str | None = None                  # code/pipeline.py (full flow)
     n_runs: int = 0
 
 
@@ -311,18 +327,15 @@ class Session:
         self._ensure_dirs()
         idx = len(self.manifest.checkpoints)
         cid = f"{idx:02d}_{stage}"
-        # input state for this step = prior checkpoint (or the session input) — for repro
-        prior = self.manifest.checkpoints[-1]["path"] if self.manifest.checkpoints \
-            else self.manifest.input.get("path", "")
         path = self.checkpoints_dir / f"{cid}.h5ad"
         with atomic_path(path) as tmp:
             a.write_h5ad(tmp, compression=compression)
-        # save the exact code that produced this step (source snapshot + standalone repro)
-        repro_path = self._write_repro(cid, stage, params or {}, prior, str(path))
         cp = Checkpoint(id=cid, stage=stage, path=str(path), created_at=_now(),
                         fingerprint=_fingerprint(path), x_state=self.manifest.x_state,
-                        repro=repro_path)
+                        params=params or {})
         self.manifest.checkpoints.append(cp.__dict__)
+        # (re)write the FULL pipeline script (entire flow, all steps, + inlined tool source)
+        self.manifest.pipeline_script = self._write_pipeline()
         self.manifest.stage = stage
         if self.manifest.counts_fingerprint is None:
             self.manifest.counts_fingerprint = counts_fingerprint(a)
@@ -347,24 +360,42 @@ class Session:
                             ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         return snap_name
 
-    def _write_repro(self, cid: str, stage: str, params: dict, input_cp: str,
-                     output_cp: str) -> str:
-        """Write code/<cid>.repro.py — a standalone script reproducing this step."""
+    def _write_pipeline(self) -> str:
+        """(Re)write code/pipeline.py — the FULL flow (all steps so far) as one runnable
+        script, with each tool's actual source inlined for inspection."""
+        import inspect
+
+        from scpilot import tools as _tools
+
         self.code_dir.mkdir(parents=True, exist_ok=True)
-        snapshot_rel = f"{self._snapshot_source()}"
+        snapshot_rel = self._snapshot_source()
         prov = build_provenance()
         prov_comment = "\n".join(
-            f"  {k}: {prov.get(k)}" for k in ("scpilot_version", "source_hash", "git_commit", "command", "timestamp"))
-        text = _REPRO_TEMPLATE.format(
-            stage=stage,
-            prov=prov_comment,
-            input_cp=input_cp,
-            output_cp=output_cp,
-            snapshot_rel=snapshot_rel,
-            params=pprint.pformat(params, indent=4, width=100, sort_dicts=True),
-            seed=int(params.get("seed", 0)) if isinstance(params, dict) else 0,
+            f"  {k}: {prov.get(k)}" for k in ("scpilot_version", "source_hash", "git_commit", "timestamp"))
+        inp = self.manifest.input.get("path", "")
+
+        flow_lines, src_blocks, seen = [], [], set()
+        seed = 0
+        for cp in self.manifest.checkpoints:
+            stage, params = cp["stage"], cp.get("params", {}) or {}
+            if "seed" in params:
+                seed = int(params["seed"])
+            flow_lines.append(f'    tools.run("{stage}", sess, **{params!r})  # {cp["id"]}')
+            if stage not in seen:
+                seen.add(stage)
+                try:
+                    src = inspect.getsource(_tools.get(stage).fn)
+                except Exception:  # noqa: BLE001
+                    src = f"# (source unavailable for {stage})"
+                commented = "\n".join("# " + ln for ln in src.splitlines())
+                src_blocks.append(f"# --- {stage} " + "-" * (60 - len(stage)) + "\n" + commented)
+
+        text = _PIPELINE_TEMPLATE.format(
+            prov=prov_comment, input_cp=inp, snapshot_rel=snapshot_rel, seed=seed,
+            flow="\n".join(flow_lines) if flow_lines else "    pass",
+            sources="\n\n".join(src_blocks),
         )
-        path = self.code_dir / f"{cid}.repro.py"
+        path = self.code_dir / "pipeline.py"
         with atomic_path(path) as tmp:
             tmp.write_text(text)
         return str(path)
