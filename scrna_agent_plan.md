@@ -16,17 +16,54 @@ LLM의 역할(전부): ① 파이프라인 오케스트레이션 + 파라미터 
 - **GPU 미탑재 (추후 추가 예정)** → scVI는 현 조건상 **CPU 모드**(`accelerator="cpu"`)로 진행.
   학습이 느리므로 검증 단계는 서브샘플 + epoch 축소. GPU 추가 시 `accelerator` 인자만 `"auto"`로 전환.
   Harmony(CPU)가 1차 통합 기본, scVI는 벤치마크 후보.
-- **미설치**: `mcp`, `anthropic`, `typer`, `celltypist` → 신규 설치 필요.
-- 실데이터 `/home/wykim/data/PDAC/`: raw counts 포함 `PDAC_merged_qc.h5ad` (180,977 cells × 40,237 genes,
-  GSE/GSM·disease·tissue·treatment 메타데이터, layers `counts`/`scale.data`), 처리완료
-  `PDAC_merged_qc_log1p_hvg_umap.h5ad` (PCA/Leiden/UMAP 有, **annotation 없음**).
-- `claude` CLI 설치됨 (`~/.local/bin/claude`).
+- **env 확정(2026-06-10)**: 작업 env = **`scpilot`** (`scRNAseq` 복제 → 검증된 numpy 2.x 호환 매트릭스 상속).
+  누락분 설치 완료: `scikit-misc 0.5.2`, `mcp 1.27.2`, `anthropic 0.109.1`, `celltypist 1.7.1`.
+  `infercnvpy 0.6.1`·`R 4.4.3`는 이미 존재. scrublet 0.2.3이 numpy 2.4.5에서 RUN 검증됨.
+- **실데이터** `/home/wykim/data/PDAC/`: raw counts 포함 `PDAC_merged_qc.h5ad` (180,977 cells × 40,237 genes,
+  GSE/GSM·disease·tissue·treatment 메타데이터, layers `counts`/`scale.data`; sample_id 35개·GSE 3개), 처리완료
+  `PDAC_merged_qc_log1p_hvg_umap.h5ad` (**2000 HVG로 subset**, PCA/Leiden/UMAP 有, **annotation 없음** → 회귀검증 전용,
+  upstream 재실행은 raw merged에서), 조건비교용 `PDAC_pancreas_primary_vs_normal.h5ad`.
+  ⚠️ `var`에 **chromosome/start/end 좌표 없음**(n_cells만) → CNV(B12) 전 좌표 주석 단계 선행 필수.
+- `claude` CLI 설치됨 (`~/.local/bin/claude`). proto는 **git 저장소로 초기화 완료**(branch `main`, 2026-06-10).
+- **product 이름 = `scpilot`** (CLI/패키지/env 공통). 본 문서 구판의 `scrna-agent`/`scRNAseq`/`uns["scrna_agent"]`
+  표기는 `scpilot`/`scpilot`/`uns["scpilot"]`로 갱신 예정(전역 rename 대기).
 
 ### 핵심 설계 아이디어
 LLM은 **데이터를 직접 보지 않고**, 서버가 보유한 AnnData에 대해 tool을 호출한다.
 각 tool은 데이터가 아니라 **요약 통계/표(JSON)** 를 반환 → LLM이 그 수치를 보고 임계값·resolution·통합방법을
 결정하고 다음 tool을 호출한다. 이 "tool은 요약만 반환, 데이터는 서버에 상주" 패턴이 토큰 효율과 재현성의 핵심.
 동일한 tool 집합을 **MCP 서버(클라이언트 LLM 구동)** 와 **CLI 에이전트(Anthropic API 자체 구동)** 둘 다에서 재사용.
+
+### scqc_pipeline 연계 — upstream 위임 + 하네스 베다링 (2026-06-10 분석 반영)
+옆 디렉토리 `/home/wykim/data/PDAC/scqc_pipeline/`(~2600 LOC, 성숙한 재현 가능 QC→merge CLI, 계약 단일소스
+`HARNESS.md`)가 **본 계획 Phase A의 상당 부분과 B1/B5·upstream QC/merge를 이미 구현**해 둠. 재구현은 명백한 중복이므로
+아래 경계로 분업한다.
+
+**① 책임 경계 (데이터 진입점)**
+- **scqc_pipeline 담당(upstream)**: metadata harmonize → per-sample 10x read → cell QC → merge → normalize.
+  산출물 `PDAC_merged_qc.h5ad`(counts+scale.data, 180977×40237)가 **scpilot의 진입점**. scpilot은 io/qc/merge를 재구현하지 않음.
+- **scpilot 담당(downstream)**: preprocess/HVG/PCA → baseline cluster → Tier1 annotation → integrate → benchmark →
+  final cluster → Tier2/3 annotation → CNV/trajectory → Tier5 review → DE → report.
+- 따라서 아래 **B1(io)·B2(state 일부)는 "scqc 위임/소비"로 격하**, **merge 단계는 scqc 소유**. scpilot은 merged h5ad에서 시작.
+
+**② 베다링(vendoring) — 코드 결합 방식 결정**
+scqc의 다음 모듈을 scpilot으로 **복사 후 독립 진화**(라이브러리 import 아님): `harness.py`(run_stage 계약·StageReport·
+`is_fresh` 5조건 체크포인트·`atomic_path`·provenance/소스 스냅샷/`repro.py`·`init_runtime` numba 캐시 패치),
+`io_10x.py`(robust 10x 리더), `plotting.py`(auto-fit figure 하네스), `metaschema.py`(cross-dataset harmonize/filter/derive).
+- 이로써 **Phase A(A3 session·A4 schemas·A7 재현성 하네스)는 "백지 설계"가 아니라 "scqc 1차자산 + scpilot 확장"으로 축소**.
+- ⚠️ 베다링 리스크(분기·이중 유지보수) 완화: 각 vendored 파일 상단에 `VENDORED FROM scqc_pipeline@<source_hash>` 주석 +
+  vendored primitive는 얇고 안정적으로 유지(과한 수정 자제). uns 키는 `scpilot`로 파라미터화.
+- **`init_runtime` numba 패치는 그대로 필수**: stdio MCP 서브프로세스(detached 세션)에서 numba import가 깨지는 동일 문제 발생.
+
+**③ scpilot이 scqc 위에 순수 신규로 추가하는 것** (scqc에 없음):
+MCP 서버(1순위 인터페이스) · 장시간 tool **잡 모델**(scVI/Harmony/scib/CNV는 stdio 타임아웃 초과) ·
+**분기/재귀·capability 게이트 가능한 tool 레지스트리**(scqc의 선형 `Pipeline.ORDER`로는 compartment 재귀·선택 도구 표현 불가) ·
+**LLM `decision`-event 스키마** · **결정성 등급(A/B/C) tolerance replay** · **capability-flag doctor**(scqc doctor는 matrix-dir만 점검) ·
+다운스트림 전 과학(integrate/benchmark/annotate Tier0-5/cnv/trajectory/de/report).
+
+**④ QC 경계 결정**: scrublet per-sample + %ribo + stress/dissociation + mixed-lineage(EPCAM+CD3D) 플래그 + batch-aware 분포
+요약 반환은 **scqc의 per-sample qc stage를 확장**해 처리(scrublet은 merge 前 per-sample이어야 하므로 upstream에 기여).
+scpilot은 그 batch-aware QC 산출을 진입 데이터로 상속.
 
 ### 상태/세션 모델 (Codex 리뷰 반영 — **온디스크 우선**)
 6GB AnnData를 stdio MCP 프로세스 메모리에만 상주시키면 호스트 재시작·크래시·타임아웃·2차 클라이언트에서
@@ -281,19 +318,25 @@ tool은 한 번에 하나씩 추가하고, **추가할 때마다 `scrna-agent st
 - [ ] **A6. MCP 최소 서버 조기 도입** — `mcp_server.py`에 읽기전용 `inspect_h5ad` 1개 tool만 노출,
       **Claude Code + Codex 양쪽에서 stdio 호환 스파이크**(도구 인식·짧은 호출·긴 호출 취소·stderr 위생·재연결).
       stdout엔 프로토콜 JSON만, 로그는 stderr/파일로.
-- [ ] **A7. 재현성 하네스 토대** — 전역 시드 제어 유틸, append-only run log + **`decision` 이벤트 스키마(Phase A에서 동결)**,
-      provenance(`.uns` 압축 포인터 + 세션파일), 경량 해시 전략, `scrna-agent replay <session>`(LLM·decision 소비, 등급별
-      tolerance diff), **pytest 스캐폴드**. 결정스키마는 재귀/선택 도구 추가 **전에** 고정. 이후 B마다 테스트 동반.
+- [ ] **A7. 재현성 하네스 토대 (scqc `harness.py` 베다링 기반)** — scqc의 `run_stage`/`StageReport`/`is_fresh`/`atomic_path`/
+      provenance·소스스냅샷·`repro.py`/`init_runtime`을 vendored 시작점으로. **여기에 scpilot 확장**: 전역 시드 제어 유틸,
+      append-only run log + **`decision` 이벤트 스키마(Phase A에서 동결)**, `.uns["scpilot"]` 압축 포인터,
+      `scpilot replay <session>`(LLM·decision 소비, **결정성 등급별 tolerance diff** — scqc엔 없음), **pytest 스캐폴드**.
+      결정스키마는 재귀/선택 도구 추가 **전에** 고정. 이후 B마다 테스트 동반.
 
 ### Phase B — core tool 단계별 구현 (annotation→benchmark 순서, 각 단계 = tool + step + MCP 동시 검증)
-- [ ] **B1. `core/io.py`** — load_10x/load_h5ad/save. 검증: PDAC h5ad 적재 → shape·layers 요약.
+- [ ] **B1. `core/io.py` (scqc `io_10x.py` 베다링)** — load_h5ad/save + vendored robust 10x 리더. load_10x/merge 자체는
+      scqc 소유. 검증: scqc 산출 `PDAC_merged_qc.h5ad` 적재 → shape·layers 요약.
 - [ ] **B2. `core/state.py`** — 단계 감지(raw/HVG/clustered/annotated) → 재진입점. 검증: 두 PDAC 파일 판정.
-- [ ] **B3. `core/qc.py` (Tier 0 artifact)** — **scrublet per-sample** + calculate_qc_metrics(%MT/%ribo) +
-      stress/dissociation·**mixed-lineage(예 EPCAM+CD3D 공발현) 플래그** → **batch-aware 분포 요약** → cutoff 필터.
+      (scpilot 진입점은 merged이므로 raw/HVG/clustered 위주.)
+- [ ] **B3. QC — 두 갈래**: ⓐ **upstream(scqc qc stage 확장)**: scrublet per-sample + %ribo + stress/dissociation +
+      **mixed-lineage(EPCAM+CD3D 공발현) 플래그** + **batch-aware 분포 요약** 반환 → scqc 산출에 반영(merge 前 per-sample).
+      ⓑ **scpilot `core/qc.py`**: merged에서 그 QC 요약을 소비해 LLM cutoff 결정·재필터 + Tier0 artifact 판정.
       (선택) ambient RNA 평가(raw droplet 有 시), 미수행 시 경고.
 - [ ] **B4. `core/preprocess.py`** — normalize/log1p/HVG(seurat_v3, **counts·scikit-misc preflight 게이트**,
       batch-aware)/scale/PCA → 분산설명비·HVG 후보 요약.
-- [ ] **B5. `core/plots.py`** — umap/qc/violin/dotplot → PNG(절대경로+메타). (annotation dotplot에 선행 필요.)
+- [ ] **B5. `core/plots.py` (scqc `plotting.py` 베다링)** — vendored auto-fit figure 하네스 위에 umap/qc/violin/dotplot →
+      PNG(절대경로+메타). (annotation dotplot에 선행 필요.)
 - [ ] **B6. `core/cluster.py`** — neighbors → leiden(igraph) → umap. 검증: **구조 불변식**(키/shape/클러스터수 허용오차).
 - [ ] **B7. `core/markers.py`** — `rank_genes_groups` → 클러스터별 **pos/neg marker + 크기 + sample 분포** 표.
 - [ ] **B8. `core/annotate.py` (Tier 1 broad, consensus)** — unintegrated marker + celltypist + quick-Harmony 라벨의
