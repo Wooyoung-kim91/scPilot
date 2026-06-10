@@ -47,7 +47,8 @@ def _artifacts_from_fit(fit, cfg) -> list[S.Artifact]:
           description="Render a figure (umap/qc_violin/hvg/pca_variance) via the auto-fit harness; "
                       "returns the saved PNG(s) sized to the column policy (plan B5).")
 def plots(session, *, kind: str = "umap", color: str | None = None,
-          keys: list | None = None, groupby: str | None = None, **params) -> S.ToolResult:
+          keys: list | None = None, groupby: str | None = None,
+          marker_groups: dict | None = None, **params) -> S.ToolResult:
     import matplotlib
     matplotlib.use("Agg")  # headless (MCP/CLI: no display)
 
@@ -93,9 +94,32 @@ def plots(session, *, kind: str = "umap", color: str | None = None,
             fit = P.save_pca_variance_ratio(adata, cfg, art_dir / "pca_variance")
             label = "PCA variance ratio"
 
+        elif kind == "dotplot":
+            # annotation dotplot: sc.pl.dotplot with marker panels AS A DICT → cell-type
+            # brackets + labels above the x-axis (built-in var-group rendering).
+            import scanpy as sc
+            from scpilot.core.annotate import BROAD_MARKERS
+            gb = groupby or ("major_cell_type" if "major_cell_type" in adata.obs else "leiden")
+            if gb not in adata.obs:
+                return S.error("plots", "invalid_state",
+                               f"groupby '{gb}' absent — run annotate_broad/cluster first",
+                               recoverable=True, suggested_next_tools=["annotate_broad"])
+            src = marker_groups or BROAD_MARKERS
+            groups = {ct: [g for g in gs if g in adata.var_names] for ct, gs in src.items()}
+            groups = {ct: gs for ct, gs in groups.items() if gs}   # drop empty panels
+            if not groups:
+                return S.error("plots", "data_gate_failed", "no marker-panel genes present", recoverable=False)
+
+            def build(size, font, draft=False):
+                return P._scanpy_build(
+                    lambda: sc.pl.dotplot(adata, groups, groupby=gb, show=False,
+                                          dendrogram=False), size)
+            fit = P.fit_and_save(build, cfg, art_dir / f"dotplot_{gb}", logger=None)
+            label = f"dotplot (markers grouped by cell type) over {gb}"
+
         else:
             return S.error("plots", "missing_input",
-                           f"unknown kind '{kind}' (umap|qc_violin|hvg|pca_variance)", recoverable=True)
+                           f"unknown kind '{kind}' (umap|qc_violin|hvg|pca_variance|dotplot)", recoverable=True)
     except Exception as exc:  # noqa: BLE001
         return S.error("plots", "internal", f"{type(exc).__name__}: {exc}")
 

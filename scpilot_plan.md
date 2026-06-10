@@ -421,7 +421,8 @@ B1~B7엔 장시간 도구 없음, scVI 실측 후 설계(과설계 회피). `lon
       /HVG(seurat_v3, batch-aware, counts·skmisc)/PCA(mask_var=HVG, 대용량 scale 회피) → variance_ratio·n_hvg·elbow 제안 요약.
       counts 불변·x_state=log1p 기록. invalid_state 게이트(counts 없으면). grade B(PCA). 검증: chain 테스트.
 - [x] **B5. `core/plots.py` (scqc `plotting.py` 베다링)** — ✅**완료(2026-06-10)**: `plots` 도구
-      (kind=umap/qc_violin/hvg/pca_variance) — vendored `save_*`에 정책 config 적용(max 1.5×1.5 + **신규
+      (kind=umap/qc_violin/hvg/pca_variance/**dotplot**[sc.pl.dotplot에 마커패널 dict→세포타입 브라켓/라벨 자동]) —
+      vendored `save_*`에 정책 config 적용(max 1.5×1.5 + **신규
       `square_limit_col=1.0`**으로 양쪽>1 금지), FitResult→Artifact(w/h in·dpi). 검증: 정책 테스트(1.5×1/1×1.5/1×1 허용,
       1.5×1.5 금지) + 실데이터 umap(180977셀→[0.75,0.5]col). scib/타패키지 동일 하네스 라우팅은 해당 도구 구현 시.
       아래 정책 **vendored `fit_and_save` auto-fit 하네스 위에** 구현: **plot 스타일 정책(사용자 확정 2026-06-10)**:
@@ -434,12 +435,14 @@ B1~B7엔 장시간 도구 없음, scVI 실측 후 설계(과설계 회피). `lon
       (X_pca 기본, 통합 임베딩도 동일 도구). cluster 수/크기 반환, invalid_state 게이트(임베딩 없으면). grade B. 검증: 구조 불변식.
 - [x] **B7. `core/markers.py`** — ✅**완료(2026-06-10)**: `markers` — rank_genes_groups(Wilcoxon, lognorm 레이어) →
       클러스터별 top marker 표(미리보기) + 크기 + **sample 분포(단일환자 지배 클러스터 플래그)** + 전체 랭킹 CSV artifact. grade A.
-- [x] **B8. `core/annotate.py` (Tier 1 broad)** — ✅**완료(2026-06-10, 디리스크① 반영)**: `annotate_broad` —
-      **per-cell marker score(배치무관 anchor, BROAD_MARKERS 패널)** → 클러스터 다수결 + confidence → `obs["major_cell_type"]`
-      (저신뢰=Mixed-Artifact) + `obs["major_confidence"]`. marker 충돌 + **단일-batch 지배 클러스터 circular-risk 플래그**,
-      evidence는 `.uns["scpilot_annotation"]["tier1"]`. grade A. 검증: fixture 4 tests + **실데이터(9k): 라벨분포 타당,
-      mean_conf 0.858, circular_risk 27/35 정확 플래그**. **→ benchmark `label_key`=major_cell_type 확보.**
-      (celltypist/quick-Harmony 추가 consensus 소스는 선택 — anchor는 marker score로 충분히 검증됨.)
+- [x] **B8. `core/annotate.py` (Tier 1 broad)** — ✅**완료(2026-06-10, 사용자확정 로직)**: `annotate_broad`.
+      **로직(사용자 확정)**: ① **leiden-cluster DE 기반**(`rank_genes_groups` Wilcoxon, pts=True) ② 마커 정의 =
+      **pct≥0.25 AND LFC≥1** ③ 클러스터의 유의 마커를 broad 세포타입 패널(`BROAD_MARKERS`)과 **조합 매칭** ④ 세포타입 호출은
+      **해당 패널 마커 ≥3개** 매칭 필수(미만=`Unknown`) ⑤ **샘플 출처 고려**(per-cluster sample/condition 조성, 단일샘플·
+      단일배치 지배 플래그) ⑥ 결과 layout = **UMAP + dotplot**(`sc.pl.dotplot`에 패널을 dict로 줘 x축 상단 세포타입 브라켓/라벨
+      자동). → `obs["major_cell_type","major_confidence"]`(confidence=매칭마커/패널크기) + evidence(matched_markers·candidates·
+      provenance·flags)는 `.uns["scpilot_annotation"]["tier1"]`. grade A. 검증: fixture 6 tests(DE매칭·≥3규칙·single-source·
+      dotplot 브라켓). **→ benchmark `label_key`=major_cell_type.** (구안의 per-cell score/celltypist consensus는 폐기.)
 - [x] **B9. `core/integrate.py`** — ✅**완료(2026-06-10)**: `integrate_scvi`(**사전학습 모델 LOAD + get_latent, 학습 X →
       grade A·동기·잡모델 불필요**; 기본 `~/data/scpilot_run/models/scvi_GSM`, scvi 1.4.2 일치, n_latent 30) +
       `integrate_harmony`(harmonypy 직접호출 + `np.asarray(Z_corr).T` 우회). **카테고리 게이트**: 모델이 아는 batch(GSM 31개)
