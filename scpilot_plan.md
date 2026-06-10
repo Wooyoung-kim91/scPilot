@@ -289,13 +289,12 @@ activation/exhaustion/cycling/IFN state 점수 → trajectory → review. **line
 
 - **Claude Code**: `claude mcp add scpilot -- /home/wykim/miniforge3/envs/scpilot/bin/scpilot mcp`
   (또는 프로젝트 `.mcp.json`의 `mcpServers`에 `command`/`args` 등록).
-- **Codex CLI**: `~/.codex/config.toml` 에
-  ```toml
-  [mcp_servers.scpilot]
-  command = "/home/wykim/miniforge3/envs/scpilot/bin/scpilot"
-  args = ["mcp"]
-  # 대안: command="conda", args=["run","--no-capture-output","-n","scpilot","scpilot","mcp"]
+- **Codex CLI** (codex-cli ≥0.137, `codex mcp add` 사용 — config.toml 자동 기록):
+  ```bash
+  codex mcp add scpilot -- /home/wykim/miniforge3/envs/scpilot/bin/scpilot mcp
   ```
+  (`--env KEY=VALUE`는 stdio 서버에 추가 가능하나 scpilot MCP 경로는 API 키 불필요 → 보통 불필요.
+  `--` 뒤는 **직접 바이너리**여야 함 — `conda run` 금지. 수동 편집 시 `[mcp_servers.scpilot] command/args` 동일.)
 - 두 호스트 모두 동일 서버 바이너리를 stdio 서브프로세스로 띄우므로 **단일 구현으로 호환**.
 - ✅ 프로토콜 호환 검증 완료(MCP SDK stdio 클라이언트=Claude Code/Codex와 동일 프로토콜): 직접 경로 2종 OK,
   conda run(캡처) 실패, `--no-capture-output` OK. **호스트 등록 후 실제 도구목록 인식 확인은 사용자 단계**(긴호출 취소·재연결 포함).
