@@ -281,18 +281,24 @@ activation/exhaustion/cycling/IFN state 점수 → trajectory → review. **line
   기록된 run log(파라미터만, LLM 없이)를 그대로 재실행 → 원본과 구조불변식 diff. 재현성 하네스의 핵심.
 
 ### MCP 등록 설정 (호스트별)
-서버 실행 커맨드(공통, conda env 활성화 포함): `conda run -n scpilot scpilot mcp`
+> ⚠️ **A6 스파이크 실측(2026-06-10): `conda run -n scpilot scpilot mcp`는 stdio MCP에서 실패한다**
+> ("Connection closed" — `conda run`이 기본적으로 자식 stdout을 캡처/버퍼링해 JSON-RPC 스트림을 끊음).
+> → **직접 env 바이너리 경로 등록**(권장) 또는 `conda run --no-capture-output` 사용.
 
-- **Claude Code**: `claude mcp add scpilot -- conda run -n scpilot scpilot mcp`
+권장 서버 실행 커맨드(직접 경로, conda run 불필요): `/home/wykim/miniforge3/envs/scpilot/bin/scpilot mcp`
+
+- **Claude Code**: `claude mcp add scpilot -- /home/wykim/miniforge3/envs/scpilot/bin/scpilot mcp`
   (또는 프로젝트 `.mcp.json`의 `mcpServers`에 `command`/`args` 등록).
 - **Codex CLI**: `~/.codex/config.toml` 에
   ```toml
   [mcp_servers.scpilot]
-  command = "conda"
-  args = ["run", "-n", "scpilot", "scpilot", "mcp"]
+  command = "/home/wykim/miniforge3/envs/scpilot/bin/scpilot"
+  args = ["mcp"]
+  # 대안: command="conda", args=["run","--no-capture-output","-n","scpilot","scpilot","mcp"]
   ```
 - 두 호스트 모두 동일 서버 바이너리를 stdio 서브프로세스로 띄우므로 **단일 구현으로 호환**.
-- 검증 시 두 에이전트 각각에서 도구 목록 인식 + QC 도구 1회 호출까지 확인.
+- ✅ 프로토콜 호환 검증 완료(MCP SDK stdio 클라이언트=Claude Code/Codex와 동일 프로토콜): 직접 경로 2종 OK,
+  conda run(캡처) 실패, `--no-capture-output` OK. **호스트 등록 후 실제 도구목록 인식 확인은 사용자 단계**(긴호출 취소·재연결 포함).
 
 ---
 
@@ -303,7 +309,7 @@ tool은 한 번에 하나씩 추가하고, **추가할 때마다 `scpilot step`(
 (체크 표기: `[ ]` 미착수 · `[~]` 부분 진행 · `[x]` 완료)
 
 > **최우선 디리스크 5 (Codex)** — 현황(2026-06-10): ①scib `label_key`(Tier1 consensus) 유효성 ⏳**미검증(조기 PoC 필요)**
-> ②잡 모델의 Claude Code+Codex MCP 동작 ⏳**미검증(A6 스파이크)** ③scVI CPU 서브샘플 실현성 ⏳**미검증(조기 PoC)**
+> ②MCP stdio 동작 ✅**프로토콜 검증 완료**(A6; `conda run` 캡처 함정 발견→직접경로 등록) / 잡모델·실호스트 등록은 추후 ③scVI CPU 서브샘플 실현성 ⏳**미검증(조기 PoC)**
 > ④CNV preflight·reference 선택 ✅**설계+PoC 검증 완료**(B12-pre) ⑤run-log `decision` 스키마 완전성 ⏳**설계 미완(A7서 동결)**.
 > → ④를 PoC로 깬 방식 그대로 ①·③도 조기 PoC로 검증.
 
@@ -361,9 +367,12 @@ tool은 한 번에 하나씩 추가하고, **추가할 때마다 `scpilot step`(
       `artifact_csv/png()`/`table_preview()` 생성자 + `_sanitize`(numpy/NaN/Path→strict JSON). 표준 `ERROR_CODES`.
       검증: `tests/test_schemas.py` 7 passed (JSON 직렬화·numpy/NaN 정화·표 캡·artifact 절대경로·잡 스키마).
 - [ ] **A5. `cli.py` 골격 + `step`** — Typer 엔트리포인트 + `step` 디스패치.
-- [ ] **A6. MCP 최소 서버 조기 도입** — `mcp_server.py`에 읽기전용 `inspect_h5ad` 1개 tool만 노출,
-      **Claude Code + Codex 양쪽에서 stdio 호환 스파이크**(도구 인식·짧은 호출·긴 호출 취소·stderr 위생·재연결).
-      stdout엔 프로토콜 JSON만, 로그는 stderr/파일로.
+- [~] **A6. MCP 최소 서버 조기 도입** — ✅**프로토콜 검증 완료(2026-06-10)** / ⏳호스트 등록은 사용자 단계.
+      `mcp_server.py`(FastMCP)에 읽기전용 `inspect_h5ad_tool` + `scpilot_version` 노출, `init_runtime()` 기동,
+      stdout=프로토콜만·로그 stderr. `core/io.py inspect_h5ad`(backed='r', ToolResult 반환). cli `mcp` 와이어링 + `__main__.py`.
+      **MCP SDK stdio 클라이언트로 end-to-end 검증**(tools/list·short call·실데이터 read·error-path·stderr 위생):
+      `tests/test_mcp_server.py` 1 passed. **디리스크 ② 핵심 발견: `conda run`(캡처) 실패 → 직접 바이너리/`--no-capture-output`**
+      (등록 섹션 갱신). 남은 것: Claude Code+Codex 실등록·긴호출 취소·재연결.
 - [ ] **A7. 재현성 하네스 토대 (scqc `harness.py` 베다링 기반)** — scqc의 `run_stage`/`StageReport`/`is_fresh`/`atomic_path`/
       provenance·소스스냅샷·`repro.py`/`init_runtime`을 vendored 시작점으로. **여기에 scpilot 확장**: 전역 시드 제어 유틸,
       append-only run log + **`decision` 이벤트 스키마(Phase A에서 동결)**, `.uns["scpilot"]` 압축 포인터,

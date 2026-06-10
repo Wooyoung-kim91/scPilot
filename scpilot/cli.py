@@ -54,8 +54,10 @@ def doctor() -> None:
 
 @app.command()
 def mcp() -> None:
-    """Start the MCP (stdio) server (plan A6/C2). Stub."""
-    _todo("mcp")
+    """Start the MCP (stdio) server (plan A6/C2). stdout = protocol only."""
+    from scpilot.mcp_server import main as run_server
+
+    run_server()
 
 
 @app.command()
