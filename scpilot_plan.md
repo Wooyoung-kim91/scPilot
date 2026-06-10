@@ -311,7 +311,8 @@ tool은 한 번에 하나씩 추가하고, **추가할 때마다 `scpilot step`(
 각 core 함수는 AnnData를 받아 처리하고 **요약 dict** 를 반환한다는 계약을 공통으로 따른다.
 (체크 표기: `[ ]` 미착수 · `[~]` 부분 진행 · `[x]` 완료)
 
-> **최우선 디리스크 5 (Codex)** — 현황(2026-06-10): ①scib `label_key`(Tier1 consensus) 유효성 ⏳**미검증(조기 PoC 필요)**
+> **최우선 디리스크 5 (Codex)** — 현황(2026-06-10): ①scib `label_key`(Tier1 consensus) 유효성 ✅**PoC 검증 완료(2026-06-10)**: unintegrated 클러스터 27/35가 단일-GSE(>80%)
+→ 순환참조 실재 확인. Harmony는 1/22로 해소. **→ Tier1은 per-cell marker score(배치무관 anchor) 기반, unint 클러스터 라벨 금지**
 > ②MCP stdio 동작 ✅**프로토콜 검증 완료**(A6; `conda run` 캡처 함정 발견→직접경로 등록) / 잡모델·실호스트 등록은 추후 ③scVI CPU 서브샘플 실현성 ⏳**미검증(조기 PoC)**
 > ④CNV preflight·reference 선택 ✅**설계+PoC 검증 완료**(B12-pre) ⑤run-log `decision` 스키마 완전성 ⏳**설계 미완(A7서 동결)**.
 > → ④를 PoC로 깬 방식 그대로 ①·③도 조기 PoC로 검증.
@@ -427,6 +428,9 @@ B1~B7엔 장시간 도구 없음, scVI 실측 후 설계(과설계 회피). `lon
 - [ ] **B9. `core/integrate.py`** — ⛔**선행 하드게이트: ToolSpec 잡 생명주기(start/get_job_status/get_job_result/
       cancel_job) 확장 + 디리스크③ scVI CPU 타이밍 스파이크**(첫 장시간 도구 — 실측 후 설계, 과설계 회피).
       `harmony_integrate` + `scvi.model.SCVI(accelerator="cpu")` **잡 모델**. 검증(서브샘플): 임베딩·CPU 시간/peak-mem·fallback.
+      ⚠️**harmony API(PoC 발견)**: scanpy 1.11.5의 `sc.external.pp.harmony_integrate`는 harmonypy 0.2.0 **torch 출력과 비호환**
+      (`Z_corr.T` shape 오류), `sc.pp.harmony_integrate`(native harmony2)는 1.11.5에 **없음** → **`harmonypy.run_harmony` 직접
+      호출 + `np.asarray(ho.Z_corr).T`** (PoC2에서 shape 검증). scanpy 업그레이드 시 native harmony2로 전환 가능.
 - [ ] **B10. `core/benchmark.py`** — `Benchmarker(label_key=major_cell_type, batch_key=...)` **2-tier**,
       kNN 고비용 지표 기본 off, **overcorrection 경고·조건별 조성** 포함. 검증(서브샘플): 점수표.
 - [ ] **B10.5. 최종 cluster (명시)** — 선정 임베딩으로 neighbors→leiden→umap, **final-cluster 키 + 임베딩 provenance**
