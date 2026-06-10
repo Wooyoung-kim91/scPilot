@@ -394,10 +394,11 @@ B1~B7엔 장시간 도구 없음, scVI 실측 후 설계(과설계 회피). `lon
       검증: `tests/test_repro.py` 7 passed(시드 결정성·해시·등급 tolerance·decision 검증·replay). provenance stamp는 A3(session).
 
 ### Phase B — core tool 단계별 구현 (annotation→benchmark 순서, 각 단계 = tool + step + MCP 동시 검증)
-- [ ] **B1. `core/io.py` (scqc `io_10x.py` 베다링)** — load_h5ad/save + vendored robust 10x 리더. load_10x/merge 자체는
-      scqc 소유. 검증: scqc 산출 `PDAC_merged_qc.h5ad` 적재 → shape·layers 요약.
-- [ ] **B2. `core/state.py`** — 단계 감지(raw/HVG/clustered/annotated) → 재진입점. 검증: 두 PDAC 파일 판정.
-      (scpilot 진입점은 merged이므로 raw/HVG/clustered 위주.)
+- [x] **B1. `core/io.py`** — ✅**완료(2026-06-10)**: `load_h5ad`/`save_h5ad` 헬퍼 + `inspect`(A6, ToolResult명 정렬) +
+      `load` 도구(input→세션 캐시 적재, summary 반환) self-register. load_10x/merge는 scqc 소유. 검증: 실데이터 적재·tiny fixture.
+- [x] **B2. `core/state.py`** — ✅**완료(2026-06-10)**: `detect_state` 도구 — backed='r'로 단계 감지
+      (raw/normalized/hvg/pca/neighbors/clustered/umap/annotated 누적 플래그) → reentry_point. 검증: 처리완료본→umap/annotate,
+      raw merged→normalized/preprocess(실데이터), clustered fixture. self-register.
 - [ ] **B3. `core/qc.py` (Tier 0 artifact) — scpilot 내부 소유(결정#1 확정)**: scqc 원본 미수정. merged를
       `obs[sample_id]`로 **그룹분리 → 그룹별 scrublet → doublet score를 merged에 기록**(per-sample 의미론 보존, 단일 scrublet
       금지) + calculate_qc_metrics(%MT/%ribo) + stress/dissociation·**mixed-lineage(EPCAM+CD3D 공발현) 플래그** +

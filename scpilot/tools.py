@@ -45,29 +45,40 @@ def register(name: str, *, mutating: bool = False, long_running: bool = False,
     return deco
 
 
+_LOADED = False
+
+
+def _ensure_loaded() -> None:
+    """Import core tool modules so their ``@register`` side-effects populate REGISTRY.
+
+    Lazy (call-time) import avoids a module-load cycle: core modules import
+    ``register`` from here, and we import them only once the registry is defined.
+    """
+    global _LOADED
+    if _LOADED:
+        return
+    _LOADED = True
+    from scpilot.core import io, state  # noqa: F401 — registration side-effects
+
+
 def get(name: str) -> ToolSpec:
+    _ensure_loaded()
     if name not in REGISTRY:
         raise KeyError(f"unknown tool '{name}'. registered: {sorted(REGISTRY)}")
     return REGISTRY[name]
 
 
 def list_tools() -> list[dict]:
+    _ensure_loaded()
     return [{"name": s.name, "mutating": s.mutating, "long_running": s.long_running,
              "description": s.description} for s in REGISTRY.values()]
+
+
+def all_specs() -> list[ToolSpec]:
+    _ensure_loaded()
+    return list(REGISTRY.values())
 
 
 def run(name: str, session, **params) -> S.ToolResult:
     """Dispatch one tool through the registry (used by CLI step / replay / MCP)."""
     return get(name).fn(session, **params)
-
-
-# --------------------------------------------------------------------------- #
-# Registered tools
-# --------------------------------------------------------------------------- #
-@register("inspect", mutating=False, description="Read-only summary of the session input h5ad.")
-def _inspect(session, **params) -> S.ToolResult:
-    from scpilot.core.io import inspect_h5ad
-    path = params.get("path") or session.manifest.input.get("path")
-    if not path:
-        return S.error("inspect", "missing_input", "no input path in session or params", recoverable=False)
-    return inspect_h5ad(path)

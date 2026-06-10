@@ -11,10 +11,28 @@ from __future__ import annotations
 from pathlib import Path
 
 from scpilot import schemas as S
+from scpilot.tools import register
 
 # obs columns with at most this many distinct values get a value_counts breakdown.
 _MAX_CATEGORIES = 20
 _MAX_VALUE_ROWS = 15  # cap per-column category listing
+
+
+# --------------------------------------------------------------------------- #
+# thin I/O helpers
+# --------------------------------------------------------------------------- #
+def load_h5ad(path: str, *, backed: str | None = None):
+    """Read an .h5ad (optionally backed='r' to avoid materializing X)."""
+    import anndata as ad
+    return ad.read_h5ad(str(path), backed=backed) if backed else ad.read_h5ad(str(path))
+
+
+def save_h5ad(adata, path: str, *, compression: str = "lzf") -> str:
+    """Write an .h5ad and return the absolute path."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    adata.write_h5ad(p, compression=compression)
+    return str(p.resolve())
 
 
 def _guess_x_state(adata) -> str:
@@ -40,7 +58,7 @@ def inspect_h5ad(path: str, *, max_categories: int = _MAX_CATEGORIES) -> S.ToolR
     """
     p = Path(path)
     if not p.exists():
-        return S.error("inspect_h5ad", "missing_input", f"file not found: {p}", recoverable=False)
+        return S.error("inspect", "missing_input", f"file not found: {p}", recoverable=False)
     try:
         import anndata as ad
         import pandas as pd
@@ -97,7 +115,7 @@ def inspect_h5ad(path: str, *, max_categories: int = _MAX_CATEGORIES) -> S.ToolR
             pass
 
         return S.success(
-            "inspect_h5ad",
+            "inspect",
             summary=summary,
             tables=tables,
             warnings=warnings,
@@ -105,4 +123,45 @@ def inspect_h5ad(path: str, *, max_categories: int = _MAX_CATEGORIES) -> S.ToolR
             suggested_next_tools=["detect_state"],
         )
     except Exception as exc:  # noqa: BLE001
-        return S.error("inspect_h5ad", "internal", f"{type(exc).__name__}: {exc}")
+        return S.error("inspect", "internal", f"{type(exc).__name__}: {exc}")
+
+
+# --------------------------------------------------------------------------- #
+# Registered tools (plan A5 registry; convention: fn(session, **params) -> ToolResult)
+# --------------------------------------------------------------------------- #
+@register("inspect", mutating=False,
+          description="Read-only summary of the session input h5ad (shape/layers/obs/embeddings; no X load).")
+def _inspect_tool(session, **params) -> S.ToolResult:
+    path = params.get("path") or session.manifest.input.get("path")
+    if not path:
+        return S.error("inspect", "missing_input", "no input path in session or params", recoverable=False)
+    return inspect_h5ad(path)
+
+
+@register("load", mutating=False,
+          description="Load the session input h5ad into the working cache and return a summary (plan B1).")
+def _load_tool(session, *, backed: str | None = None, **params) -> S.ToolResult:
+    import time
+
+    path = params.get("path") or session.manifest.input.get("path")
+    if not path:
+        return S.error("load", "missing_input", "no input path in session or params", recoverable=False)
+    if not Path(path).exists():
+        return S.error("load", "missing_input", f"file not found: {path}", recoverable=False)
+    t0 = time.time()
+    adata = session.load_input(path, backed=backed)
+    layers = sorted(adata.layers.keys())
+    summary = {
+        "path": str(Path(path).resolve()),
+        "n_obs": int(adata.n_obs),
+        "n_vars": int(adata.n_vars),
+        "layers": layers,
+        "obsm": sorted(adata.obsm.keys()),
+        "has_counts": "counts" in layers,
+        "x_state_guess": _guess_x_state(adata),
+        "backed": bool(backed),
+    }
+    warnings = [] if "counts" in layers else ["no 'counts' layer — raw counts unavailable downstream"]
+    return S.success("load", summary=summary, warnings=warnings, determinism_grade="A",
+                     duration_s=round(time.time() - t0, 3),
+                     suggested_next_tools=["detect_state", "preprocess"])

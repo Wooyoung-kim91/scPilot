@@ -53,8 +53,7 @@ def build_server():
     from scpilot import __version__, tools
     from scpilot.session import Session
 
-    # ensure core tool modules are imported so they register (A5: inspect; B-tools later)
-    import scpilot.core.io  # noqa: F401
+    specs = tools.all_specs()  # triggers registration of all core tool modules
 
     lg = _configure_io()
     mcp = FastMCP("scpilot")
@@ -72,7 +71,7 @@ def build_server():
                 return S.error(name, "internal", f"{type(exc).__name__}: {exc}").to_dict()
         return handler
 
-    for spec in tools.REGISTRY.values():
+    for spec in specs:
         handler = _make_handler(spec.name)
         handler.__name__ = f"{spec.name}_tool"
         handler.__doc__ = (
@@ -89,7 +88,7 @@ def build_server():
         """Return the scpilot version (cheap connectivity check)."""
         return {"scpilot_version": __version__}
 
-    names = [f"{s.name}_tool" for s in tools.REGISTRY.values()] + ["scpilot_version"]
+    names = [f"{s.name}_tool" for s in specs] + ["scpilot_version"]
     lg.info("scpilot MCP server ready (v%s) — tools: %s", __version__, ", ".join(names))
     return mcp
 
