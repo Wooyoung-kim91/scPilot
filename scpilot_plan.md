@@ -515,6 +515,11 @@ B1~B7엔 장시간 도구 없음, scVI 실측 후 설계(과설계 회피). `lon
 - [ ] **C3. `step` 완성** — 각 단계 결정론적 단독 실행(재현/디버그) 마무리.
 
 ### Phase D — LLM 에이전트 & 자율 실행 (모드 2, 선택)
+> **📝 메모(2026-06-10 논의)**: 현재 **scpilot 자체가 LLM API를 호출하는 기능은 없음**(llm/ 전부 skeleton,
+> `scpilot run` stub). 지금 "LLM 개입"은 **호스트(Claude Code/Codex)** 가 도구를 구동하는 경로(MCP=mode1 또는 Bash로
+> `scpilot step` 구동)뿐. `scpilot step`(mode3)·`annotate_broad` 등은 **결정론적, LLM API 0**(ANTHROPIC_API_KEY 불필요).
+> → **scpilot 단독으로(호스트 없이) API 키로 자율 실행**이 필요해지면 **이 Phase D를 구축**: `scpilot run`이 Anthropic API
+> (`claude-opus-4-8`, tool_runner)를 직접 호출해 8단계 자율 수행. 빌드 시점은 MVP 루프(Tier1→통합→benchmark→report) 안정화 후.
 - [ ] **D1. preflight** — `claude-opus-4-8`·`tool_runner` 가용성 확인, **모델명 설정화**(하드코딩 금지).
 - [ ] **D2. `llm/provider.py`** — provider 추상화(기본 Claude/Anthropic).
 - [ ] **D3. `llm/prompts.py`** — 단계별 system prompt(오케스트레이션/annotation/해석/DE 설계).
