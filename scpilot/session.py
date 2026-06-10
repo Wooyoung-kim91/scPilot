@@ -35,6 +35,8 @@ from scpilot import __version__
 from scpilot.vendor.harness import atomic_path, build_provenance, _fingerprint, init_runtime
 
 UNS_KEY = "scpilot"
+# Default on-disk session workspace (override via env SCPILOT_RUN_DIR or --workdir).
+DEFAULT_RUN_DIR = os.environ.get("SCPILOT_RUN_DIR", str(Path.home() / "data" / "scpilot_run"))
 # Semantic meaning of adata.X at a given point (recorded per step; counts layer is immutable).
 XState = Literal["raw_counts", "normalized", "log1p", "scaled", "unknown"]
 

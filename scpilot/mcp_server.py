@@ -61,9 +61,10 @@ def build_server():
     def _make_handler(name: str):
         def handler(input: str, workdir: str = "", params: dict | None = None) -> dict:
             from scpilot import schemas as S
+            from scpilot.session import DEFAULT_RUN_DIR
             lg.info("tool=%s input=%s", name, input)
             try:
-                wd = workdir or str(Path(input).resolve().parent / f"{Path(input).stem}_scpilot")
+                wd = workdir or DEFAULT_RUN_DIR
                 session = Session.create(wd, input_path=input)
                 return tools.run(name, session, **(params or {})).to_dict()
             except Exception as exc:  # noqa: BLE001 — MCP must return a structured error, not throw

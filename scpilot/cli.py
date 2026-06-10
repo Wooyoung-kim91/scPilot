@@ -89,7 +89,8 @@ def step(
 
     params = _parse_params(param or [])
     seed_rec = set_global_seed(seed)
-    wd = workdir or str(Path.cwd() / "scpilot_session")
+    from scpilot.session import DEFAULT_RUN_DIR
+    wd = workdir or DEFAULT_RUN_DIR
     session = Session.create(wd, input_path=inp)
 
     result = spec.fn(session, **params)
