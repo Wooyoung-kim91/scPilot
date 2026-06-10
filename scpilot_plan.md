@@ -303,8 +303,9 @@ tool은 한 번에 하나씩 추가하고, **추가할 때마다 `scpilot step`(
 ### Phase A — 기반 + 위험 조기 검증 (LLM 무관)
 - [ ] **A1. 스캐폴딩** — `pyproject.toml`, 패키지 골격, 콘솔스크립트 `scpilot`,
       env에 `mcp`/`anthropic`/`typer`/`scikit-misc`/`pytest` 설치.
-      **선택(Tier2/3·궤적)**: `celltypist`/`infercnvpy`/`scvelo`/`cellrank`/`palantir`/`cytotrace`
-      + R(Slingshot/Monocle3) (있을 때만 도구 활성, `doctor`로 게이트).
+      **선택(Tier2/3·궤적)**: `celltypist`/`infercnvpy`/**`gtfparse`(infercnvpy GTF 좌표주석 필수 옵션의존 — 실측 확인)**/
+      `scvelo`/`cellrank`/`palantir`/`cytotrace` + R(Slingshot/Monocle3) (있을 때만 도구 활성, `doctor`로 게이트).
+      (현 scpilot env엔 celltypist·infercnvpy·gtfparse·pybiomart 설치 완료.)
 - [ ] **A2. 환경 preflight** — `scpilot doctor`: 전 의존성(scvi/scrublet/jax|torch/numba/igraph/scib/scikit-misc)
       import + 버전 출력 + tiny smoke test. **numpy 2.x 호환 조기 확인**, 실패 시 actionable 가이드.
       **capability 플래그 산출**: `velocity_available`(spliced/unspliced 有),
@@ -355,16 +356,25 @@ tool은 한 번에 하나씩 추가하고, **추가할 때마다 `scpilot step`(
       없으므로(symbol만, `n_cells`뿐) CNV 전 반드시 수행. infercnvpy `genomic_position_from_gtf(gtf_gene_id="gene_name")`로
       `var[chromosome,start,end]` 채움. **설계 핵심**:
       - **좌표 소스**: 기본 = **고정 릴리스 GENCODE GRCh38 GTF 1회 다운로드 → sha256 content-addressed 캐시·재사용**
-        (결정성 등급 A). 대체 = 사용자 `--gtf`(정렬 ref면 최선), offline 불가 시 biomart `hgnc_symbol`(등급 B, 네트워크·
-        Ensembl 버전 의존으로 플래그). `--genome-build {GRCh38(기본),GRCh37}` provenance 기록.
+        (결정성 등급 A; **GTF 경로는 `gtfparse` 필수 — 미설치 시 infercnvpy가 ImportError, 실측 확인**). 대체 = 사용자 `--gtf`
+        (정렬 ref면 최선), offline 불가 시 biomart `hgnc_symbol`(등급 B, 네트워크·Ensembl 버전 의존으로 플래그).
+        `--genome-build {GRCh38(기본),GRCh37}` provenance 기록.
       - **2-pass symbol 매핑(make_unique 안전 역연산)**: Pass1 = `var_names` 원본을 `gene_name`에 매칭(→ `HLA-A`/`NKX2-1`
         등 실제 하이픈 유전자 정상 매핑). Pass2 = Pass1 실패 + `^(.+)-\d+$` 패턴만 base symbol로 재매핑(중복 suffix 회수);
         그 외 미매핑은 `chromosome=NaN`(infercnvpy 자동 제외). **단순 trailing `-\d+` strip 금지**(실제 하이픈 유전자 훼손).
       - **chromosome 명명 `chr` prefix로 통일**(infercnvpy `exclude_chromosomes=('chrX','chrY')` 기본과 정합).
-      - **커버리지 게이트 + 요약 반환**: `{n_genes_total, n_mapped, mapped_fraction, make_unique_recovered, n_unmapped,
-        genome_build, source(type/name/sha256), reproducibility_grade, per_chromosome_gene_counts, unmapped_kind(noncoding/
-        clone 비중), unmapped_preview}`. `frac≥0.7` 정상 / `0.5~0.7` 경고(미매핑이 lncRNA/AS/MIR 위주면 무해, build 불일치면
-        의심) / `<0.5` 강한 경고 + build 재확인·사용자 GTF 제안. ⚠️ **다중 GSE build 불일치**는 매핑률로 감지.
+      - **커버리지 게이트 — 전체비율 아닌 protein-coding 커버리지로**(PoC로 정정): 전체 매핑률은 lncRNA/clone-contig
+        미매핑에 눌려 낮게 보이므로 게이트 지표는 **`protein_coding_coverage` = (GTF protein_coding 중 데이터가 좌표 부여한 비율)**.
+        `pc_coverage≥0.8` 정상 / `0.6~0.8` 경고(옛 심볼 drift·build 불일치 의심) / `<0.6` 강한 경고 + build 재확인·alias 해소·
+        사용자 GTF 제안. ⚠️ **다중 GSE build/심볼버전 불일치**는 pc_coverage 저하로 감지.
+      - **요약 반환**: `{n_genes_total, n_mapped, overall_fraction, protein_coding_coverage, make_unique_recovered,
+        n_unmapped, unmapped_kind(noncoding/clone vs other), genome_build, source(type/name/sha256), reproducibility_grade,
+        per_chromosome_gene_counts, unmapped_preview}`.
+      - **(선택) 심볼 alias 해소 패스**: 미매핑 "other"의 상당수가 옛 HGNC 심볼(예 `AARS→AARS1`, `AAED1→PRXL2C`) — HGNC alias
+        매핑으로 추가 회수 가능(필수 아님, 기본 PC 커버리지로 충분).
+      - **✅ PoC 실측(2026-06-10, PDAC 40,237 symbol × GENCODE v44 basic GRCh38)**: pass1 53.4% + make_unique 회수 63 →
+        전체 53.6%, 그러나 **protein_coding 커버리지 89.8%(17,981/20,020)**, 미매핑 18,688 중 91%가 noncoding/clone →
+        **CNV 진행에 충분**. 25개 chromosome `chr` prefix 확인. GTF 다운로드 ~57s/29.6MB(sha 3e52f82c…).
       - **불변식**: `var` 컬럼 추가만(비파괴) — `layers["counts"]`·`.X` 의미 불변. provenance(GTF 해시·build·매핑률)는
         `.uns["scpilot"]`. replay는 등급별 tolerance.
 - [ ] **B12. `core/cnv.py` (Tier 2 malignancy, fine보다 선행)** — **B12-pre 좌표 주석 통과 후** infercnvpy `tl.infercnv`:
