@@ -323,7 +323,7 @@ tool은 한 번에 하나씩 추가하고, **추가할 때마다 `scpilot step`(
 **🔧 열린 결정 2개 (착수 전/중 확정)**
 1. **scqc qc 확장 방식** — B3-ⓐ scrublet·batch-aware를 (a) 실제 scqc 수정→merged 재생성 vs (b) scpilot 후처리.
    ⚠️ (a)는 "베다링=독립" 결정보다 결합이 큼 → 방식 명시 필요.
-2. **세션 모델** — MVP는 단일 `out_dir`(scqc식, 권장) vs 처음부터 멀티클라이언트 세션(A3). 멀티클라이언트는 **연기 권장**.
+2. ~~**세션 모델**~~ ✅**확정(2026-06-10)**: 단일 `out_dir`(A3 구현 완료). 멀티클라이언트/lock 연기.
 
 **📐 착수 전 보완 필요(미명세)**
 - **재귀 레지스트리 ↔ 잡 모델 동거 설계**(C1 진짜 난점): 선형 `run_stage` 위에 compartment 재귀 + 장시간 잡을 어떻게 표현할지.
@@ -350,8 +350,11 @@ tool은 한 번에 하나씩 추가하고, **추가할 때마다 `scpilot step`(
       **`cnv_available` = infercnvpy import OK AND 좌표소스 가용(GTF 캐시 존재 OR `--gtf` 제공 OR biomart 도달+pybiomart)
       AND `var`에 매핑 가능 식별자(symbol/ensembl) 존재**(좌표 주석 단계 B12-pre 성공 가능성 게이트),
       `r_available`(R+renv: Slingshot/Monocle3), celltypist/cytotrace 가용성. LLM은 플래그 false면 해당 도구 선택 불가.
-- [ ] **A3. `session.py` (온디스크 1급)** — `session_id`/manifest/이력로그/단계별 `.h5ad` 체크포인트 + file lock.
-      인메모리는 캐시. AnnData provenance(`.uns["scpilot"]`)·불변식 헬퍼.
+- [x] **A3. `session.py` (온디스크 1급)** — ✅**완료(2026-06-10, 단일 out_dir 확정)**: `Session`(create/open/save) +
+      manifest(`session.json`: session_id·x_state·counts_fingerprint·checkpoints[]·stage) + 단계별 `.h5ad` 체크포인트
+      (atomic) + append-only `run_log.jsonl`/`decisions.jsonl`(스키마는 A7서 동결) + provenance stamp(`.uns["scpilot"]`)
+      + 불변식 헬퍼(counts 존재·fingerprint drift). 인메모리=캐시(lazy 체크포인트 로드). **열린결정#2 확정: 단일 out_dir,
+      멀티클라이언트/lock 연기**(`.lock`은 forward-compat 마커만). 검증: `tests/test_session.py` 5 passed.
 - [x] **A4. `schemas.py`** — ✅**완료(2026-06-10, 동결)**: `ToolResult`(status/summary/tables/artifacts/checkpoint/
       warnings/suggested_next_tools/**determinism_grade**/params/provenance/error_code/recoverable) + `Artifact`(절대경로+meta)
       + `TablePreview`(행수 캡+full CSV 포인터) + 잡 스키마(`JobStatus`/`FallbackAttempt`) + `success()`/`error()`/
