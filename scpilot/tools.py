@@ -58,7 +58,7 @@ def _ensure_loaded() -> None:
     if _LOADED:
         return
     _LOADED = True
-    from scpilot.core import io, state  # noqa: F401 — registration side-effects
+    from scpilot.core import io, state, qc  # noqa: F401 — registration side-effects
 
 
 def get(name: str) -> ToolSpec:

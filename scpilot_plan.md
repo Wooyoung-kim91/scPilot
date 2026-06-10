@@ -399,10 +399,11 @@ B1~B7엔 장시간 도구 없음, scVI 실측 후 설계(과설계 회피). `lon
 - [x] **B2. `core/state.py`** — ✅**완료(2026-06-10)**: `detect_state` 도구 — backed='r'로 단계 감지
       (raw/normalized/hvg/pca/neighbors/clustered/umap/annotated 누적 플래그) → reentry_point. 검증: 처리완료본→umap/annotate,
       raw merged→normalized/preprocess(실데이터), clustered fixture. self-register.
-- [ ] **B3. `core/qc.py` (Tier 0 artifact) — scpilot 내부 소유(결정#1 확정)**: scqc 원본 미수정. merged를
-      `obs[sample_id]`로 **그룹분리 → 그룹별 scrublet → doublet score를 merged에 기록**(per-sample 의미론 보존, 단일 scrublet
-      금지) + calculate_qc_metrics(%MT/%ribo) + stress/dissociation·**mixed-lineage(EPCAM+CD3D 공발현) 플래그** +
-      **batch-aware 분포 요약** 반환 → LLM cutoff 결정·재필터. (선택) ambient RNA 평가(raw droplet 有 시), 미수행 시 경고.
+- [x] **B3. `core/qc.py` (Tier 0 artifact)** — ✅**완료(2026-06-10)**: `qc_metrics`(counts에서 %MT/%ribo +
+      **per-sample scrublet**(sample_key 그룹분리, <30셀 graceful skip) + **mixed-lineage EPCAM+CD3D 플래그** +
+      **batch-aware 분포 요약**(global + per-sample 표)) + `qc_filter`(min_genes/max_pct_mt/max_doublet 컷오프·per-sample
+      kept/removed). 둘 다 mutating·checkpoint. 검증: fixture 5 tests + 실데이터 서브샘플(35 samples). scqc 원본 미수정.
+      (ambient RNA는 raw droplet 필요 — 추후.)
 - [ ] **B4. `core/preprocess.py`** — normalize/log1p/HVG(seurat_v3, **counts·scikit-misc preflight 게이트**,
       batch-aware)/scale/PCA → 분산설명비·HVG 후보 요약.
 - [ ] **B5. `core/plots.py` (scqc `plotting.py` 베다링)** — vendored auto-fit figure 하네스 위에 umap/qc/violin/dotplot →
