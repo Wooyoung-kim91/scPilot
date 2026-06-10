@@ -1,6 +1,7 @@
 """Unit tests for the on-disk Session — scpilot plan A3 (single out_dir)."""
 
 import json
+from pathlib import Path
 
 import anndata as ad
 import numpy as np
