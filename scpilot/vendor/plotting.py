@@ -54,6 +54,10 @@ def plotting_cfg(cfg: PipelineConfig) -> dict:
     p.setdefault("column_width_in", 3.5)
     p.setdefault("max_w_col", 1.5)
     p.setdefault("max_h_col", 1.0)
+    # scpilot adaptation: orientation-flexible cap — allow up to max_w/max_h in
+    # either dimension but forbid BOTH exceeding this per-panel limit (so the saved
+    # size is one of {1×1.5, 1.5×1, 1×1} col, never 1.5×1.5). None = off (scqc default).
+    p.setdefault("square_limit_col", None)
     p.setdefault("start_col", 0.5)
     p.setdefault("step_col", 0.25)
     p.setdefault("min_font_pt", 5)
@@ -213,6 +217,10 @@ def _size_grid(p: dict, cols: int = 1, rows: int = 1):
     ws = np.round(np.arange(start * cols, p["max_w_col"] * cols + 1e-9, step * cols), 3)
     hs = np.round(np.arange(start * rows, p["max_h_col"] * rows + 1e-9, step * rows), 3)
     pairs = [(float(w), float(h)) for w in ws for h in hs]
+    lim = p.get("square_limit_col")
+    if lim is not None:                       # forbid both dims exceeding lim (per panel)
+        pairs = [(w, h) for (w, h) in pairs
+                 if not (w / cols > lim + 1e-9 and h / rows > lim + 1e-9)]
     pairs.sort(key=lambda wh: (wh[0] * wh[1], wh[0] + wh[1]))  # smallest area first
     return pairs
 

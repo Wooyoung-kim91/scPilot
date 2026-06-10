@@ -58,7 +58,7 @@ def _ensure_loaded() -> None:
     if _LOADED:
         return
     _LOADED = True
-    from scpilot.core import io, state, qc, preprocess, cluster, markers  # noqa: F401 — registration
+    from scpilot.core import io, state, qc, preprocess, cluster, markers, plots  # noqa: F401
 
 
 def get(name: str) -> ToolSpec:

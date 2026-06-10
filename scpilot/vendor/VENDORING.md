@@ -15,7 +15,7 @@ library dependency). This file records provenance and the re-sync procedure.
 | `harness.py` | scqc `harness.py` | imports → `scpilot` / `scpilot.vendor.config`; provenance key `scqc_pipeline_version`→`scpilot_version`; command `-m scqc_pipeline`→`-m scpilot`; snapshot dir `scqc_pipeline-*`→`scpilot-*`; `uns["scqc_pipeline"]`→`uns["scpilot"]`; repro-template stages-import neutralized |
 | `config.py` | scqc `config.py` | none (no scqc imports) — scqc-specific profile fields kept as starting point; will diverge |
 | `io_10x.py` | scqc `io_10x.py` | none (self-contained) |
-| `plotting.py` | scqc `plotting.py` | config import → `scpilot.vendor.config` |
+| `plotting.py` | scqc `plotting.py` | config import → `scpilot.vendor.config`; **+`square_limit_col`** option (plotting_cfg setdefault + `_size_grid` filter) so scpilot can cap to orientation-flexible {1×1.5,1.5×1,1×1} per the user plot policy (B5) |
 
 **Not vendored (yet):** `metaschema.py` — upstream raw-metadata harmonize/filter/derive
 domain; scpilot enters at the merged h5ad, so vendor only if scpilot ever handles

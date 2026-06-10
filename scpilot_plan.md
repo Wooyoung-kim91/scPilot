@@ -407,8 +407,11 @@ B1~B7엔 장시간 도구 없음, scVI 실측 후 설계(과설계 회피). `lon
 - [x] **B4. `core/preprocess.py`** — ✅**완료(2026-06-10)**: `preprocess` — counts에서 시작 normalize/log1p(+lognorm 레이어)
       /HVG(seurat_v3, batch-aware, counts·skmisc)/PCA(mask_var=HVG, 대용량 scale 회피) → variance_ratio·n_hvg·elbow 제안 요약.
       counts 불변·x_state=log1p 기록. invalid_state 게이트(counts 없으면). grade B(PCA). 검증: chain 테스트.
-- [ ] **B5. `core/plots.py` (scqc `plotting.py` 베다링)** — vendored `fit_and_save` auto-fit 하네스 위에
-      umap/qc/violin/dotplot/pca → PNG(절대경로+메타). **plot 스타일 정책(사용자 확정 2026-06-10)**:
+- [x] **B5. `core/plots.py` (scqc `plotting.py` 베다링)** — ✅**완료(2026-06-10)**: `plots` 도구
+      (kind=umap/qc_violin/hvg/pca_variance) — vendored `save_*`에 정책 config 적용(max 1.5×1.5 + **신규
+      `square_limit_col=1.0`**으로 양쪽>1 금지), FitResult→Artifact(w/h in·dpi). 검증: 정책 테스트(1.5×1/1×1.5/1×1 허용,
+      1.5×1.5 금지) + 실데이터 umap(180977셀→[0.75,0.5]col). scib/타패키지 동일 하네스 라우팅은 해당 도구 구현 시.
+      아래 정책 **vendored `fit_and_save` auto-fit 하네스 위에** 구현: **plot 스타일 정책(사용자 확정 2026-06-10)**:
       ① 각 패키지 튜토리얼 스타일 그대로 — scanpy는 `sc.pl.*`, scib는 scib 자체 plotter, 나머지도 자기 plot 도구를 빌더로
       → 같은 `fit_and_save`에 태워 **동일 로직 공유**. ② 저장 크기 = 컬럼 단위 **min 0.5×0.5, max는 방향유연
       {1×1.5(세로)·1.5×1(가로)·1×1} — 양쪽 동시 >1 금지**(현 vendored 기본 h≤1.0을 이 제약으로 조정). ③ 잘림 발생 시
