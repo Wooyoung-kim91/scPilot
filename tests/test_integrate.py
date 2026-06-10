@@ -61,6 +61,29 @@ def test_scvi_missing_model_dir(tmp_path):
     assert r.status == "error" and r.error_code == "missing_input"
 
 
+def test_train_scvi_trains_saves_applies(tmp_path):
+    s = _pca_session(tmp_path)
+    r = tools.run("train_scvi", s, batch_key="GSM", n_latent=10, max_epochs=2,
+                  model_out=str(tmp_path / "model"))
+    assert r.status == "success"
+    assert "X_scVI" in s.adata.obsm
+    assert s.adata.obsm["X_scVI"].shape == (s.adata.n_obs, 10)
+    assert (tmp_path / "model" / "model.pt").exists()
+    assert "X_pca" in s.adata.obsm           # baseline embedding preserved
+    assert r.determinism_grade == "B"
+    r.to_dict()
+
+
+def test_train_scvi_requires_hvg(tmp_path):
+    # raw session, no preprocess → no highly_variable
+    a = ad.AnnData(sparse.csr_matrix(np.random.default_rng(0).poisson(1.0, (60, 30)).astype("float32")))
+    a.layers["counts"] = a.X.copy(); a.obs["GSM"] = "s1"
+    p = tmp_path / "raw.h5ad"; a.write_h5ad(p)
+    s = Session.create(tmp_path / "s", input_path=str(p)); s.load_input()
+    r = tools.run("train_scvi", s, batch_key="GSM")
+    assert r.status == "error" and r.error_code == "invalid_state"
+
+
 def test_registry_has_integrate():
     names = {t["name"] for t in tools.list_tools()}
-    assert {"integrate_scvi", "integrate_harmony"} <= names
+    assert {"integrate_scvi", "integrate_harmony", "train_scvi"} <= names
