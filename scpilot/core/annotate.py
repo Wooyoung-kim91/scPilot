@@ -326,10 +326,11 @@ _REVIEW_CONF_MIN = 0.5
                       "deterministic review_status baseline. The LLM (host agent / mode-2) then infers "
                       "transcriptional programs from the raw DE WITHOUT a marker database, detects "
                       "conflicting programs / artifacts, and adjusts confidence — see llm/prompts.py "
-                      "ANNOTATION_REVIEW_PROMPT. Run after annotate_broad (plan B8 review layer).")
+                      "ANNOTATION_REVIEW_PROMPT. Pass tissue= (e.g. 'human pancreas, PDAC') as a soft "
+                      "prior so the reviewer flags tissue-implausible calls. Run after annotate_broad (plan B8).")
 def annotation_review(session, *, top_n: int = 50, sample_key: str = "sample_id",
                       conf_min: float = _REVIEW_CONF_MIN, max_samples_reported: int = 8,
-                      **params) -> S.ToolResult:
+                      tissue: str | None = None, **params) -> S.ToolResult:
     """Deterministic evidence packager — the boundary the plan draws between replayable
     tools (this) and non-deterministic LLM reasoning (the reviewer). It re-uses the
     ``rank_genes_groups`` and ``scpilot_annotation['tier1']`` that ``annotate_broad``
@@ -419,17 +420,21 @@ def annotation_review(session, *, top_n: int = 50, sample_key: str = "sample_id"
     json_path = art_dir / "annotation_review.json"
     json_path.write_text(json.dumps(
         {"groupby": groupby, "top_n": top_n, "label_key": "major_cell_type",
-         "marker_db_used_for_review": False, "clusters": payloads}, indent=2, default=str))
+         "tissue_context": tissue, "marker_db_used_for_review": False,
+         "clusters": payloads}, indent=2, default=str))
 
     import pandas as pd
     table = S.table_preview(pd.DataFrame(rows), max_rows=len(rows))
     flagged = [p["cluster_id"] for p in payloads if p["review_status"] != "ok"]
     summary = {
         "groupby": groupby, "top_n": top_n, "n_clusters": len(payloads),
+        "tissue_context": tissue,
         "status_counts": status_counts, "flagged_clusters": flagged,
         "review_input": str(json_path),
-        "note": "LLM reviewer infers programs from de_table WITHOUT a marker DB; "
-                "see llm/prompts.py ANNOTATION_REVIEW_PROMPT. review_status here is the deterministic baseline.",
+        "note": "LLM reviewer infers programs from de_table WITHOUT a marker DB, but uses "
+                "tissue_context as a soft prior (flags tissue-implausible calls). See "
+                "llm/prompts.py ANNOTATION_REVIEW_PROMPT + TISSUE_CONTEXT_GUIDANCE. "
+                "review_status here is the deterministic baseline.",
     }
     warnings = [] if not flagged else [f"{len(flagged)} cluster(s) flagged for review: {flagged}"]
     return S.success("annotation_review", summary=summary, tables={"review": table},

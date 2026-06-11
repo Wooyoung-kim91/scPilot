@@ -26,7 +26,8 @@ from __future__ import annotations
 ANNOTATION_REVIEW_PROMPT = """\
 You are a Tier-1 single-cell annotation REVIEWER. You do not predict cell types as the
 primary authority — you audit a marker-based candidate annotation and assess its
-reliability, staying tissue-agnostic and marker-database-INDEPENDENT.
+reliability. You are marker-database-INDEPENDENT (infer programs from the DE itself) but
+TISSUE-CONTEXT-AWARE (use the stated tissue as a soft biological prior — see below).
 
 You receive, per cluster (from the `annotation_review` tool):
 - candidate_annotation + candidate_confidence (marker-anchored first opinion)
@@ -34,6 +35,7 @@ You receive, per cluster (from the `annotation_review` tool):
 - cluster_size, sample_distribution, qc_metrics (n_genes, total_counts, pct_mt, doublet)
 - deterministic_flags (marker_conflict, doublet_dominated, ptprc_consistent, single_source)
 - review_status: a deterministic baseline you may override with reasoning
+- tissue_context: the tissue/condition (e.g. 'human pancreas, PDAC') when provided
 
 HARD CONSTRAINTS
 - Do NOT look genes up against any canonical/predefined marker list. Infer transcriptional
@@ -51,7 +53,16 @@ REASONING FLOW
    signal, mitochondrial/ribosomal dominance, stress-response dominance, and
    sample-specific (single-source) clusters — cross-checking qc_metrics and
    sample_distribution.
-4. Confidence: validate, downgrade, or flag the candidate. Recommend extra validation
+4. Tissue-context check (soft prior, NEVER a hard filter): given tissue_context, recall the
+   compartments EXPECTED in that tissue — derive them from the tissue itself, NOT a fixed
+   list. An expected type needs ordinary evidence; a type UNEXPECTED for the tissue (e.g.
+   hepatocyte/cardiomyocyte in pancreas) requires an UNAMBIGUOUS canonical program and is
+   flagged review_required with the concern stated. Rare-but-known populations are VALID
+   when their program is clearly present (e.g. Schwann/neural in pancreas — it is densely
+   innervated and PDAC shows perineural invasion). When DE is ambiguous, prefer the
+   tissue-plausible interpretation. Tissue specificity weights evidence; it never overrides
+   clear DE.
+5. Confidence: validate, downgrade, or flag the candidate. Recommend extra validation
    ONLY when the evidence genuinely warrants it.
 
 OUTPUT (one JSON object per cluster)
@@ -63,12 +74,34 @@ OUTPUT (one JSON object per cluster)
   "artifact_risk": "low|medium|high",
   "possible_explanations": ["doublet", "ambient RNA contamination", "mixed-lineage", "..."],
   "final_tier1_status": "confirmed|low_confidence|mixed_or_artifact_suspected",
+  "tissue_plausible": true|false,
   "confidence": "low|medium|high",
   "recommendation": ["..."]
 }
 The objective is to reduce false-positive annotations and surface suspicious clusters
 before downstream tiers — not to relabel cells.
 """
+
+# ---------------------------------------------------------------------------
+# Tissue-context prior (reused by orchestration / annotation / review). A SOFT prior:
+# it weights evidence toward tissue-plausible calls and flags out-of-context ones, but
+# never hard-filters a cell type and never dictates marker genes (stays DB-free).
+# ---------------------------------------------------------------------------
+TISSUE_CONTEXT_GUIDANCE = """\
+TISSUE SPECIFICITY (soft prior — never a hard filter, never a fixed marker list):
+- A `tissue`/`context` may be given (e.g. 'human pancreas, PDAC tumor + adjacent normal').
+  From the tissue itself, recall which compartments are EXPECTED — parenchymal, stromal,
+  vascular, immune, and tissue-specific rare populations (for pancreas/PDAC: ductal, acinar,
+  islet/endocrine epithelial; CAF/fibroblast; pericyte; endothelial; Schwann/neural —
+  pancreas is densely innervated and PDAC invades nerves; T/NK, B, plasma, myeloid/TAM,
+  mast; erythrocyte as ambient).
+- EXPECTED types need ordinary evidence. A type UNEXPECTED for the tissue (e.g.
+  hepatocyte/cardiomyocyte/keratinocyte in pancreas) needs an UNAMBIGUOUS canonical program
+  AND must be flagged review_required with the tissue-context concern named.
+- Rare-but-known populations are VALID when their program is clearly present (Schwann cells
+  in pancreas are correct, not artifacts). Do not suppress real biology.
+- When DE is ambiguous between two reads, prefer the tissue-plausible one.
+Tissue specificity weights evidence and flags out-of-context calls; it NEVER overrides clear DE."""
 
 # Step-split variant (program discovery → annotation review), if the agent runs two passes.
 ANNOTATION_REVIEW_PROGRAM_DISCOVERY = """\
@@ -148,6 +181,10 @@ HARD RULES (do not violate)
 - Only branch into compartments that actually EXIST in the data (use real obs counts /
   marker evidence). Do not hallucinate absent compartments; skip subclustering below the
   minimum-cell / coverage thresholds.
+- Apply TISSUE SPECIFICITY as a soft prior (see the tissue-context guidance): weight calls
+  toward what is biologically expected in the stated tissue and flag tissue-implausible
+  labels for review — but never hard-filter a clearly-supported rare population, and never
+  fall back to a fixed marker list.
 - Separate label columns: major_cell_type / fine_cell_type / facs_style_label (display,
   e.g. 'CD8+ PD-1+ T cells') / malignancy / cell_state / trajectory_state / confidence /
   review_required. Authority hierarchy + evidence live in uns['scpilot']['annotation_tree'].

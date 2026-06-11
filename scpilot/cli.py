@@ -138,6 +138,8 @@ def run(
     inp: str = typer.Argument(..., metavar="INPUT", help="input .h5ad path"),
     workdir: str = typer.Option(None, "--workdir", help="session working directory"),
     goal: str = typer.Option(None, "--goal", help="analysis goal for the agent"),
+    tissue: str = typer.Option(None, "--tissue",
+                               help="tissue/condition (e.g. 'human pancreas, PDAC') — soft annotation prior"),
     effort: str = typer.Option("high", "--effort", help="LLM effort level (high|medium|low)"),
     backend: str = typer.Option(None, "--backend",
                                 help="LLM backend: anthropic | openai (default: env SCPILOT_LLM_BACKEND)"),
@@ -185,7 +187,7 @@ def run(
     typer.secho(f"[scpilot run] backend={provider.name} model={provider.model} -> {wd}",
                 fg=typer.colors.CYAN, err=True)
 
-    result = run_agent(session, provider, goal=goal, seed=seed, max_iters=max_iters)
+    result = run_agent(session, provider, goal=goal, tissue=tissue, seed=seed, max_iters=max_iters)
 
     # final interpretation + report (LLM prose injected into the deterministic report tool)
     interp = ""

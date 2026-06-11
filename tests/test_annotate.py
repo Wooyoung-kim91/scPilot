@@ -202,6 +202,19 @@ def test_annotation_review_packages_evidence(tmp_path):
     assert "qc_metrics" in by_cl["1"] and "sample_distribution" in by_cl["1"]
 
 
+def test_annotation_review_threads_tissue_context(tmp_path):
+    import json
+    s = _ruleset_session(tmp_path)
+    tools.run("annotate_broad", s, groupby="leiden")
+    r = tools.run("annotation_review", s, top_n=10, tissue="human pancreas, PDAC")
+    assert r.status == "success"
+    assert r.summary["tissue_context"] == "human pancreas, PDAC"
+    payload = json.load(open(r.summary["review_input"]))
+    # tissue prior reaches the reviewer payload; markers still NOT used to review
+    assert payload["tissue_context"] == "human pancreas, PDAC"
+    assert payload["marker_db_used_for_review"] is False
+
+
 def test_annotation_review_needs_annotation(tmp_path):
     s = _ruleset_session(tmp_path)            # annotate_broad NOT run
     r = tools.run("annotation_review", s)

@@ -161,9 +161,12 @@ def build_tool_schemas(toolset: list[str] | None = None) -> list[dict]:
     return schemas
 
 
-def _system_prompt(goal: str | None) -> str:
+def _system_prompt(goal: str | None, tissue: str | None = None) -> str:
     parts = [prompts.ORCHESTRATION_PROMPT, prompts.ANNOTATION_PROMPT,
-             prompts.ANNOTATION_REVIEW_PROMPT, prompts.DE_DESIGN_PROMPT]
+             prompts.ANNOTATION_REVIEW_PROMPT, prompts.TISSUE_CONTEXT_GUIDANCE,
+             prompts.DE_DESIGN_PROMPT]
+    if tissue:
+        parts.insert(0, f"TISSUE / CONTEXT: {tissue}\n")
     if goal:
         parts.insert(0, f"ANALYSIS GOAL: {goal}\n")
     return "\n\n".join(parts)
@@ -248,14 +251,15 @@ def _persist_structured(session, name: str, args: dict, stats: RunStats) -> dict
 
 
 def run_agent(session, provider: Provider, *, goal: str | None = None,
-              toolset: list[str] | None = None, seed: int = 0,
+              tissue: str | None = None, toolset: list[str] | None = None, seed: int = 0,
               max_iters: int = 40) -> AgentResult:
     """Drive the autonomous tool loop until the model stops calling tools (or max_iters).
 
-    Returns an ``AgentResult`` with the final prose, token/tool-call stats, and a
-    transcript. All tool runs are logged to the session for deterministic replay.
+    ``tissue`` (e.g. 'human pancreas, PDAC') is passed as a soft annotation prior. Returns an
+    ``AgentResult`` with the final prose, token/tool-call stats, and a transcript. All tool
+    runs are logged to the session for deterministic replay.
     """
-    system = _system_prompt(goal)
+    system = _system_prompt(goal, tissue)
     tool_schemas = build_tool_schemas(toolset)
     stats = RunStats()
     transcript: list[dict] = []
