@@ -76,8 +76,11 @@ NONIMMUNE_COMPARTMENTS = {"Epithelial", "Stromal", "Endothelial"}
 MIXED_LABEL = "Mixed/Artifact"
 LOWQ_LABEL = "Low_quality"
 UNKNOWN_LABEL = "Unknown"
-# non-biological labels — excluded from the scib bio-conservation label set downstream.
-ARTIFACT_LABELS = {UNKNOWN_LABEL, MIXED_LABEL, LOWQ_LABEL}
+AMBIGUOUS_LABEL = "ambiguous"   # consensus_annotation sentinel: methods disagree
+# tool-produced NON-BIOLOGICAL sentinels (NOT cell types) — excluded from the scib
+# bio-conservation label set downstream. (Dataset/tissue-specific labels are NEVER added
+# here; drop those per-run via the benchmark `drop_labels` param.)
+ARTIFACT_LABELS = {UNKNOWN_LABEL, MIXED_LABEL, LOWQ_LABEL, AMBIGUOUS_LABEL}
 UNS_ANNO = "scpilot_annotation"
 
 
@@ -522,4 +525,90 @@ def apply_annotation(session, *, groupby: str = "leiden", labels: dict | None = 
                             params={"groupby": groupby, "key": key, "method": method})
     return S.success("apply_annotation", summary=summary, warnings=warnings, checkpoint=cp.path,
                      determinism_grade="A", duration_s=round(time.time() - t0, 3),
-                     suggested_next_tools=["plots", "integrate_scvi", "benchmark"])
+                     suggested_next_tools=["plots", "consensus_annotation", "integrate_scvi", "benchmark"])
+
+
+@register("consensus_annotation", mutating=True,
+          description="Build a per-cell CONSENSUS cell-type label by majority vote across SEVERAL annotation "
+                      "columns you pass in `keys` (e.g. the per-integration-method annotations). Purpose: an "
+                      "UNBIASED benchmark label_key that is NOT derived from any single embedding — so scib "
+                      "bio-conservation is not circular (de-risk ①). Cells where no label reaches `min_agreement` "
+                      "(or a tie) are marked '" + AMBIGUOUS_LABEL + "' and excluded downstream. NO hardcoding: the "
+                      "annotation columns AND any labels to exclude are caller-supplied; no built-in vocabulary.")
+def consensus_annotation(session, *, keys: list | None = None, out_key: str = "celltype_consensus",
+                         min_agreement: float = 0.5, ambiguous_label: str = AMBIGUOUS_LABEL,
+                         **params) -> S.ToolResult:
+    """Per-cell majority vote across the given annotation columns. A label must be held by a
+    fraction > ``min_agreement`` of the columns AND be a unique winner (no tie) to become the
+    consensus; otherwise the cell is ``ambiguous_label``. Embedding-independent by construction
+    (it combines per-method calls), so it is the recommended ``benchmark`` label_key."""
+    import numpy as np
+    import pandas as pd
+
+    t0 = time.time()
+    adata = session.adata
+    keys = list(keys or [])
+    if len(keys) < 2:
+        return S.error("consensus_annotation", "missing_input",
+                       "pass >=2 annotation columns in 'keys' to vote across (e.g. per-method labels)",
+                       recoverable=True, suggested_next_tools=["apply_annotation"])
+    missing = [k for k in keys if k not in adata.obs.columns]
+    if missing:
+        return S.error("consensus_annotation", "missing_input",
+                       f"annotation column(s) absent in obs: {missing}", recoverable=True,
+                       suggested_next_tools=["apply_annotation"])
+
+    n_keys = len(keys)
+    cats = pd.unique(np.concatenate([adata.obs[k].astype(str).values for k in keys]))
+    code = {c: i for i, c in enumerate(cats)}
+    codes = np.column_stack([
+        pd.Categorical(adata.obs[k].astype(str).values, categories=cats).codes for k in keys])  # (n, n_keys)
+
+    out = np.empty(adata.n_obs, dtype=object)
+    agree = np.zeros(adata.n_obs, dtype=float)
+    for i in range(adata.n_obs):
+        counts = np.bincount(codes[i], minlength=len(cats))
+        mx = counts.max()
+        winners = np.flatnonzero(counts == mx)
+        agree[i] = mx / n_keys
+        out[i] = cats[winners[0]] if (winners.size == 1 and mx / n_keys > min_agreement) else ambiguous_label
+
+    adata.obs[out_key] = pd.Categorical(out)
+    adata.obs[f"{out_key}_agreement"] = agree.astype("float32")
+
+    # pairwise agreement between the input annotations (how concordant the methods are)
+    pairwise = {}
+    for a in range(n_keys):
+        for b in range(a + 1, n_keys):
+            frac = float((codes[:, a] == codes[:, b]).mean())
+            pairwise[f"{keys[a]}__vs__{keys[b]}"] = round(frac, 3)
+
+    dist = adata.obs[out_key].value_counts().to_dict()
+    n_amb = int((adata.obs[out_key].astype(str) == ambiguous_label).sum())
+    adata.uns.setdefault(UNS_ANNO, {})
+    adata.uns[UNS_ANNO]["consensus"] = {
+        "out_key": out_key, "source_keys": keys, "min_agreement": min_agreement,
+        "ambiguous_label": ambiguous_label, "n_ambiguous": n_amb, "pairwise_agreement": pairwise,
+    }
+    try:
+        session.log_decision(S.DecisionEvent(
+            decision_type="consensus_label", choice={"out_key": out_key, "keys": keys},
+            candidates=[], rationale=f"majority vote across {keys} (min_agreement={min_agreement})",
+            stage="consensus_annotation", params={"out_key": out_key}).to_dict())
+    except Exception:  # noqa: BLE001
+        pass
+
+    summary = {
+        "out_key": out_key, "source_keys": keys, "n_keys": n_keys, "min_agreement": min_agreement,
+        "n_ambiguous": n_amb, "ambiguous_frac": round(n_amb / adata.n_obs, 3),
+        "mean_agreement": round(float(agree.mean()), 3), "pairwise_agreement": pairwise,
+        "label_distribution": {str(k): int(v) for k, v in dist.items()},
+        "note": f"Embedding-independent consensus → use as benchmark label_key. '{ambiguous_label}' + other "
+                "non-cell-type labels should be passed to benchmark drop_labels (caller-chosen, not hardcoded).",
+    }
+    warnings = [f"{n_amb} cells '{ambiguous_label}' (methods disagree)"] if n_amb else []
+    cp = session.checkpoint("consensus_annotation", x_state=session.manifest.x_state,
+                            params={"keys": keys, "out_key": out_key, "min_agreement": min_agreement})
+    return S.success("consensus_annotation", summary=summary, warnings=warnings, checkpoint=cp.path,
+                     determinism_grade="A", duration_s=round(time.time() - t0, 3),
+                     suggested_next_tools=["benchmark", "plots"])

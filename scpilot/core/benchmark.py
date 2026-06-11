@@ -29,8 +29,11 @@ _AGG_COLS = ["Batch correction", "Bio conservation", "Total"]
 
 @register("benchmark", mutating=False, long_running=True,
           description="scib-metrics comparison of integration embeddings (PCA/Harmony/scVI) on batch-correction "
-                      "vs bio-conservation; label_key=major_cell_type (marker-anchored, not leiden — avoids "
-                      "circularity). Returns a scored table + scib summary-table figure (plan B10).")
+                      "vs bio-conservation. CRITICAL: label_key must be an EMBEDDING-INDEPENDENT cell-type set — "
+                      "use the cross-method consensus_annotation output (recommended) or one consistent label "
+                      "for all embeddings; NEVER each embedding's own clustering-derived labels (circular, de-risk "
+                      "①). drop_labels (caller-set) removes non-cell-type/sentinel labels. Returns a scored table "
+                      "+ scib summary-table figure (plan B10).")
 def benchmark(session, *, label_key: str = "major_cell_type", batch_key: str = "sample_id",
               embeddings: list | None = None, drop_labels: list | None = None,
               min_label_cells: int = 10, subsample: int | None = 60000, seed: int = 0,

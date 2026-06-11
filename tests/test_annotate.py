@@ -6,8 +6,8 @@ import scanpy as sc
 from scipy import sparse
 
 from scpilot import tools
-from scpilot.core.annotate import (ARTIFACT_LABELS, BROAD_MARKERS, LOWQ_LABEL,
-                                   MIXED_LABEL, UNS_ANNO)
+from scpilot.core.annotate import (AMBIGUOUS_LABEL, ARTIFACT_LABELS, BROAD_MARKERS,
+                                   LOWQ_LABEL, MIXED_LABEL, UNS_ANNO)
 from scpilot.session import Session
 
 
@@ -250,8 +250,39 @@ def test_registry_has_de_llm_annotation_tools():
 
 
 def test_artifact_labels_dropped_by_benchmark_default():
-    # the non-biological labels are the benchmark's default drop set (de-risk ①)
-    assert {"Unknown", MIXED_LABEL, LOWQ_LABEL} == ARTIFACT_LABELS
+    # the tool-produced non-biological sentinels are the benchmark's default drop set (de-risk ①)
+    assert {"Unknown", MIXED_LABEL, LOWQ_LABEL, AMBIGUOUS_LABEL} == ARTIFACT_LABELS
+
+
+def test_consensus_annotation_majority_vote(tmp_path):
+    # consensus across per-method labels; no hardcoded keys/vocabulary
+    import anndata as ad, numpy as np
+    from scipy import sparse
+    rng = np.random.default_rng(0)
+    a = ad.AnnData(sparse.csr_matrix(rng.poisson(1.0, (6, 5)).astype("float32")))
+    a.layers["counts"] = a.X.copy()
+    # 3 per-method annotations: cells 0-3 agree (>=2/3), 4-5 all differ -> ambiguous
+    a.obs["celltype_merge"]   = ["T", "T", "B", "B", "T", "Epi"]
+    a.obs["celltype_harmony"] = ["T", "T", "B", "Epi", "B", "Mye"]
+    a.obs["celltype_scvi"]    = ["T", "Mye", "B", "B", "Mye", "Endo"]
+    p = tmp_path / "c.h5ad"; a.write_h5ad(p)
+    s = Session.create(tmp_path / "csess", input_path=str(p)); s.load_input()
+
+    r = tools.run("consensus_annotation", s,
+                  keys=["celltype_merge", "celltype_harmony", "celltype_scvi"])
+    assert r.status == "success", r.error
+    cons = list(s.adata.obs["celltype_consensus"].astype(str))
+    assert cons[0] == "T" and cons[2] == "B" and cons[3] == "B"   # majority
+    assert cons[5] == AMBIGUOUS_LABEL                              # all 3 differ -> ambiguous
+    assert r.summary["source_keys"] == ["celltype_merge", "celltype_harmony", "celltype_scvi"]
+    assert r.summary["n_ambiguous"] >= 1
+    assert "celltype_merge__vs__celltype_harmony" in r.summary["pairwise_agreement"]
+
+
+def test_consensus_annotation_needs_two_keys(tmp_path):
+    s = _ruleset_session(tmp_path)
+    r = tools.run("consensus_annotation", s, keys=["leiden"])
+    assert r.status == "error" and r.error_code == "missing_input"
 
 
 def test_registry_has_annotate_broad():
