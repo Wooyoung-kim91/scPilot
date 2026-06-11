@@ -175,7 +175,10 @@ def replay_session(out_dir: str, *, executor: "ReplayExecutor | None" = None) ->
         grade = rec.get("determinism_grade") or "B"
         step = {"tool": tool, "grade": grade, "status": rec.get("status")}
         if executor is None:
-            step["replay"] = "dry-run (no executor; tool registry pending — plan C1/A5)"
+            step["replay"] = "dry-run (pass an executor — tools.make_replay_executor — to re-execute)"
+        elif rec.get("status") != "success":
+            # only successful original runs have a summary to reproduce/diff
+            step["replay"] = f"skipped (original status={rec.get('status')})"
         else:
             try:
                 new_summary = executor(rec)

@@ -83,3 +83,21 @@ def all_specs() -> list[ToolSpec]:
 def run(name: str, session, **params) -> S.ToolResult:
     """Dispatch one tool through the registry (used by CLI step / replay / MCP)."""
     return get(name).fn(session, **params)
+
+
+def make_replay_executor(session) -> Callable[[dict], dict]:
+    """Build a stateful ``executor(run_log_record) -> new_summary`` for ``repro.replay_session``.
+
+    Re-runs each recorded tool through the registry with its recorded params on a SHARED
+    replay ``session``, so mutating tools accumulate state (checkpoint → next tool reads it)
+    exactly as the original run did — no LLM in the loop. Raises on a failed re-run so the
+    replay report records it as a mismatch.
+    """
+    def executor(rec: dict) -> dict:
+        tool = rec["tool"]
+        params = rec.get("params", {}) or {}
+        res = run(tool, session, **params)
+        if res.status != "success":
+            raise RuntimeError(f"replay of '{tool}' failed: {res.error_code}: {res.error}")
+        return res.summary
+    return executor

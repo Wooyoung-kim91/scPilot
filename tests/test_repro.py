@@ -87,3 +87,38 @@ def test_replay_with_executor_diffs(tmp_path):
     assert report["mode"] == "executed"
     assert report["all_match"] is True
     assert report["steps"][0]["diff"]["match"] is True
+
+
+def test_replay_registry_executor_end_to_end(tmp_path):
+    """Re-run a real tool chain through the registry executor on a fresh session and
+    confirm every summary matches the original within its determinism grade."""
+    import anndata as ad
+    from scipy import sparse
+    from scpilot import tools
+
+    rng = np.random.default_rng(0)
+    X = rng.poisson(1.0, (300, 80)).astype("float32")
+    X[:150, :20] += rng.poisson(5.0, (150, 20)).astype("float32")
+    a = ad.AnnData(sparse.csr_matrix(X))
+    a.var_names = [f"G{i}" for i in range(80)]
+    a.layers["counts"] = a.X.copy()
+    p = tmp_path / "in.h5ad"; a.write_h5ad(p)
+
+    chain = [("preprocess", {"n_top_genes": 40, "n_pcs": 15}), ("cluster", {"resolution": 0.5})]
+
+    repro.set_global_seed(0)
+    s = Session.create(tmp_path / "sess", input_path=str(p)); s.load_input()
+    for tool, params in chain:
+        res = tools.run(tool, s, **params)
+        assert res.status == "success", res.error
+        s.log_run(S.RunLogRecord(tool=tool, status="success", params=params, summary=res.summary,
+                                 determinism_grade=res.determinism_grade or "B",
+                                 output_checkpoint=res.checkpoint).to_dict())
+
+    repro.set_global_seed(0)
+    replay_sess = Session.create(tmp_path / "replay", input_path=str(p))
+    report = repro.replay_session(str(tmp_path / "sess"),
+                                  executor=tools.make_replay_executor(replay_sess))
+    assert report["mode"] == "executed"
+    assert report["all_match"] is True, report["steps"]
+    assert [st["tool"] for st in report["steps"]] == ["preprocess", "cluster"]

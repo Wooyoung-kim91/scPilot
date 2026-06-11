@@ -147,18 +147,43 @@ def run(
 @app.command()
 def replay(
     session: str = typer.Argument(..., help="session directory to replay"),
+    to: str = typer.Option(None, "--to", help="replay workdir (default <session>/replay)"),
+    seed: int = typer.Option(0, "--seed", help="global RNG seed for the replay"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="validate/list only; do not re-execute"),
 ) -> None:
     """Deterministic replay from the run log, no LLM (plan A7 / mode 4).
 
-    Without a tool registry (plan C1/A5) this runs in dry-run mode: validates and
-    reports the recorded run log + decisions. Emits a JSON report.
+    Re-runs every recorded tool with its recorded params on a FRESH session, then diffs
+    each summary against the original with per-determinism-grade tolerance (A=exact,
+    B=structural±tol, C=bit-identical). ``--dry-run`` validates/lists the log without
+    re-executing. Emits a JSON report; exit code is non-zero on any mismatch.
     """
     import json
+    import shutil
+    from pathlib import Path
 
-    from scpilot.repro import replay_session
+    from scpilot.repro import replay_session, set_global_seed
+    from scpilot.session import Session
+    from scpilot import tools
 
-    report = replay_session(session)  # executor wired once the registry exists
+    executor = None
+    if not dry_run:
+        orig = Session.open(session)
+        inp = orig.manifest.input.get("path")
+        if not inp:
+            typer.secho("original session has no recorded input path — cannot re-execute (use --dry-run)",
+                        fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=2)
+        replay_dir = Path(to) if to else Path(session) / "replay"
+        if replay_dir.exists():
+            shutil.rmtree(replay_dir)           # derived artifact — regenerate fresh each replay
+        set_global_seed(seed)
+        replay_sess = Session.create(replay_dir, input_path=inp)
+        executor = tools.make_replay_executor(replay_sess)
+
+    report = replay_session(session, executor=executor)
     typer.echo(json.dumps(report, indent=2))
+    raise typer.Exit(code=0 if (dry_run or report.get("all_match")) else 1)
 
 
 if __name__ == "__main__":
