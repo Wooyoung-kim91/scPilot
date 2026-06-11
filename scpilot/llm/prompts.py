@@ -53,15 +53,13 @@ REASONING FLOW
    signal, mitochondrial/ribosomal dominance, stress-response dominance, and
    sample-specific (single-source) clusters — cross-checking qc_metrics and
    sample_distribution.
-4. Tissue-context check (soft prior, NEVER a hard filter): given tissue_context, recall the
-   compartments EXPECTED in that tissue — derive them from the tissue itself, NOT a fixed
-   list. An expected type needs ordinary evidence; a type UNEXPECTED for the tissue (e.g.
-   hepatocyte/cardiomyocyte in pancreas) requires an UNAMBIGUOUS canonical program and is
-   flagged review_required with the concern stated. Rare-but-known populations are VALID
-   when their program is clearly present (e.g. Schwann/neural in pancreas — it is densely
-   innervated and PDAC shows perineural invasion). When DE is ambiguous, prefer the
-   tissue-plausible interpretation. Tissue specificity weights evidence; it never overrides
-   clear DE.
+4. Tissue-context check (soft prior, NEVER a hard filter): if tissue_context is given, reason
+   about plausibility FROM the tissue using your own biological knowledge — do NOT use or
+   invent a fixed per-tissue list (it would bias other samples). A tissue-plausible type needs
+   ordinary evidence; a biologically out-of-context type needs an UNAMBIGUOUS canonical program
+   and is flagged review_required with the concern stated. Rare/uncommon populations are VALID
+   when their program is clearly present — do not suppress real biology. When DE is ambiguous,
+   prefer the tissue-plausible read. Tissue specificity weights evidence; it never overrides clear DE.
 5. Confidence: validate, downgrade, or flag the candidate. Recommend extra validation
    ONLY when the evidence genuinely warrants it.
 
@@ -88,20 +86,19 @@ before downstream tiers — not to relabel cells.
 # never hard-filters a cell type and never dictates marker genes (stays DB-free).
 # ---------------------------------------------------------------------------
 TISSUE_CONTEXT_GUIDANCE = """\
-TISSUE SPECIFICITY (soft prior — never a hard filter, never a fixed marker list):
-- A `tissue`/`context` may be given (e.g. 'human pancreas, PDAC tumor + adjacent normal').
-  From the tissue itself, recall which compartments are EXPECTED — parenchymal, stromal,
-  vascular, immune, and tissue-specific rare populations (for pancreas/PDAC: ductal, acinar,
-  islet/endocrine epithelial; CAF/fibroblast; pericyte; endothelial; Schwann/neural —
-  pancreas is densely innervated and PDAC invades nerves; T/NK, B, plasma, myeloid/TAM,
-  mast; erythrocyte as ambient).
-- EXPECTED types need ordinary evidence. A type UNEXPECTED for the tissue (e.g.
-  hepatocyte/cardiomyocyte/keratinocyte in pancreas) needs an UNAMBIGUOUS canonical program
-  AND must be flagged review_required with the tissue-context concern named.
-- Rare-but-known populations are VALID when their program is clearly present (Schwann cells
-  in pancreas are correct, not artifacts). Do not suppress real biology.
-- When DE is ambiguous between two reads, prefer the tissue-plausible one.
-Tissue specificity weights evidence and flags out-of-context calls; it NEVER overrides clear DE."""
+TISSUE SPECIFICITY (soft prior — never a hard filter, never a stored catalog, never marker genes):
+- A `tissue`/`context` may be given. Reason about which compartments are biologically
+  plausible for THAT tissue using your own knowledge of it — there is NO built-in per-tissue
+  expected-type list and you must not invent one to reuse. (A hardcoded catalog overfits one
+  dataset and biases every other sample — exactly what to avoid.)
+- A type that is plausible for the tissue needs ordinary DE evidence. A type that would be
+  biologically out-of-context for the tissue needs an UNAMBIGUOUS canonical program AND must
+  be flagged review_required with the concern named.
+- Rare or uncommon populations are VALID when their canonical program is clearly present —
+  do not suppress real biology just because a population is unexpected or small.
+- When DE is ambiguous between competing reads, prefer the tissue-plausible one.
+This is applied by reasoning FROM the tissue at runtime, not from any table baked into the
+code; it weights evidence and flags out-of-context calls, and NEVER overrides clear DE."""
 
 # Step-split variant (program discovery → annotation review), if the agent runs two passes.
 ANNOTATION_REVIEW_PROGRAM_DISCOVERY = """\
