@@ -43,7 +43,10 @@ def benchmark(session, *, label_key: str = "major_cell_type", batch_key: str = "
 
     t0 = time.time()
     adata = session.adata
-    drop_labels = ["Unknown"] if drop_labels is None else [str(x) for x in drop_labels]
+    # default-drop the non-biological Tier-1 labels (Unknown + the rule-1/4 artifact
+    # buckets) so a grab-bag / doublet / low-quality class can't pollute bio-conservation.
+    from scpilot.core.annotate import ARTIFACT_LABELS
+    drop_labels = sorted(ARTIFACT_LABELS) if drop_labels is None else [str(x) for x in drop_labels]
 
     candidates = embeddings or ["X_pca", "X_harmony", "X_scVI"]
     embs = [e for e in candidates if e in adata.obsm]

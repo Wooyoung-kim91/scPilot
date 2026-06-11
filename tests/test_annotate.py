@@ -6,7 +6,8 @@ import scanpy as sc
 from scipy import sparse
 
 from scpilot import tools
-from scpilot.core.annotate import BROAD_MARKERS, UNS_ANNO
+from scpilot.core.annotate import (ARTIFACT_LABELS, BROAD_MARKERS, LOWQ_LABEL,
+                                   MIXED_LABEL, UNS_ANNO)
 from scpilot.session import Session
 
 
@@ -92,6 +93,94 @@ def test_dotplot_with_celltype_brackets(tmp_path):
     assert r.artifacts and r.artifacts[0].kind == "png"
     from pathlib import Path
     assert Path(r.artifacts[0].path).exists()
+
+
+# ---------------------------------------------------------------------------
+# new Tier-1 rules (2026-06-11): top-30 positives, negative-marker tie-break,
+# Mixed/Artifact, Low_quality QC gate, PTPRC consistency.
+# Pre-assigned leiden labels (annotate only needs groupby + expression for DE),
+# with a large background cluster so one-vs-rest LFCs aren't diluted by overlap.
+# ---------------------------------------------------------------------------
+def _ruleset_session(tmp_path):
+    rng = np.random.default_rng(0)
+    epi, tnk = BROAD_MARKERS["Epithelial"], BROAD_MARKERS["T_NK"]
+    genes = epi + tnk + ["PTPRC"] + [f"G{i}" for i in range(40)]
+    gi = {g: i for i, g in enumerate(genes)}
+    # cluster sizes (bg large so it dominates "rest")
+    spec = [("0", 300), ("1", 50), ("2", 50), ("3", 50), ("4", 50), ("5", 50), ("6", 50)]
+    leiden = sum(([c] * n for c, n in spec), [])
+    N = len(leiden)
+    X = rng.poisson(0.1, (N, len(genes))).astype("float32")
+
+    def boost(cl, cols, lam=10.0):
+        idx = np.array([i for i, c in enumerate(leiden) if c == cl])
+        for col in cols:
+            X[np.ix_(idx, [col])] += rng.poisson(lam, (idx.size, 1)).astype("float32")
+
+    boost("0", [gi[f"G{i}"] for i in range(10)])           # background noise → Unknown
+    boost("1", [gi[g] for g in epi])                        # Epithelial (PTPRC-)
+    boost("2", [gi[g] for g in tnk] + [gi["PTPRC"]])        # T_NK (PTPRC+)  consistent
+    boost("3", [gi[g] for g in epi] + [gi[g] for g in tnk]) # epi+tnk co-expr → Mixed (conflict)
+    boost("4", [gi[g] for g in epi])                        # Epithelial markers BUT high %MT → Low_quality
+    boost("5", [gi[g] for g in tnk])                        # T_NK markers, PTPRC- → ptprc-inconsistent
+    boost("6", [gi[g] for g in tnk])                        # T_NK markers, doublet+ → Mixed (doublet path)
+
+    a = ad.AnnData(sparse.csr_matrix(X))
+    a.var_names = genes
+    a.obs["leiden"] = leiden
+    a.obs["leiden"] = a.obs["leiden"].astype("category")
+    a.layers["counts"] = a.X.copy()
+    a.obs["sample_id"] = rng.choice(["s1", "s2", "s3"], N)
+    a.obs["pct_counts_mt"] = np.where(np.array(leiden) == "4", 40.0, 3.0).astype("float32")
+    # constant high complexity → only the %MT gate fires here (low-gene gate tested elsewhere)
+    a.obs["n_genes_by_counts"] = np.full(N, 1500.0, dtype="float32")
+    a.obs["predicted_doublet"] = (np.array(leiden) == "6")
+    sc.pp.normalize_total(a, target_sum=1e4); sc.pp.log1p(a)
+    p = tmp_path / "rules.h5ad"; a.write_h5ad(p)
+    s = Session.create(tmp_path / "rsess", input_path=str(p)); s.load_input()
+    return s
+
+
+def test_annotate_broad_new_rules(tmp_path):
+    s = _ruleset_session(tmp_path)
+    r = tools.run("annotate_broad", s, groupby="leiden")
+    assert r.status == "success", r.error
+    ev = s.adata.uns[UNS_ANNO]["tier1"]["clusters"]
+
+    # pure lineage clusters resolve correctly
+    assert ev["1"]["label"] == "Epithelial"
+    assert ev["2"]["label"] == "T_NK" and ev["2"]["ptprc_consistent"] is True
+    # rule 1: co-expression of two incompatible panels → Mixed/Artifact (not a single type)
+    assert ev["3"]["label"] == MIXED_LABEL and ev["3"]["marker_conflict"] is True
+    # rule 4: high-%MT cluster gated to Low_quality even though epi markers are present
+    assert ev["4"]["label"] == LOWQ_LABEL and ev["4"]["review_required"] is True
+    # rule 2: immune label but PTPRC- → flagged inconsistent + confidence penalized + review
+    assert ev["5"]["label"] == "T_NK" and ev["5"]["ptprc_consistent"] is False
+    assert ev["5"]["review_required"] is True
+    # rule 1 (doublet path): doublet-dominated cluster → Mixed/Artifact
+    assert ev["6"]["label"] == MIXED_LABEL and ev["6"]["doublet_dominated"] is True
+
+    sm = r.summary
+    assert sm["mixed_artifact_clusters"] and sm["low_quality_clusters"]
+    assert sm["ptprc_inconsistent_clusters"] == ["5"]
+    assert "top-30" in sm["method"]
+    assert s.adata.uns[UNS_ANNO]["tier1"]["top_n_markers"] == 30
+    assert "major_review_required" in s.adata.obs
+
+
+def test_annotate_broad_top_n_limits_positives(tmp_path):
+    # top_n_markers=1 keeps only the single strongest DE gene per cluster → a 3-marker
+    # panel call is impossible, so even clean lineages fall back to Unknown.
+    s = _ruleset_session(tmp_path)
+    r = tools.run("annotate_broad", s, groupby="leiden", top_n_markers=1)
+    assert r.status == "success"
+    ev = s.adata.uns[UNS_ANNO]["tier1"]["clusters"]
+    assert ev["1"]["label"] == "Unknown" and ev["2"]["label"] == "Unknown"
+
+
+def test_artifact_labels_dropped_by_benchmark_default():
+    # the non-biological labels are the benchmark's default drop set (de-risk ①)
+    assert {"Unknown", MIXED_LABEL, LOWQ_LABEL} == ARTIFACT_LABELS
 
 
 def test_registry_has_annotate_broad():
