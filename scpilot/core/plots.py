@@ -44,10 +44,17 @@ def _artifacts_from_fit(fit, cfg) -> list[S.Artifact]:
 
 
 @register("plots", mutating=False,
-          description="Render a figure (umap/qc_violin/hvg/pca_variance) via the auto-fit harness; "
-                      "returns the saved PNG(s) sized to the column policy (plan B5).")
+          description="Render a figure and return the saved PNG(s) (plan B5). "
+                      "kind=umap (params: color, basis — e.g. basis=X_umap_harmony / X_umap_scvi "
+                      "and color=sample_id/condition/major_cell_type for integration before/after "
+                      "comparisons; many-category colors auto-use a generous canvas), "
+                      "qc_violin (keys, groupby), hvg, pca_variance, "
+                      "dotplot (annotation marker dotplot: groupby=major_cell_type, optional marker_groups; "
+                      "cell-type rows ordered as a staircase under their marker brackets). "
+                      "umap/qc_violin/hvg/pca_variance obey the journal-column size policy; "
+                      "dotplot and many-category umap are sized naturally for legibility.")
 def plots(session, *, kind: str = "umap", color: str | None = None,
-          keys: list | None = None, groupby: str | None = None,
+          basis: str = "X_umap", keys: list | None = None, groupby: str | None = None,
           marker_groups: dict | None = None, **params) -> S.ToolResult:
     import matplotlib
     matplotlib.use("Agg")  # headless (MCP/CLI: no display)
@@ -63,14 +70,16 @@ def plots(session, *, kind: str = "umap", color: str | None = None,
 
     try:
         if kind == "umap":
-            if "X_umap" not in adata.obsm:
-                return S.error("plots", "invalid_state", "no X_umap — run cluster first",
+            if basis not in adata.obsm:
+                return S.error("plots", "invalid_state",
+                               f"no '{basis}' in obsm{sorted(adata.obsm)} — run cluster/integrate first",
                                recoverable=True, suggested_next_tools=["cluster"])
             ck = color or ("leiden" if "leiden" in adata.obs else adata.obs.columns[0])
             if ck not in adata.obs:
                 return S.error("plots", "missing_input", f"color key '{ck}' not in obs", recoverable=True)
-            fit = P.save_umap(adata, cfg, art_dir / f"umap_{ck}", color=ck)
-            label = f"umap colored by {ck}"
+            suf = "" if basis == "X_umap" else "_" + basis.removeprefix("X_umap_").removeprefix("X_")
+            fit = P.save_umap(adata, cfg, art_dir / f"umap{suf}_{ck}", color=ck, basis=basis)
+            label = f"{basis} colored by {ck}"
 
         elif kind == "qc_violin":
             ks = keys or [k for k in _QC_KEYS if k in adata.obs]
@@ -97,7 +106,6 @@ def plots(session, *, kind: str = "umap", color: str | None = None,
         elif kind == "dotplot":
             # annotation dotplot: sc.pl.dotplot with marker panels AS A DICT → cell-type
             # brackets + labels above the x-axis (built-in var-group rendering).
-            import scanpy as sc
             from scpilot.core.annotate import BROAD_MARKERS
             gb = groupby or ("major_cell_type" if "major_cell_type" in adata.obs else "leiden")
             if gb not in adata.obs:
@@ -110,11 +118,15 @@ def plots(session, *, kind: str = "umap", color: str | None = None,
             if not groups:
                 return S.error("plots", "data_gate_failed", "no marker-panel genes present", recoverable=False)
 
-            def build(size, font, draft=False):
-                return P._scanpy_build(
-                    lambda: sc.pl.dotplot(adata, groups, groupby=gb, show=False,
-                                          dendrogram=False), size)
-            fit = P.fit_and_save(build, cfg, art_dir / f"dotplot_{gb}", logger=None)
+            # staircase: order y-axis cell types to mirror the marker-group columns
+            # (left→right), so each cell type's dots sit on the diagonal under its own
+            # marker block; cell types without a matching panel (e.g. Unknown) trail below.
+            present = list(adata.obs[gb].astype("category").cat.categories)
+            cats_order = [ct for ct in groups if ct in present]
+            cats_order += [ct for ct in present if ct not in cats_order]
+
+            fit = P.save_dotplot(adata, cfg, art_dir / f"dotplot_{gb}", groups, gb,
+                                 categories_order=cats_order, logger=None)
             label = f"dotplot (markers grouped by cell type) over {gb}"
 
         else:

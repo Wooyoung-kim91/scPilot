@@ -261,13 +261,26 @@ def _legend_cats_colors(adata, key, cfg):
     return cats, colors[:len(cats)]
 
 
-def _add_cat_legend(fig, labels, colors, *, font, marker_pt, fig_h_in):
-    """Figure-level categorical legend, outside-right, small dots, auto ncol
-    (constrained_layout reserves the space → never clips / never dominates)."""
+def _add_cat_legend(fig, labels, colors, *, font, marker_pt, fig_h_in, fig_w_in=None):
+    """Figure-level categorical legend with small dots (constrained_layout reserves the
+    space → never clips / never dominates). Few categories sit outside-right (auto ncol
+    by height); many categories (a 31/41-sample batch key) go BELOW the plot in many
+    columns instead — a right-side column of 40 labels would otherwise crush the UMAP to
+    a sliver."""
     from matplotlib.lines import Line2D
     handles = [Line2D([], [], marker="o", linestyle="", markersize=marker_pt,
                       markerfacecolor=c, markeredgewidth=0, color=c, label=str(l))
                for l, c in zip(labels, colors)]
+    n = len(labels)
+    if n > 12:                                    # bottom strip, packed in columns
+        maxlen = max((len(str(l)) for l in labels), default=4)
+        col_in = (maxlen + 3) * font / 72.0       # ~chars × font width + marker/pad
+        avail = (fig_w_in or 3.5)
+        ncol = int(max(2, min(n, avail / max(col_in, 0.4))))
+        fig.legend(handles=handles, loc="outside lower center", frameon=False, fontsize=font,
+                   ncol=ncol, handletextpad=0.3, columnspacing=0.6, labelspacing=0.25,
+                   borderaxespad=0.2)
+        return
     rows_fit = max(1, int((fig_h_in * 72) / (font * 1.7)))
     ncol = max(1, -(-len(labels) // rows_fit))
     fig.legend(handles=handles, loc="outside right upper", frameon=False, fontsize=font,
@@ -496,21 +509,29 @@ def _scanpy_build(call, size):
     return fig
 
 
-def save_violin(adata, cfg, base_path, keys, groupby=None, logger=None):
+def save_violin(adata, cfg, base_path, keys, groupby=None, logger=None, strip_max=2500):
     """Harness lays out a constrained 1×N axes grid; scanpy draws each panel via ax=
     (multi_panel FacetGrid ignores constrained_layout and clips labels, so the
-    harness provides the grid — data rendering stays 100% scanpy)."""
+    harness provides the grid — data rendering stays 100% scanpy).
+
+    The stripplot is thinned: at full scale (10⁵–10⁶ cells) an exhaustive strip is a
+    solid black mass that hides the violin entirely, so we subsample to ``strip_max``
+    points (KDE shape is unchanged) and draw them small + semi-transparent so the
+    violin body reads through."""
     keys = list(keys)
     n_cat = adata.obs[groupby].nunique() if groupby else len(keys)
 
     def build(size, font, draft=False):
-        ad = _draft_view(adata, draft)
+        ad = _draft_view(adata, draft) if draft else _draft_view(adata, True, n=strip_max)
         fig = _new_fig(size)
         axes = fig.subplots(1, len(keys), squeeze=False)[0]
         for ax, m in zip(axes, keys):
             sc.pl.violin(ad, keys=m, groupby=groupby, ax=ax, show=False,
-                         stripplot=not draft, jitter=0.4)
+                         stripplot=not draft, jitter=0.4, size=1.0)
             ax.set_xlabel("")
+            if not draft:                       # de-densify the strip so the violin shows
+                for coll in ax.collections:
+                    coll.set_alpha(0.4)
         return fig
     return fit_and_save(build, cfg, base_path, n_categories=n_cat,
                         grid=(1, len(keys)), logger=logger)
@@ -575,26 +596,117 @@ def save_pca_diagnostic(adata, cfg, base_path, cat_key, cont_key, size_pt=2, log
     return fit_and_save(build, cfg, base_path, grid=(2, 2), logger=logger)
 
 
-def save_umap(adata, cfg, base_path, color, size_pt=2, logger=None):
-    """Harness lays out the axes; scanpy renders the points (sc.pl.umap ax=) with its
+def save_umap(adata, cfg, base_path, color, size_pt=2, logger=None, basis="X_umap"):
+    """Harness lays out the axes; scanpy renders the points (sc.pl.embedding ax=) with its
     legend/colorbar suppressed. The harness owns a small-dot legend (categorical) or a
-    colorbar (continuous) outside — controlled, never clipped, never dominating."""
+    colorbar (continuous) outside — controlled, never clipped, never dominating.
+
+    ``basis`` selects the obsm embedding (default X_umap; e.g. X_umap_harmony / X_umap_scvi
+    to render per-integration UMAPs)."""
     cmap = _default_cmap(cfg)
     mk = plotting_cfg(cfg)["legend_marker_pt"]
     cat = _is_cat(adata, color)
     n = adata.obs[color].nunique() if cat else None
+    emb = basis[2:] if basis.startswith("X_") else basis   # sc.pl.embedding strips the X_ prefix itself
 
     def build(size, font, draft=False):
         ad = _draft_view(adata, draft)
         fig = _new_fig(size)
         ax = fig.subplots()
-        sc.pl.umap(ad, color=color, size=size_pt, ax=ax, show=False,
-                   color_map=cmap, legend_loc=None, colorbar_loc=None)
+        sc.pl.embedding(ad, basis=emb, color=color, size=size_pt, ax=ax, show=False,
+                        color_map=cmap, legend_loc=None, colorbar_loc=None)
         if cat:
             cats, colors = _legend_cats_colors(ad, color, cfg)
-            _add_cat_legend(fig, cats, colors, font=font, marker_pt=mk, fig_h_in=size[1])
+            _add_cat_legend(fig, cats, colors, font=font, marker_pt=mk,
+                            fig_h_in=size[1], fig_w_in=size[0])
         else:
             _add_colorbar(fig, [ax], ad.obs[color], cmap, font=font, label=color)
         return fig
+
+    # Many categories (a 30–40 sample batch key): exempt from the column cap. The
+    # auto-fit minimizes area and would settle on a tiny canvas where a 41-row legend
+    # leaves the UMAP a horizontal sliver. Instead render a generous square panel with
+    # the legend packed below in many columns, saved tight (legibility > strict cap).
+    if cat and n and n > 12:
+        return _save_umap_manycat(build, cfg, base_path, n, logger=logger)
     nc = n if (n and n <= 12) else None
     return fit_and_save(build, cfg, base_path, n_categories=nc, logger=logger)
+
+
+def _save_umap_manycat(build, cfg, base_path, n, *, logger=None):
+    p = plotting_cfg(cfg)
+    col = p["column_width_in"]
+    font = max(p["min_font_pt"], 5)
+    # wide canvas → the bottom legend packs into few rows (≈ √n columns)
+    fig_w = 1.8 * col
+    fig = build((fig_w, 1.7 * col), font, draft=False)
+    _finalize_layout(fig, p, font, 1.7 * col)
+    base = Path(base_path)
+    base.parent.mkdir(parents=True, exist_ok=True)
+    out = []
+    for fmt in p["formats"]:
+        path = base.with_suffix(f".{fmt}")
+        fig.savefig(path, dpi=p["dpi_save"], facecolor=p["facecolor"], bbox_inches="tight")
+        out.append(str(path))
+    plt.close(fig)
+    if logger:
+        logger.info("umap(manycat) %s → %d categories", base.name, n)
+    return FitResult(out, (1.8, 1.7), font, {"manycat": True, "n_categories": n}, [])
+
+
+def save_dotplot(adata, cfg, base_path, groups, groupby, *, categories_order=None,
+                 logger=None, per_gene_in=0.30, per_group_in=0.40, min_panel_in=2.2,
+                 standard_scale=None):
+    """Annotation dotplot: ``sc.pl.dotplot`` with the marker panels passed AS A DICT, so
+    scanpy draws the cell-type brackets + labels above the x-axis (var-group rendering).
+
+    Intentionally EXEMPT from the journal-column cap. A dotplot of N markers × M cell
+    types must be wide enough that adjacent dots never touch and every gene / group
+    label is legible, so the panel is sized naturally from the grid
+    (``per_gene_in`` × ``per_group_in``) — squeezing it into 1.5 columns is what made the
+    labels collide. ``categories_order`` reorders the y-axis cell types (e.g. a staircase
+    aligned with the marker-group columns). Saved with a tight bbox (the no-clip
+    guarantee here comes from sizing, not from a fixed canvas). Returns a FitResult."""
+    p = plotting_cfg(cfg)
+    n_genes = sum(len(v) for v in groups.values())
+    cats = list(categories_order) if categories_order is not None \
+        else list(adata.obs[groupby].astype("category").cat.categories)
+    n_groups = len(cats)
+    font = p["base_font_pt"]
+    panel_w = max(min_panel_in, n_genes * per_gene_in)
+    panel_h = max(min_panel_in, n_groups * per_group_in)
+
+    with _font_context(font):
+        plt.close("all")
+        dp = sc.pl.dotplot(adata, groups, groupby=groupby, categories_order=cats,
+                           figsize=(panel_w, panel_h), var_group_rotation=0.0,
+                           standard_scale=standard_scale, dendrogram=False,
+                           return_fig=True, show=False)
+        # dot diameter ≤ grid-cell so neighbours never overlap; thin edge for legibility
+        cell_in = min(panel_w / max(n_genes, 1), panel_h / max(n_groups, 1))
+        largest = float(np.clip((cell_in * 72.0 * 0.85) ** 2, 30.0, 200.0))
+        dp.style(largest_dot=largest, smallest_dot=8.0, dot_edge_lw=0.35,
+                 dot_edge_color="black", grid=False, x_padding=0.4, y_padding=0.4)
+        dp.legend(width=1.3)
+        dp.make_figure()
+        fig = dp.fig
+        for ax in fig.axes:
+            ax.tick_params(labelsize=font)
+            for t in (ax.get_xticklabels() + ax.get_yticklabels()):
+                t.set_fontsize(font)
+        fig.canvas.draw()
+
+    base_path = Path(base_path)
+    base_path.parent.mkdir(parents=True, exist_ok=True)
+    out = []
+    for fmt in p["formats"]:
+        path = base_path.with_suffix(f".{fmt}")
+        fig.savefig(path, dpi=p["dpi_save"], facecolor=p["facecolor"], bbox_inches="tight")
+        out.append(str(path))
+    plt.close(fig)
+    col = p["column_width_in"]
+    if logger:
+        logger.info("dotplot %s → %.1fx%.1f in (%d genes × %d groups)",
+                    base_path.name, panel_w, panel_h, n_genes, n_groups)
+    return FitResult(out, (round(panel_w / col, 2), round(panel_h / col, 2)), font,
+                     {"dotplot": True, "n_genes": n_genes, "n_groups": n_groups}, [])
