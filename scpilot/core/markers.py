@@ -34,8 +34,10 @@ def markers(session, *, groupby: str = "leiden", n_genes: int = 25, layer: str |
 
     # rank ALL genes so the CSV artifact is a genuine full ranking (Codex review 1.5);
     # the inline preview is capped separately by n_genes.
+    # pts=True → per-cluster expressed fractions (pct_in / pct_out), consumed by
+    # annotation_review as DE evidence for the marker-DB-free LLM annotation.
     sc.tl.rank_genes_groups(adata, groupby=groupby, method="wilcoxon", layer=use_layer,
-                            use_raw=False, n_genes=adata.n_vars)
+                            use_raw=False, n_genes=adata.n_vars, pts=True)
     rg = adata.uns["rank_genes_groups"]
     groups = list(rg["names"].dtype.names)
     preview_n = min(n_genes, adata.n_vars)
@@ -80,4 +82,4 @@ def markers(session, *, groupby: str = "leiden", n_genes: int = 25, layer: str |
     return S.success("markers", summary=summary, tables=tables, artifacts=artifacts,
                      warnings=warnings, checkpoint=cp.path, determinism_grade="A",
                      duration_s=round(time.time() - t0, 3),
-                     suggested_next_tools=["annotate"])
+                     suggested_next_tools=["annotation_review"])

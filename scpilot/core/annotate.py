@@ -93,10 +93,10 @@ def _expressed_fraction(adata, gene: str):
 
 
 @register("annotate_broad", mutating=True,
-          description="Tier 1 broad cell type → obs['major_cell_type'] via leiden-cluster DE markers "
-                      "(pct>=0.25 & LFC>=1, top-30 per cluster) matched to cell-type panels (>=3 markers), "
-                      "with negative-marker tie-break, Mixed/Artifact + Low_quality gating, PTPRC consistency, "
-                      "and sample-provenance flags (plan B8).")
+          description="LEGACY / opt-in (FIXED marker panel). Deterministic Tier-1 via leiden-cluster DE matched "
+                      "to hardcoded BROAD_MARKERS panels — organism/tissue-biased, misses panel-absent types. "
+                      "The PRIMARY Tier-1 path is now marker-DB-FREE: markers → annotation_review → apply_annotation "
+                      "(LLM infers types from DE). Use this only as a quick fixed-panel sanity check.")
 def annotate_broad(session, *, groupby: str = "leiden", min_pct: float = 0.25, min_lfc: float = 1.0,
                    min_markers: int = 3, top_n_markers: int = 30,
                    sample_key: str = "sample_id", batch_key: str = "GSE",
@@ -312,30 +312,28 @@ def annotate_broad(session, *, groupby: str = "leiden", min_pct: float = 0.25, m
                                     "doublet_frac": doublet_frac})
     return S.success("annotate_broad", summary=summary, warnings=warnings, checkpoint=cp.path,
                      determinism_grade="A", duration_s=round(time.time() - t0, 3),
-                     suggested_next_tools=["annotation_review", "plots", "integrate_scvi", "benchmark"])
-
-
-# review_status thresholds (deterministic baseline; the LLM reviewer refines these).
-_REVIEW_CONF_MIN = 0.5
+                     suggested_next_tools=["plots", "integrate_scvi", "benchmark"])
 
 
 @register("annotation_review", mutating=False,
-          description="Package per-cluster Tier-1 review EVIDENCE for an LLM reviewer (read-only, no LLM "
-                      "call here): full top-N ranked DE (logFC/padj/pct_in/pct_out), cluster size, sample "
-                      "distribution, QC, the candidate major_cell_type + deterministic rule flags, and a "
-                      "deterministic review_status baseline. The LLM (host agent / mode-2) then infers "
-                      "transcriptional programs from the raw DE WITHOUT a marker database, detects "
-                      "conflicting programs / artifacts, and adjusts confidence — see llm/prompts.py "
-                      "ANNOTATION_REVIEW_PROMPT. Pass tissue= (e.g. 'human pancreas, PDAC') as a soft "
-                      "prior so the reviewer flags tissue-implausible calls. Run after annotate_broad (plan B8).")
-def annotation_review(session, *, top_n: int = 50, sample_key: str = "sample_id",
-                      conf_min: float = _REVIEW_CONF_MIN, max_samples_reported: int = 8,
-                      tissue: str | None = None, **params) -> S.ToolResult:
-    """Deterministic evidence packager — the boundary the plan draws between replayable
-    tools (this) and non-deterministic LLM reasoning (the reviewer). It re-uses the
-    ``rank_genes_groups`` and ``scpilot_annotation['tier1']`` that ``annotate_broad``
-    already produced (no DE recompute), so it is cheap and adds no analysis decisions of
-    its own beyond a transparent ``review_status`` heuristic over the existing flags."""
+          description="PRIMARY Tier-1 annotation evidence (read-only, NO fixed marker panel): packages each "
+                      "cluster's full top-N ranked DE (logFC/padj/pct_in/pct_out) + cluster size + sample "
+                      "distribution + QC + panel-free artifact flags (doublet/single-source/QC) for the LLM. "
+                      "The LLM (host agent / mode-2) infers each cluster's cell type FROM THE DE ITSELF — no "
+                      "marker database — applies tissue= as a soft prior to flag implausible calls, then writes "
+                      "the calls via apply_annotation. Run after markers (which produces the pts DE). "
+                      "See llm/prompts.py ANNOTATION_REVIEW_PROMPT + TISSUE_CONTEXT_GUIDANCE.")
+def annotation_review(session, *, groupby: str = "leiden", top_n: int = 50, sample_key: str = "sample_id",
+                      tissue: str | None = None, max_samples_reported: int = 8,
+                      doublet_key: str = "predicted_doublet", doublet_frac: float = 0.5,
+                      single_source_frac: float = 0.8, mt_key: str = "pct_counts_mt", max_pct_mt: float = 25.0,
+                      genes_key: str = "n_genes_by_counts", min_genes: float = 300.0, min_cells: int = 20,
+                      **params) -> S.ToolResult:
+    """Deterministic, marker-DB-FREE evidence packager — the boundary between replayable tools
+    (this) and non-deterministic LLM reasoning (the cell-type call). It reuses the per-cluster
+    DE that ``markers`` computed (with ``pts``); it does NOT match against any panel and emits
+    no candidate label. The only deterministic signals it adds are panel-independent QC/artifact
+    flags (high %MT, low complexity, doublet-dominated, single-sample) as a review_status hint."""
     import json
 
     import numpy as np
@@ -343,102 +341,173 @@ def annotation_review(session, *, top_n: int = 50, sample_key: str = "sample_id"
 
     t0 = time.time()
     adata = session.adata
-    if "major_cell_type" not in adata.obs.columns or UNS_ANNO not in adata.uns:
+    if groupby not in adata.obs.columns:
         return S.error("annotation_review", "invalid_state",
-                       "no Tier-1 annotation — run annotate_broad first", recoverable=True,
-                       suggested_next_tools=["annotate_broad"])
-    tier1 = adata.uns[UNS_ANNO].get("tier1")
-    if not tier1 or "rank_genes_groups" not in adata.uns:
+                       f"clustering '{groupby}' absent — run cluster first", recoverable=True,
+                       suggested_next_tools=["cluster"])
+    rg = adata.uns.get("rank_genes_groups")
+    if not rg or rg.get("params", {}).get("groupby") != groupby:
         return S.error("annotation_review", "invalid_state",
-                       "annotate_broad evidence (tier1 + rank_genes_groups) absent — re-run annotate_broad",
-                       recoverable=True, suggested_next_tools=["annotate_broad"])
-
-    groupby = tier1.get("groupby", "leiden")
+                       f"per-cluster DE for '{groupby}' absent — run markers (groupby={groupby}) first",
+                       recoverable=True, suggested_next_tools=["markers"])
     de = sc.get.rank_genes_groups_df(adata, group=None)
+    if "pct_nz_group" not in de.columns:
+        return S.error("annotation_review", "invalid_state",
+                       "DE lacks expressed-fraction (pct) — re-run markers (it sets pts=True)",
+                       recoverable=True, suggested_next_tools=["markers"])
+
     de_cols = {"names": "gene", "logfoldchanges": "logFC", "pvals_adj": "padj",
                "pct_nz_group": "pct_in", "pct_nz_reference": "pct_out", "scores": "score"}
     present_cols = [c for c in de_cols if c in de.columns]
     obs_g = adata.obs[groupby].astype(str)
     has_sample = sample_key in adata.obs.columns
-    clusters_ev = tier1.get("clusters", {})
+    has_doublet = doublet_key in adata.obs.columns
+    has_mt = mt_key in adata.obs.columns
+    has_genes = genes_key in adata.obs.columns
 
     payloads, rows = [], []
-    status_counts = {"ok": 0, "low_confidence": 0, "artifact_suspected": 0}
+    status_counts = {"clean": 0, "review": 0, "artifact_suspected": 0}
     for cl, sub in de.groupby("group", observed=True):
         cl = str(cl)
-        ev = clusters_ev.get(cl, {})
         top = sub.head(top_n)
         de_table = [{de_cols[c]: (round(float(r[c]), 4) if c != "names" else str(r[c]))
                      for c in present_cols} for _, r in top.iterrows()]
-
         mask = (obs_g == cl).values
-        sample_dist = {}
+        n_cells = int(mask.sum())
+
+        sample_dist, single_source = {}, False
         if has_sample:
             sv = adata.obs[sample_key].astype(str)[mask].value_counts(normalize=True)
             sample_dist = {str(k): round(float(v), 3) for k, v in sv.head(max_samples_reported).items()}
+            single_source = bool(sv.iloc[0] >= single_source_frac)
+        qc = {}
+        if has_mt:
+            qc["median_pct_mt"] = round(float(np.median(adata.obs[mt_key].values[mask])), 2)
+        if has_genes:
+            qc["median_n_genes"] = round(float(np.median(adata.obs[genes_key].values[mask])), 1)
+        if has_doublet:
+            qc["doublet_frac"] = round(float(np.asarray(adata.obs[doublet_key].values[mask], dtype=float).mean()), 3)
 
-        label = ev.get("label", "Unknown")
-        conf = float(ev.get("confidence", 0.0))
-        flags = {
-            "marker_conflict": bool(ev.get("marker_conflict", False)),
-            "doublet_dominated": bool(ev.get("doublet_dominated", False)),
-            "ptprc_consistent": ev.get("ptprc_consistent"),
-            "single_source": bool(ev.get("single_source", False)),
-        }
-        # deterministic review_status baseline (the LLM reviewer refines it). Mixed/Artifact
-        # and Low_quality (and the conflict/doublet flags) are genuine artifact risk; plain
-        # Unknown is insufficient-evidence → low_confidence (the LLM's program inference may
-        # still resolve it), not an artifact.
+        # panel-FREE artifact baseline (QC + provenance only — never a cell-type call)
+        doublet_dominated = has_doublet and qc.get("doublet_frac", 0.0) >= doublet_frac
+        low_quality = (has_mt and qc.get("median_pct_mt", 0) > max_pct_mt) or \
+                      (has_genes and qc.get("median_n_genes", 1e9) < min_genes)
         risk = []
-        if label in (MIXED_LABEL, LOWQ_LABEL) or flags["marker_conflict"] or flags["doublet_dominated"]:
+        if doublet_dominated or low_quality:
             status = "artifact_suspected"
-            risk = [k for k in ("marker_conflict", "doublet_dominated") if flags[k]] or [f"label={label}"]
-        elif label == UNKNOWN_LABEL or conf < conf_min or flags["ptprc_consistent"] is False \
-                or flags["single_source"]:
-            status = "low_confidence"
-            risk = (["unknown"] if label == UNKNOWN_LABEL else []) \
-                + ([f"confidence<{conf_min}"] if (label != UNKNOWN_LABEL and conf < conf_min) else []) \
-                + (["ptprc_inconsistent"] if flags["ptprc_consistent"] is False else []) \
-                + (["single_source"] if flags["single_source"] else [])
+            if doublet_dominated: risk.append("doublet_dominated")
+            if low_quality: risk.append("low_quality_qc")
+        elif single_source or n_cells < min_cells:
+            status = "review"
+            if single_source: risk.append("single_source")
+            if n_cells < min_cells: risk.append("tiny_cluster")
         else:
-            status = "ok"
+            status = "clean"
         status_counts[status] += 1
 
         payloads.append({
-            "cluster_id": cl, "candidate_annotation": label, "candidate_confidence": conf,
-            "cluster_size": int(mask.sum()), "deterministic_flags": flags,
+            "cluster_id": cl, "cluster_size": n_cells,
             "review_status": status, "risk_signals": risk,
-            "sample_distribution": sample_dist, "qc_metrics": ev.get("qc", {}),
+            "deterministic_flags": {"doublet_dominated": doublet_dominated,
+                                    "low_quality_qc": low_quality, "single_source": single_source},
+            "sample_distribution": sample_dist, "qc_metrics": qc,
             "de_table": de_table,
         })
-        rows.append({"cluster": cl, "candidate": label, "confidence": conf,
-                     "review_status": status, "risk_signals": ",".join(risk),
-                     "top_de": ",".join(d["gene"] for d in de_table[:6])})
+        rows.append({"cluster": cl, "n_cells": n_cells, "review_status": status,
+                     "risk_signals": ",".join(risk),
+                     "top_de": ",".join(d["gene"] for d in de_table[:8])})
 
     art_dir = session.artifacts_dir
     art_dir.mkdir(parents=True, exist_ok=True)
     json_path = art_dir / "annotation_review.json"
     json_path.write_text(json.dumps(
-        {"groupby": groupby, "top_n": top_n, "label_key": "major_cell_type",
-         "tissue_context": tissue, "marker_db_used_for_review": False,
+        {"groupby": groupby, "top_n": top_n, "tissue_context": tissue,
+         "marker_db_used": False, "candidate_labels_provided": False,
+         "instruction": "Infer each cluster's broad cell type from its de_table (no marker DB); "
+                        "use tissue_context as a soft prior; then call apply_annotation with the "
+                        "cluster->label map.",
          "clusters": payloads}, indent=2, default=str))
 
     import pandas as pd
     table = S.table_preview(pd.DataFrame(rows), max_rows=len(rows))
-    flagged = [p["cluster_id"] for p in payloads if p["review_status"] != "ok"]
+    flagged = [p["cluster_id"] for p in payloads if p["review_status"] != "clean"]
     summary = {
         "groupby": groupby, "top_n": top_n, "n_clusters": len(payloads),
-        "tissue_context": tissue,
+        "tissue_context": tissue, "marker_db_used": False,
         "status_counts": status_counts, "flagged_clusters": flagged,
         "review_input": str(json_path),
-        "note": "LLM reviewer infers programs from de_table WITHOUT a marker DB, but uses "
-                "tissue_context as a soft prior (flags tissue-implausible calls). See "
-                "llm/prompts.py ANNOTATION_REVIEW_PROMPT + TISSUE_CONTEXT_GUIDANCE. "
-                "review_status here is the deterministic baseline.",
+        "note": "DE-based annotation: the LLM reads de_table and assigns cell types WITHOUT a "
+                "marker panel (tissue_context = soft prior), then calls apply_annotation. The flags "
+                "here are panel-free QC/provenance only — not cell-type calls.",
     }
-    warnings = [] if not flagged else [f"{len(flagged)} cluster(s) flagged for review: {flagged}"]
+    warnings = [] if not flagged else [f"{len(flagged)} cluster(s) flagged (QC/provenance): {flagged}"]
     return S.success("annotation_review", summary=summary, tables={"review": table},
                      artifacts=[S.Artifact(path=str(json_path), kind="json",
-                                           description="per-cluster Tier-1 review evidence (LLM reviewer input)")],
+                                           description="per-cluster DE evidence for marker-DB-free LLM annotation")],
                      warnings=warnings, determinism_grade="A", duration_s=round(time.time() - t0, 3),
-                     suggested_next_tools=["plots", "integrate_scvi"])
+                     suggested_next_tools=["apply_annotation"])
+
+
+@register("apply_annotation", mutating=True,
+          description="Write the LLM's DE-based Tier-1 calls into obs['major_cell_type'] — the cluster->label "
+                      "map the LLM inferred from annotation_review evidence (NO fixed marker panel). Deterministic "
+                      "given the map, so the LLM's judgment is fully replayable. Optionally takes per-cluster "
+                      "confidence / review_required / cell_state maps. This is the PRIMARY Tier-1 result.")
+def apply_annotation(session, *, groupby: str = "leiden", labels: dict | None = None,
+                     key: str = "major_cell_type", confidence: dict | None = None,
+                     review_required: dict | None = None, cell_state: dict | None = None,
+                     tissue: str | None = None, method: str = "DE_LLM_marker_free",
+                     unassigned: str = "Unassigned", **params) -> S.ToolResult:
+    t0 = time.time()
+    adata = session.adata
+    if groupby not in adata.obs.columns:
+        return S.error("apply_annotation", "invalid_state",
+                       f"clustering '{groupby}' absent — run cluster first", recoverable=True,
+                       suggested_next_tools=["cluster"])
+    if not labels:
+        return S.error("apply_annotation", "missing_input",
+                       "no 'labels' map given (expected {cluster_id: cell_type} from the LLM)",
+                       recoverable=True, suggested_next_tools=["annotation_review"])
+
+    obs_g = adata.obs[groupby].astype(str)
+    clusters = set(obs_g.unique())
+    lab = {str(k): str(v) for k, v in labels.items()}
+    missing = sorted(clusters - set(lab))                 # clusters the LLM did not label
+    adata.obs[key] = obs_g.map(lambda c: lab.get(c, unassigned)).astype("category")
+    if confidence:
+        cf = {str(k): float(v) for k, v in confidence.items()}
+        adata.obs[f"{key}_confidence"] = obs_g.map(lambda c: cf.get(c, float("nan"))).astype(float)
+    if review_required:
+        rv = {str(k): bool(v) for k, v in review_required.items()}
+        adata.obs[f"{key}_review_required"] = obs_g.map(lambda c: rv.get(c, False)).astype(bool)
+    if cell_state:
+        cs = {str(k): str(v) for k, v in cell_state.items()}
+        adata.obs["cell_state"] = obs_g.map(lambda c: cs.get(c, "")).astype("category")
+
+    adata.uns.setdefault(UNS_ANNO, {})
+    adata.uns[UNS_ANNO]["tier1_llm"] = {
+        "method": method, "groupby": groupby, "label_key": key, "tissue_context": tissue,
+        "labels": lab, "marker_db_used": False,
+    }
+    dist = adata.obs[key].value_counts().to_dict()
+    n_unassigned = int((adata.obs[key].astype(str) == unassigned).sum())
+    try:
+        session.log_decision(S.DecisionEvent(
+            decision_type="tier1_llm_labels", choice=lab, candidates=[],
+            rationale=f"DE-based marker-free Tier-1 labels (tissue={tissue})",
+            stage="apply_annotation", params={"groupby": groupby, "key": key}).to_dict())
+    except Exception:  # noqa: BLE001
+        pass
+
+    summary = {
+        "label_key": key, "method": method, "groupby": groupby, "tissue_context": tissue,
+        "marker_db_used": False, "n_clusters_labeled": len(lab),
+        "unlabeled_clusters": missing, "n_unassigned_cells": n_unassigned,
+        "label_distribution": {str(k): int(v) for k, v in dist.items()},
+    }
+    warnings = [] if not missing else [f"{len(missing)} cluster(s) not in labels → '{unassigned}': {missing}"]
+    cp = session.checkpoint("apply_annotation", x_state=session.manifest.x_state,
+                            params={"groupby": groupby, "key": key, "method": method})
+    return S.success("apply_annotation", summary=summary, warnings=warnings, checkpoint=cp.path,
+                     determinism_grade="A", duration_s=round(time.time() - t0, 3),
+                     suggested_next_tools=["plots", "integrate_scvi", "benchmark"])

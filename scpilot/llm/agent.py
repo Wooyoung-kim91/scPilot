@@ -48,7 +48,7 @@ from scpilot.llm.provider import Provider, ToolCall
 # list, not a hardcode of behaviour — the registry remains the single source of truth.
 DEFAULT_TOOLSET = [
     "detect_state", "qc_metrics", "qc_filter", "preprocess", "cluster",
-    "markers", "annotate_broad", "annotation_review", "plots",
+    "markers", "annotation_review", "apply_annotation", "plots",
     "integrate_scvi", "integrate_harmony",
 ]
 
@@ -72,7 +72,15 @@ _PARAM_HINTS: dict[str, dict] = {
         "n_neighbors": {"type": "integer"},
     },
     "markers": {"n_genes": {"type": "integer"}},
-    "annotate_broad": {"groupby": {"type": "string", "description": "cluster key (leiden)"}},
+    "annotation_review": {"groupby": {"type": "string", "description": "cluster key (leiden)"},
+                          "top_n": {"type": "integer", "description": "DE genes per cluster to expose"},
+                          "tissue": {"type": "string", "description": "tissue/condition — soft prior"}},
+    "apply_annotation": {
+        "groupby": {"type": "string", "description": "cluster key the labels are keyed on (leiden)"},
+        "labels": {"type": "object", "description": "cluster_id -> broad cell type (inferred from DE, NO panel)"},
+        "confidence": {"type": "object", "description": "optional cluster_id -> 0..1 confidence"},
+        "review_required": {"type": "object", "description": "optional cluster_id -> bool"},
+        "tissue": {"type": "string", "description": "tissue/condition context"}},
     "plots": {"kind": {"type": "string", "description": "umap | qc_violin | hvg | pca_variance | dotplot"}},
 }
 
@@ -81,7 +89,7 @@ _DECISION_TYPE: dict[str, str] = {
     "qc_filter": "qc_cutoff",
     "preprocess": "hvg_npcs",
     "cluster": "clustering_resolution",
-    "annotate_broad": "tier1_consensus_label",
+    # apply_annotation logs its own tier1_llm_labels decision (it owns the label map) → not here.
     "integrate_scvi": "integration_method",
     "integrate_harmony": "integration_method",
 }

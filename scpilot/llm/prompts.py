@@ -138,10 +138,13 @@ CANONICAL FLOW (skip steps already satisfied per detect_state; stop when the goa
    (avoid global cutoffs that erase sample/tissue-specific populations).
 3. preprocess -> from variance_ratio + suggested_n_pcs_elbow choose n_top_genes and n_pcs.
 4. cluster (baseline, use_rep=X_pca) -> pick a resolution giving interpretable, not
-   over-fragmented, clusters. markers -> per-cluster ranked DE.
-5. annotate_broad -> Tier-1 major_cell_type (this is the benchmark label_key).
-   annotation_review -> audit it (see the annotation-review prompt; infer programs,
-   flag conflicts/artifacts).
+   over-fragmented, clusters. markers -> per-cluster ranked DE (Wilcoxon, with pts).
+5. Tier-1 annotation is MARKER-DB-FREE — do NOT use a fixed marker panel (annotate_broad is
+   legacy/opt-in only): call annotation_review -> read each cluster's de_table and INFER its
+   broad cell type from the DE itself (see the annotation-review prompt; apply the tissue
+   prior to flag implausible calls; treat QC/doublet/single-source flags as artifact signals).
+   Then call apply_annotation with the cluster->label map you inferred -> this writes
+   obs['major_cell_type'] (the benchmark label_key) and records your calls for replay.
 6. (optional) integrate_scvi / integrate_harmony then benchmark -> pick the integration
    method from scib scores AND biology conservation (do not trust the aggregate alone;
    watch overcorrection warnings). Re-cluster on the chosen embedding.

@@ -181,48 +181,68 @@ def test_annotate_broad_top_n_limits_positives(tmp_path):
 def test_annotation_review_packages_evidence(tmp_path):
     import json
     s = _ruleset_session(tmp_path)
-    tools.run("annotate_broad", s, groupby="leiden")
+    tools.run("markers", s, groupby="leiden")          # DE source (NO fixed panel)
     r = tools.run("annotation_review", s, top_n=20)
     assert r.status == "success", r.error
     assert r.summary["n_clusters"] == 7 and r.summary["top_n"] == 20
-    assert set(r.summary["status_counts"]) == {"ok", "low_confidence", "artifact_suspected"}
+    assert r.summary["marker_db_used"] is False
+    assert set(r.summary["status_counts"]) == {"clean", "review", "artifact_suspected"}
     payload = json.load(open(r.summary["review_input"]))
-    # reviewer-facing payload is marker-database-INDEPENDENT (raw ranked DE only)
-    assert payload["marker_db_used_for_review"] is False
+    # marker-DB-FREE: no panel used, NO candidate label provided to the LLM
+    assert payload["marker_db_used"] is False and payload["candidate_labels_provided"] is False
     by_cl = {c["cluster_id"]: c for c in payload["clusters"]}
-    # full ranked DE evidence is present with the proposal's fields
+    assert "candidate_annotation" not in by_cl["1"]    # the LLM must infer, not confirm
+    # full ranked DE evidence present
     de0 = by_cl["1"]["de_table"][0]
     assert {"gene", "logFC", "padj", "pct_in", "pct_out"} <= set(de0)
     assert len(by_cl["1"]["de_table"]) <= 20
-    # deterministic baseline: the co-expression cluster is artifact_suspected, a clean
-    # lineage is ok, and the QC-gated one is flagged
-    assert by_cl["3"]["review_status"] == "artifact_suspected"
-    assert by_cl["2"]["review_status"] == "ok"
+    # panel-FREE QC/artifact baseline only: doublet cluster (6) + high-%MT cluster (4) flagged
+    assert by_cl["6"]["review_status"] == "artifact_suspected"
     assert by_cl["4"]["review_status"] == "artifact_suspected"
+    assert by_cl["2"]["review_status"] == "clean"
     assert "qc_metrics" in by_cl["1"] and "sample_distribution" in by_cl["1"]
 
 
 def test_annotation_review_threads_tissue_context(tmp_path):
     import json
     s = _ruleset_session(tmp_path)
-    tools.run("annotate_broad", s, groupby="leiden")
+    tools.run("markers", s, groupby="leiden")
     r = tools.run("annotation_review", s, top_n=10, tissue="human pancreas, PDAC")
     assert r.status == "success"
     assert r.summary["tissue_context"] == "human pancreas, PDAC"
     payload = json.load(open(r.summary["review_input"]))
-    # tissue prior reaches the reviewer payload; markers still NOT used to review
     assert payload["tissue_context"] == "human pancreas, PDAC"
-    assert payload["marker_db_used_for_review"] is False
+    assert payload["marker_db_used"] is False
 
 
-def test_annotation_review_needs_annotation(tmp_path):
-    s = _ruleset_session(tmp_path)            # annotate_broad NOT run
-    r = tools.run("annotation_review", s)
+def test_annotation_review_needs_de(tmp_path):
+    s = _ruleset_session(tmp_path)            # markers (DE) NOT run
+    r = tools.run("annotation_review", s, groupby="leiden")
     assert r.status == "error" and r.error_code == "invalid_state"
 
 
-def test_registry_has_annotation_review():
-    assert "annotation_review" in {t["name"] for t in tools.list_tools()}
+def test_apply_annotation_writes_labels_marker_free(tmp_path):
+    import json
+    s = _ruleset_session(tmp_path)
+    tools.run("markers", s, groupby="leiden")
+    # the LLM's DE-derived cluster->type map (no fixed panel anywhere here)
+    labels = {"0": "Myeloid", "1": "Epithelial", "2": "T_NK", "3": "Mixed",
+              "4": "Low_quality", "5": "T_NK", "6": "Mast"}
+    r = tools.run("apply_annotation", s, groupby="leiden", labels=labels,
+                  tissue="human pancreas, PDAC")
+    assert r.status == "success", r.error
+    assert r.summary["marker_db_used"] is False
+    assert "major_cell_type" in s.adata.obs
+    assert set(s.adata.obs["major_cell_type"].astype(str).unique()) <= set(labels.values())
+    assert s.adata.uns[UNS_ANNO]["tier1_llm"]["labels"]["1"] == "Epithelial"
+    # decision logged so the LLM's judgment replays deterministically
+    decs = [json.loads(l) for l in s.decisions_path.read_text().splitlines() if l.strip()]
+    assert any(d["decision_type"] == "tier1_llm_labels" for d in decs)
+
+
+def test_registry_has_de_llm_annotation_tools():
+    names = {t["name"] for t in tools.list_tools()}
+    assert {"annotation_review", "apply_annotation"} <= names
 
 
 def test_artifact_labels_dropped_by_benchmark_default():
