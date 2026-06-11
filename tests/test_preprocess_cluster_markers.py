@@ -86,14 +86,23 @@ def test_cluster_and_markers_chain(tmp_path):
     rm.to_dict()
 
 
+def test_cluster_requires_explicit_resolution(tmp_path):
+    # resolution is human-in-the-loop: cluster refuses to guess it
+    s = _session(tmp_path)
+    tools.run("preprocess", s, n_top_genes=100, n_pcs=20)
+    r = tools.run("cluster", s, use_rep="X_pca")             # no resolution given
+    assert r.status == "error" and r.error_code == "missing_input"
+    assert "resolution" in (r.error or "")
+
+
 def test_cluster_preserves_reductions_per_model(tmp_path):
     """All reductions kept per model, before+after integration (user requirement)."""
     s = _session(tmp_path)
     tools.run("preprocess", s, n_top_genes=100, n_pcs=20)
-    tools.run("cluster", s, use_rep="X_pca")                 # baseline: X_umap / leiden
+    tools.run("cluster", s, use_rep="X_pca", resolution=0.5)   # baseline: X_umap / leiden
     # simulate an integration embedding, then cluster on it
     s.adata.obsm["X_scVI"] = s.adata.obsm["X_pca"][:, :10].copy()
-    rc = tools.run("cluster", s, use_rep="X_scVI")
+    rc = tools.run("cluster", s, use_rep="X_scVI", resolution=0.5)
     a = s.adata
     # baseline reductions still present AND model-specific ones added (not overwritten)
     assert "X_umap" in a.obsm and "X_umap_scvi" in a.obsm

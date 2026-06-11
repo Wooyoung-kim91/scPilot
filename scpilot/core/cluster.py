@@ -22,10 +22,11 @@ def _model_suffix(use_rep: str) -> str:
 
 
 @register("cluster", mutating=True,
-          description="neighbors → leiden → umap on a PCA/integration embedding. ALL reductions are kept "
+          description="neighbors → leiden → umap on a PCA/integration embedding. resolution is HUMAN-IN-THE-LOOP "
+                      "and REQUIRED (no auto-default) — the user sets it per clustering. ALL reductions kept "
                       "per-model (baseline X_umap/leiden; X_umap_<model>/leiden_<model>) — never overwritten (plan B6).")
 def cluster(session, *, use_rep: str = "X_pca", n_neighbors: int = 15, n_pcs: int | None = None,
-            resolution: float = 0.5, seed: int = 0, key_added: str | None = None,
+            resolution: float | None = None, seed: int = 0, key_added: str | None = None,
             key_suffix: str | None = None, **params) -> S.ToolResult:
     import scanpy as sc
 
@@ -35,6 +36,12 @@ def cluster(session, *, use_rep: str = "X_pca", n_neighbors: int = 15, n_pcs: in
         return S.error("cluster", "invalid_state",
                        f"embedding '{use_rep}' absent in obsm{sorted(adata.obsm)} — run preprocess/integrate first",
                        recoverable=True, suggested_next_tools=["preprocess"])
+    # resolution is a human decision (plan: human-in-the-loop) — never silently defaulted.
+    if resolution is None:
+        return S.error("cluster", "missing_input",
+                       "clustering 'resolution' must be set explicitly by the user (human-in-the-loop) — "
+                       "pass resolution=<float>; scpilot does not auto-choose it.",
+                       recoverable=True)
 
     # per-model namespacing so integration-before/after reductions all coexist
     suf = key_suffix if key_suffix is not None else _model_suffix(use_rep)

@@ -124,9 +124,13 @@ GOLDEN RULES
 - One tool at a time. Inspect each result before the next call. Respect a tool's
   `suggested_next_tools` but you may diverge with a stated reason.
 - Reproducibility is mandatory: whenever you make a non-trivial CHOICE (QC cutoffs,
-  HVG/PC counts, clustering resolution, integration method, annotation strategy, DE
-  design), state the candidates you considered, your choice, and a one-line rationale
-  in your prose BEFORE the tool call. The harness records this as a decision event.
+  HVG/PC counts, integration method, annotation strategy, DE design), state the candidates
+  you considered, your choice, and a one-line rationale in your prose BEFORE the tool call.
+  The harness records this as a decision event.
+- CLUSTERING RESOLUTION IS HUMAN-IN-THE-LOOP — you do NOT choose it. The `cluster` tool
+  requires an explicit `resolution` and will not guess. Use ONLY the resolution(s) the user
+  provided (see "Human-set clustering resolution" in context). If a clustering step needs a
+  resolution the user has not given, STOP and ASK the user for it — never invent or default one.
 - If a tool returns status="error", read error_code: `invalid_state` -> run the
   prerequisite tool first; `capability_unavailable`/`dependency_missing` -> skip that
   optional branch and continue; `data_gate_failed` -> do not retry that path.
@@ -145,11 +149,20 @@ CANONICAL FLOW (skip steps already satisfied per detect_state; stop when the goa
    prior to flag implausible calls; treat QC/doublet/single-source flags as artifact signals).
    Then call apply_annotation with the cluster->label map you inferred -> this writes
    obs['major_cell_type'] (the benchmark label_key) and records your calls for replay.
-6. (optional) integrate_scvi / integrate_harmony then benchmark -> pick the integration
-   method from scib scores AND biology conservation (do not trust the aggregate alone;
-   watch overcorrection warnings). Re-cluster on the chosen embedding.
-7. Fine annotation / malignancy / DE per the goal and available capabilities.
-8. Finish with a report.
+6. Integration + PER-METHOD annotation. Run integrate_harmony and/or integrate_scvi
+   (or train_scvi). Then, FOR EACH embedding separately — baseline X_pca AND every
+   integration (X_harmony, X_scVI) — repeat the SAME annotation pipeline on that
+   embedding's own clustering:
+     cluster(use_rep=<emb>, resolution=<HUMAN-set for this embedding>)
+       -> markers(groupby=<that leiden key>)
+       -> annotation_review(groupby=<that leiden key>, tissue=...)
+       -> apply_annotation(groupby=<that leiden key>, key=major_cell_type_<model>, labels=...)
+   Keep each method's labels in a DISTINCT key (major_cell_type / _harmony / _scvi) so they
+   coexist and can be compared. Ask the user for each embedding's resolution before clustering.
+7. benchmark -> compare embeddings on batch-correction vs biology conservation (do not trust
+   the aggregate alone; watch overcorrection). NOTE: for bio-conservation use a CONSISTENT
+   label set, not each embedding's own clustering-derived labels (that is circular).
+8. Fine annotation / malignancy / DE per the goal and available capabilities. Finish with a report.
 
 When the analysis goal is achieved (or no further safe step exists), STOP calling tools
 and write a short final summary of what was done and the key results.
