@@ -312,4 +312,128 @@ def annotate_broad(session, *, groupby: str = "leiden", min_pct: float = 0.25, m
                                     "doublet_frac": doublet_frac})
     return S.success("annotate_broad", summary=summary, warnings=warnings, checkpoint=cp.path,
                      determinism_grade="A", duration_s=round(time.time() - t0, 3),
-                     suggested_next_tools=["plots", "integrate_scvi", "benchmark"])
+                     suggested_next_tools=["annotation_review", "plots", "integrate_scvi", "benchmark"])
+
+
+# review_status thresholds (deterministic baseline; the LLM reviewer refines these).
+_REVIEW_CONF_MIN = 0.5
+
+
+@register("annotation_review", mutating=False,
+          description="Package per-cluster Tier-1 review EVIDENCE for an LLM reviewer (read-only, no LLM "
+                      "call here): full top-N ranked DE (logFC/padj/pct_in/pct_out), cluster size, sample "
+                      "distribution, QC, the candidate major_cell_type + deterministic rule flags, and a "
+                      "deterministic review_status baseline. The LLM (host agent / mode-2) then infers "
+                      "transcriptional programs from the raw DE WITHOUT a marker database, detects "
+                      "conflicting programs / artifacts, and adjusts confidence — see llm/prompts.py "
+                      "ANNOTATION_REVIEW_PROMPT. Run after annotate_broad (plan B8 review layer).")
+def annotation_review(session, *, top_n: int = 50, sample_key: str = "sample_id",
+                      conf_min: float = _REVIEW_CONF_MIN, max_samples_reported: int = 8,
+                      **params) -> S.ToolResult:
+    """Deterministic evidence packager — the boundary the plan draws between replayable
+    tools (this) and non-deterministic LLM reasoning (the reviewer). It re-uses the
+    ``rank_genes_groups`` and ``scpilot_annotation['tier1']`` that ``annotate_broad``
+    already produced (no DE recompute), so it is cheap and adds no analysis decisions of
+    its own beyond a transparent ``review_status`` heuristic over the existing flags."""
+    import json
+
+    import numpy as np
+    import scanpy as sc
+
+    t0 = time.time()
+    adata = session.adata
+    if "major_cell_type" not in adata.obs.columns or UNS_ANNO not in adata.uns:
+        return S.error("annotation_review", "invalid_state",
+                       "no Tier-1 annotation — run annotate_broad first", recoverable=True,
+                       suggested_next_tools=["annotate_broad"])
+    tier1 = adata.uns[UNS_ANNO].get("tier1")
+    if not tier1 or "rank_genes_groups" not in adata.uns:
+        return S.error("annotation_review", "invalid_state",
+                       "annotate_broad evidence (tier1 + rank_genes_groups) absent — re-run annotate_broad",
+                       recoverable=True, suggested_next_tools=["annotate_broad"])
+
+    groupby = tier1.get("groupby", "leiden")
+    de = sc.get.rank_genes_groups_df(adata, group=None)
+    de_cols = {"names": "gene", "logfoldchanges": "logFC", "pvals_adj": "padj",
+               "pct_nz_group": "pct_in", "pct_nz_reference": "pct_out", "scores": "score"}
+    present_cols = [c for c in de_cols if c in de.columns]
+    obs_g = adata.obs[groupby].astype(str)
+    has_sample = sample_key in adata.obs.columns
+    clusters_ev = tier1.get("clusters", {})
+
+    payloads, rows = [], []
+    status_counts = {"ok": 0, "low_confidence": 0, "artifact_suspected": 0}
+    for cl, sub in de.groupby("group", observed=True):
+        cl = str(cl)
+        ev = clusters_ev.get(cl, {})
+        top = sub.head(top_n)
+        de_table = [{de_cols[c]: (round(float(r[c]), 4) if c != "names" else str(r[c]))
+                     for c in present_cols} for _, r in top.iterrows()]
+
+        mask = (obs_g == cl).values
+        sample_dist = {}
+        if has_sample:
+            sv = adata.obs[sample_key].astype(str)[mask].value_counts(normalize=True)
+            sample_dist = {str(k): round(float(v), 3) for k, v in sv.head(max_samples_reported).items()}
+
+        label = ev.get("label", "Unknown")
+        conf = float(ev.get("confidence", 0.0))
+        flags = {
+            "marker_conflict": bool(ev.get("marker_conflict", False)),
+            "doublet_dominated": bool(ev.get("doublet_dominated", False)),
+            "ptprc_consistent": ev.get("ptprc_consistent"),
+            "single_source": bool(ev.get("single_source", False)),
+        }
+        # deterministic review_status baseline (the LLM reviewer refines it). Mixed/Artifact
+        # and Low_quality (and the conflict/doublet flags) are genuine artifact risk; plain
+        # Unknown is insufficient-evidence → low_confidence (the LLM's program inference may
+        # still resolve it), not an artifact.
+        risk = []
+        if label in (MIXED_LABEL, LOWQ_LABEL) or flags["marker_conflict"] or flags["doublet_dominated"]:
+            status = "artifact_suspected"
+            risk = [k for k in ("marker_conflict", "doublet_dominated") if flags[k]] or [f"label={label}"]
+        elif label == UNKNOWN_LABEL or conf < conf_min or flags["ptprc_consistent"] is False \
+                or flags["single_source"]:
+            status = "low_confidence"
+            risk = (["unknown"] if label == UNKNOWN_LABEL else []) \
+                + ([f"confidence<{conf_min}"] if (label != UNKNOWN_LABEL and conf < conf_min) else []) \
+                + (["ptprc_inconsistent"] if flags["ptprc_consistent"] is False else []) \
+                + (["single_source"] if flags["single_source"] else [])
+        else:
+            status = "ok"
+        status_counts[status] += 1
+
+        payloads.append({
+            "cluster_id": cl, "candidate_annotation": label, "candidate_confidence": conf,
+            "cluster_size": int(mask.sum()), "deterministic_flags": flags,
+            "review_status": status, "risk_signals": risk,
+            "sample_distribution": sample_dist, "qc_metrics": ev.get("qc", {}),
+            "de_table": de_table,
+        })
+        rows.append({"cluster": cl, "candidate": label, "confidence": conf,
+                     "review_status": status, "risk_signals": ",".join(risk),
+                     "top_de": ",".join(d["gene"] for d in de_table[:6])})
+
+    art_dir = session.artifacts_dir
+    art_dir.mkdir(parents=True, exist_ok=True)
+    json_path = art_dir / "annotation_review.json"
+    json_path.write_text(json.dumps(
+        {"groupby": groupby, "top_n": top_n, "label_key": "major_cell_type",
+         "marker_db_used_for_review": False, "clusters": payloads}, indent=2, default=str))
+
+    import pandas as pd
+    table = S.table_preview(pd.DataFrame(rows), max_rows=len(rows))
+    flagged = [p["cluster_id"] for p in payloads if p["review_status"] != "ok"]
+    summary = {
+        "groupby": groupby, "top_n": top_n, "n_clusters": len(payloads),
+        "status_counts": status_counts, "flagged_clusters": flagged,
+        "review_input": str(json_path),
+        "note": "LLM reviewer infers programs from de_table WITHOUT a marker DB; "
+                "see llm/prompts.py ANNOTATION_REVIEW_PROMPT. review_status here is the deterministic baseline.",
+    }
+    warnings = [] if not flagged else [f"{len(flagged)} cluster(s) flagged for review: {flagged}"]
+    return S.success("annotation_review", summary=summary, tables={"review": table},
+                     artifacts=[S.Artifact(path=str(json_path), kind="json",
+                                           description="per-cluster Tier-1 review evidence (LLM reviewer input)")],
+                     warnings=warnings, determinism_grade="A", duration_s=round(time.time() - t0, 3),
+                     suggested_next_tools=["plots", "integrate_scvi"])

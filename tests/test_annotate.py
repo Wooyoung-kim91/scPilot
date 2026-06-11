@@ -178,6 +178,40 @@ def test_annotate_broad_top_n_limits_positives(tmp_path):
     assert ev["1"]["label"] == "Unknown" and ev["2"]["label"] == "Unknown"
 
 
+def test_annotation_review_packages_evidence(tmp_path):
+    import json
+    s = _ruleset_session(tmp_path)
+    tools.run("annotate_broad", s, groupby="leiden")
+    r = tools.run("annotation_review", s, top_n=20)
+    assert r.status == "success", r.error
+    assert r.summary["n_clusters"] == 7 and r.summary["top_n"] == 20
+    assert set(r.summary["status_counts"]) == {"ok", "low_confidence", "artifact_suspected"}
+    payload = json.load(open(r.summary["review_input"]))
+    # reviewer-facing payload is marker-database-INDEPENDENT (raw ranked DE only)
+    assert payload["marker_db_used_for_review"] is False
+    by_cl = {c["cluster_id"]: c for c in payload["clusters"]}
+    # full ranked DE evidence is present with the proposal's fields
+    de0 = by_cl["1"]["de_table"][0]
+    assert {"gene", "logFC", "padj", "pct_in", "pct_out"} <= set(de0)
+    assert len(by_cl["1"]["de_table"]) <= 20
+    # deterministic baseline: the co-expression cluster is artifact_suspected, a clean
+    # lineage is ok, and the QC-gated one is flagged
+    assert by_cl["3"]["review_status"] == "artifact_suspected"
+    assert by_cl["2"]["review_status"] == "ok"
+    assert by_cl["4"]["review_status"] == "artifact_suspected"
+    assert "qc_metrics" in by_cl["1"] and "sample_distribution" in by_cl["1"]
+
+
+def test_annotation_review_needs_annotation(tmp_path):
+    s = _ruleset_session(tmp_path)            # annotate_broad NOT run
+    r = tools.run("annotation_review", s)
+    assert r.status == "error" and r.error_code == "invalid_state"
+
+
+def test_registry_has_annotation_review():
+    assert "annotation_review" in {t["name"] for t in tools.list_tools()}
+
+
 def test_artifact_labels_dropped_by_benchmark_default():
     # the non-biological labels are the benchmark's default drop set (de-risk ①)
     assert {"Unknown", MIXED_LABEL, LOWQ_LABEL} == ARTIFACT_LABELS
