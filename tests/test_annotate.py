@@ -187,9 +187,13 @@ def test_annotation_review_packages_evidence(tmp_path):
     assert r.summary["n_clusters"] == 7 and r.summary["top_n"] == 20
     assert r.summary["marker_db_used"] is False
     assert set(r.summary["status_counts"]) == {"clean", "review", "artifact_suspected"}
+    # explicit significance gate (padj < 0.05) is applied and reported
+    assert r.summary["padj_max"] == 0.05 and r.summary["significance_filter"] == "pvals_adj < 0.05"
+    assert r.summary["n_significant_total"] <= r.summary["n_de_total"]
     payload = json.load(open(r.summary["review_input"]))
     # marker-DB-FREE: no panel used, NO candidate label provided to the LLM
     assert payload["marker_db_used"] is False and payload["candidate_labels_provided"] is False
+    assert payload["significance_filter"] == "pvals_adj < 0.05"
     by_cl = {c["cluster_id"]: c for c in payload["clusters"]}
     assert "candidate_annotation" not in by_cl["1"]    # the LLM must infer, not confirm
     # full ranked DE evidence present

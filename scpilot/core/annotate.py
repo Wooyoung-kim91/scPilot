@@ -317,14 +317,14 @@ def annotate_broad(session, *, groupby: str = "leiden", min_pct: float = 0.25, m
 
 @register("annotation_review", mutating=False,
           description="PRIMARY Tier-1 annotation evidence (read-only, NO fixed marker panel): packages each "
-                      "cluster's full top-N ranked DE (logFC/padj/pct_in/pct_out) + cluster size + sample "
-                      "distribution + QC + panel-free artifact flags (doublet/single-source/QC) for the LLM. "
+                      "cluster's top-N SIGNIFICANT (padj<0.05, configurable) ranked DE (logFC/padj/pct_in/pct_out) "
+                      "+ cluster size + sample distribution + QC + panel-free artifact flags for the LLM. "
                       "The LLM (host agent / mode-2) infers each cluster's cell type FROM THE DE ITSELF — no "
                       "marker database — applies tissue= as a soft prior to flag implausible calls, then writes "
                       "the calls via apply_annotation. Run after markers (which produces the pts DE). "
                       "See llm/prompts.py ANNOTATION_REVIEW_PROMPT + TISSUE_CONTEXT_GUIDANCE.")
-def annotation_review(session, *, groupby: str = "leiden", top_n: int = 50, sample_key: str = "sample_id",
-                      tissue: str | None = None, max_samples_reported: int = 8,
+def annotation_review(session, *, groupby: str = "leiden", top_n: int = 50, padj_max: float = 0.05,
+                      sample_key: str = "sample_id", tissue: str | None = None, max_samples_reported: int = 8,
                       doublet_key: str = "predicted_doublet", doublet_frac: float = 0.5,
                       single_source_frac: float = 0.8, mt_key: str = "pct_counts_mt", max_pct_mt: float = 25.0,
                       genes_key: str = "n_genes_by_counts", min_genes: float = 300.0, min_cells: int = 20,
@@ -332,8 +332,9 @@ def annotation_review(session, *, groupby: str = "leiden", top_n: int = 50, samp
     """Deterministic, marker-DB-FREE evidence packager — the boundary between replayable tools
     (this) and non-deterministic LLM reasoning (the cell-type call). It reuses the per-cluster
     DE that ``markers`` computed (with ``pts``); it does NOT match against any panel and emits
-    no candidate label. The only deterministic signals it adds are panel-independent QC/artifact
-    flags (high %MT, low complexity, doublet-dominated, single-sample) as a review_status hint."""
+    no candidate label. Only SIGNIFICANT up-markers (``pvals_adj < padj_max``, default 0.05) are
+    exposed, and the top-N of those per cluster. The only deterministic signals it adds are
+    panel-independent QC/artifact flags (high %MT, low complexity, doublet-dominated, single-sample)."""
     import json
 
     import numpy as np
@@ -355,6 +356,11 @@ def annotation_review(session, *, groupby: str = "leiden", top_n: int = 50, samp
         return S.error("annotation_review", "invalid_state",
                        "DE lacks expressed-fraction (pct) — re-run markers (it sets pts=True)",
                        recoverable=True, suggested_next_tools=["markers"])
+    # explicit significance gate: keep only significant up-markers (padj < padj_max).
+    n_de_total = int(len(de))
+    if "pvals_adj" in de.columns:
+        de = de[de["pvals_adj"] < padj_max]
+    n_sig_total = int(len(de))
 
     de_cols = {"names": "gene", "logfoldchanges": "logFC", "pvals_adj": "padj",
                "pct_nz_group": "pct_in", "pct_nz_reference": "pct_out", "scores": "score"}
@@ -369,7 +375,8 @@ def annotation_review(session, *, groupby: str = "leiden", top_n: int = 50, samp
     status_counts = {"clean": 0, "review": 0, "artifact_suspected": 0}
     for cl, sub in de.groupby("group", observed=True):
         cl = str(cl)
-        top = sub.head(top_n)
+        n_sig = int(len(sub))                          # significant up-markers for this cluster
+        top = sub.head(top_n)                          # top-N AMONG significant (padj < padj_max)
         de_table = [{de_cols[c]: (round(float(r[c]), 4) if c != "names" else str(r[c]))
                      for c in present_cols} for _, r in top.iterrows()]
         mask = (obs_g == cl).values
@@ -406,7 +413,7 @@ def annotation_review(session, *, groupby: str = "leiden", top_n: int = 50, samp
         status_counts[status] += 1
 
         payloads.append({
-            "cluster_id": cl, "cluster_size": n_cells,
+            "cluster_id": cl, "cluster_size": n_cells, "n_significant_markers": n_sig,
             "review_status": status, "risk_signals": risk,
             "deterministic_flags": {"doublet_dominated": doublet_dominated,
                                     "low_quality_qc": low_quality, "single_source": single_source},
@@ -422,8 +429,11 @@ def annotation_review(session, *, groupby: str = "leiden", top_n: int = 50, samp
     json_path = art_dir / "annotation_review.json"
     json_path.write_text(json.dumps(
         {"groupby": groupby, "top_n": top_n, "tissue_context": tissue,
+         "significance_filter": f"pvals_adj < {padj_max}",
+         "n_de_total": n_de_total, "n_significant_total": n_sig_total,
          "marker_db_used": False, "candidate_labels_provided": False,
-         "instruction": "Infer each cluster's broad cell type from its de_table (no marker DB); "
+         "instruction": f"de_table = top-{top_n} SIGNIFICANT (padj<{padj_max}) up-markers per cluster. "
+                        "Infer each cluster's broad cell type from its de_table (no marker DB); "
                         "use tissue_context as a soft prior; then call apply_annotation with the "
                         "cluster->label map.",
          "clusters": payloads}, indent=2, default=str))
@@ -433,12 +443,14 @@ def annotation_review(session, *, groupby: str = "leiden", top_n: int = 50, samp
     flagged = [p["cluster_id"] for p in payloads if p["review_status"] != "clean"]
     summary = {
         "groupby": groupby, "top_n": top_n, "n_clusters": len(payloads),
+        "significance_filter": f"pvals_adj < {padj_max}", "padj_max": padj_max,
+        "n_significant_total": n_sig_total, "n_de_total": n_de_total,
         "tissue_context": tissue, "marker_db_used": False,
         "status_counts": status_counts, "flagged_clusters": flagged,
         "review_input": str(json_path),
-        "note": "DE-based annotation: the LLM reads de_table and assigns cell types WITHOUT a "
-                "marker panel (tissue_context = soft prior), then calls apply_annotation. The flags "
-                "here are panel-free QC/provenance only — not cell-type calls.",
+        "note": f"DE-based annotation: de_table = top-{top_n} SIGNIFICANT up-markers (padj<{padj_max}) per "
+                "cluster; the LLM assigns cell types WITHOUT a marker panel (tissue_context = soft prior), "
+                "then calls apply_annotation. The flags here are panel-free QC/provenance only.",
     }
     warnings = [] if not flagged else [f"{len(flagged)} cluster(s) flagged (QC/provenance): {flagged}"]
     return S.success("annotation_review", summary=summary, tables={"review": table},
