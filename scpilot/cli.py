@@ -62,8 +62,9 @@ def mcp() -> None:
 
 @app.command()
 def step(
-    stage: str = typer.Argument(..., help="tool/stage name (e.g. inspect)"),
-    inp: str = typer.Argument(..., metavar="INPUT", help="input .h5ad path"),
+    stage: str = typer.Argument(..., help="tool/stage name (e.g. load, qc_metrics)"),
+    inp: str = typer.Argument(None, metavar="[INPUT]",
+                              help="input .h5ad / profile (entry step only; later steps resume from the session)"),
     workdir: str = typer.Option(None, "--workdir", "-w", help="session working directory"),
     param: list[str] = typer.Option(None, "--param", "-p", help="k=v tool param (repeatable)"),
     seed: int = typer.Option(0, "--seed", help="global RNG seed"),
@@ -71,7 +72,8 @@ def step(
     """Run a single tool deterministically, no LLM (plan A5 / mode 3).
 
     Dispatches ``stage`` through the tool registry against an on-disk Session and
-    prints the ToolResult as JSON. Used for debug + structural-invariant regression.
+    prints the ToolResult as JSON. INPUT is given on the entry step (load/ingest, or
+    the first step); later steps omit it and resume from the session's checkpoints.
     """
     import json
     from pathlib import Path
@@ -79,7 +81,7 @@ def step(
     from scpilot import schemas as S
     from scpilot import tools
     from scpilot.repro import set_global_seed
-    from scpilot.session import Session
+    from scpilot.session import DEFAULT_RUN_DIR, Session
 
     try:
         spec = tools.get(stage)
@@ -89,9 +91,12 @@ def step(
 
     params = _parse_params(param or [])
     seed_rec = set_global_seed(seed)
-    from scpilot.session import DEFAULT_RUN_DIR
     wd = workdir or DEFAULT_RUN_DIR
-    session = Session.create(wd, input_path=inp)
+    if inp is None and not (Path(wd) / Session.MANIFEST).exists():
+        typer.secho(f"no session at {wd} and no INPUT given — provide INPUT on the entry step",
+                    fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+    session = Session.create(wd, input_path=inp)   # inp None on resume → opens existing session
 
     result = spec.fn(session, **params)
     session.log_run(S.RunLogRecord(

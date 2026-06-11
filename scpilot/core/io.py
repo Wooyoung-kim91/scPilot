@@ -138,9 +138,10 @@ def _inspect_tool(session, **params) -> S.ToolResult:
     return inspect_h5ad(path)
 
 
-@register("load", mutating=False,
-          description="Load the session input h5ad into the working cache and return a summary (plan B1).")
-def _load_tool(session, *, backed: str | None = None, **params) -> S.ToolResult:
+@register("load", mutating=True,
+          description="Entry step: load the input h5ad into the session and checkpoint it as the starting "
+                      "state (00_load), so subsequent steps resume from disk (plan B1).")
+def _load_tool(session, **params) -> S.ToolResult:
     import time
 
     path = params.get("path") or session.manifest.input.get("path")
@@ -149,19 +150,18 @@ def _load_tool(session, *, backed: str | None = None, **params) -> S.ToolResult:
     if not Path(path).exists():
         return S.error("load", "missing_input", f"file not found: {path}", recoverable=False)
     t0 = time.time()
-    adata = session.load_input(path, backed=backed)
+    adata = session.load_input(path)        # full load (needed to checkpoint the entry state)
     layers = sorted(adata.layers.keys())
+    x_state = _guess_x_state(adata)
     summary = {
         "path": str(Path(path).resolve()),
-        "n_obs": int(adata.n_obs),
-        "n_vars": int(adata.n_vars),
-        "layers": layers,
-        "obsm": sorted(adata.obsm.keys()),
-        "has_counts": "counts" in layers,
-        "x_state_guess": _guess_x_state(adata),
-        "backed": bool(backed),
+        "n_obs": int(adata.n_obs), "n_vars": int(adata.n_vars),
+        "layers": layers, "obsm": sorted(adata.obsm.keys()),
+        "obs_columns": [str(c) for c in adata.obs.columns],
+        "has_counts": "counts" in layers, "x_state_guess": x_state,
     }
     warnings = [] if "counts" in layers else ["no 'counts' layer — raw counts unavailable downstream"]
-    return S.success("load", summary=summary, warnings=warnings, determinism_grade="A",
-                     duration_s=round(time.time() - t0, 3),
-                     suggested_next_tools=["detect_state", "preprocess"])
+    cp = session.checkpoint("load", x_state=x_state, params={"path": str(Path(path).resolve())})
+    return S.success("load", summary=summary, warnings=warnings, checkpoint=cp.path,
+                     determinism_grade="A", duration_s=round(time.time() - t0, 3),
+                     suggested_next_tools=["detect_state", "qc_metrics", "preprocess"])
