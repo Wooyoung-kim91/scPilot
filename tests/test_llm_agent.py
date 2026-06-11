@@ -1,0 +1,252 @@
+"""Offline-safe tests for the mode-2 LLM layer (plan D1-D5).
+
+No real API key, no network: a scripted FakeProvider returns a fixed sequence of tool
+calls, driving a tiny synthetic h5ad through real registry tools. Asserts that:
+- the agent runs tools, logs token/tool-call stats,
+- run-log + decision events are written (frozen schema),
+- forced structured output (emit_de_design) is recorded as a decision + artifact,
+- and `scpilot replay` reproduces the mode-2 session deterministically (no LLM).
+"""
+
+import json
+from pathlib import Path
+
+import anndata as ad
+import numpy as np
+from scipy import sparse
+
+from scpilot import tools
+from scpilot.llm.agent import build_tool_schemas, run_agent
+from scpilot.llm.provider import (LLMResponse, ProviderConfig, ToolCall,
+                                   build_provider, probe_backend)
+from scpilot.session import Session
+
+
+# --------------------------------------------------------------------------- #
+# tiny synthetic data (two latent groups so clustering finds structure)
+# --------------------------------------------------------------------------- #
+def _raw(n_obs=240, n_vars=150):
+    rng = np.random.default_rng(0)
+    base = rng.poisson(0.5, (n_obs, n_vars)).astype("float32")
+    half = n_obs // 2
+    base[:half, :30] += rng.poisson(4.0, (half, 30)).astype("float32")
+    base[half:, 30:60] += rng.poisson(4.0, (n_obs - half, 30)).astype("float32")
+    a = ad.AnnData(sparse.csr_matrix(base))
+    a.obs_names = [f"c{i}" for i in range(n_obs)]
+    a.var_names = [f"G{i}" for i in range(n_vars)]
+    a.layers["counts"] = a.X.copy()
+    a.obs["sample_id"] = rng.choice(["s1", "s2", "s3"], n_obs)
+    return a
+
+
+def _session(tmp_path):
+    a = _raw()
+    p = tmp_path / "in.h5ad"
+    a.write_h5ad(p)
+    s = Session.create(tmp_path / "sess", input_path=str(p))
+    s.load_input()
+    return s
+
+
+# --------------------------------------------------------------------------- #
+# scripted fake provider (no SDK, no network)
+# --------------------------------------------------------------------------- #
+class FakeProvider:
+    """A Provider stand-in that returns a pre-scripted list of LLMResponses."""
+
+    def __init__(self, script):
+        self._script = list(script)
+        self.name = "fake"
+        self.model = "fake-model"
+        self.config = ProviderConfig(backend="fake", model="fake-model")
+        self.calls = 0
+
+    def complete(self, messages, *, tools=None, system=None, tool_choice=None, max_tokens=None):
+        self.calls += 1
+        if self._script:
+            return self._script.pop(0)
+        return LLMResponse(text="done", tool_calls=[], stop_reason="end_turn",
+                           usage={"input_tokens": 5, "output_tokens": 5})
+
+    @staticmethod
+    def tool_result_message(call, content):
+        return {"role": "tool", "tool_call_id": call.id, "name": call.name, "content": content}
+
+
+def _tc(i, name, args):
+    return ToolCall(id=f"call_{i}", name=name, arguments=args)
+
+
+def _resp(*calls):
+    return LLMResponse(text="reasoning", tool_calls=list(calls), stop_reason="tool_use",
+                       usage={"input_tokens": 100, "output_tokens": 40})
+
+
+# --------------------------------------------------------------------------- #
+# tests
+# --------------------------------------------------------------------------- #
+def test_build_tool_schemas_includes_emit_tools():
+    names = {s["name"] for s in build_tool_schemas()}
+    assert {"preprocess", "cluster", "markers"} <= names
+    assert {"emit_annotation_labels", "emit_de_design"} <= names
+    # forced-structured schemas carry required keys
+    de = next(s for s in build_tool_schemas() if s["name"] == "emit_de_design")
+    assert "method" in de["input_schema"]["required"]
+
+
+def test_agent_drives_tools_logs_and_stats(tmp_path):
+    s = _session(tmp_path)
+    script = [
+        _resp(_tc(1, "detect_state", {})),
+        _resp(_tc(2, "preprocess", {"n_top_genes": 80, "n_pcs": 20})),
+        _resp(_tc(3, "cluster", {"resolution": 0.5})),
+        _resp(_tc(4, "markers", {"n_genes": 10})),
+        _resp(_tc(5, "emit_de_design", {
+            "method": "pseudobulk", "comparison_axis": "leiden", "group_key": "leiden",
+            "groups": ["0", "1"], "rationale": "two planted groups"})),
+        LLMResponse(text="Analysis complete.", tool_calls=[], stop_reason="end_turn",
+                    usage={"input_tokens": 10, "output_tokens": 8}),
+    ]
+    res = run_agent(s, FakeProvider(script), goal="cluster the data", seed=0, max_iters=20)
+
+    assert res.final_text == "Analysis complete."
+    st = res.stats.to_dict()
+    assert st["tool_calls"] == 5
+    assert st["tool_calls_by_name"]["preprocess"] == 1
+    assert st["total_tokens"] > 0
+    assert st["decisions_logged"] >= 2          # preprocess(hvg_npcs)+cluster(res)+de_design
+
+    # run-log written for the mutating tools (replayable recipe)
+    runs = [json.loads(l) for l in s.run_log_path.read_text().splitlines() if l.strip()]
+    logged = {r["tool"] for r in runs}
+    assert {"preprocess", "cluster", "markers"} <= logged
+
+    # decision events written + valid against the frozen schema
+    decs = [json.loads(l) for l in s.decisions_path.read_text().splitlines() if l.strip()]
+    dtypes = {d["decision_type"] for d in decs}
+    assert "hvg_npcs" in dtypes and "clustering_resolution" in dtypes
+    assert "de_design" in dtypes               # forced structured output recorded
+
+    # forced-structured artifact written
+    assert (s.artifacts_dir / "de_design.json").exists()
+    payload = json.loads((s.artifacts_dir / "de_design.json").read_text())
+    assert payload["method"] == "pseudobulk"
+
+
+def test_mode2_session_replays_deterministically(tmp_path):
+    s = _session(tmp_path)
+    script = [
+        _resp(_tc(1, "preprocess", {"n_top_genes": 80, "n_pcs": 20})),
+        _resp(_tc(2, "cluster", {"resolution": 0.5})),
+        _resp(_tc(3, "markers", {"n_genes": 10})),
+        LLMResponse(text="done", tool_calls=[], stop_reason="end_turn", usage={}),
+    ]
+    run_agent(s, FakeProvider(script), seed=0, max_iters=20)
+
+    # replay through the registry executor (no LLM) on a fresh session
+    from scpilot.repro import replay_session, set_global_seed
+    set_global_seed(0)
+    replay_dir = tmp_path / "replay"
+    rsess = Session.create(replay_dir, input_path=s.manifest.input["path"])
+    executor = tools.make_replay_executor(rsess)
+    report = replay_session(str(s.out), executor=executor)
+
+    assert report["mode"] == "executed"
+    assert report["all_match"] is True, report
+    # every successfully-logged step was diffed and matched within grade tolerance
+    diffed = [st for st in report["steps"] if "diff" in st]
+    assert diffed and all(st["diff"]["match"] for st in diffed)
+
+
+def test_report_tool_assembles_markdown(tmp_path):
+    s = _session(tmp_path)
+    # drive via the agent so the run log (which report reads) is populated
+    script = [
+        _resp(_tc(1, "preprocess", {"n_top_genes": 80, "n_pcs": 20})),
+        _resp(_tc(2, "cluster", {"resolution": 0.5})),
+        LLMResponse(text="done", tool_calls=[], stop_reason="end_turn", usage={}),
+    ]
+    run_agent(s, FakeProvider(script), seed=0, max_iters=20)
+    rep = tools.run("report", s, interpretation="Two clusters were found.")
+    assert rep.status == "success"
+    md = next(a.path for a in rep.artifacts if a.path.endswith("report.md"))
+    assert Path(md).exists()
+    text = Path(md).read_text()
+    assert "Two clusters were found." in text
+    assert "preprocess" in text and "cluster" in text
+    assert (s.artifacts_dir / "report.json").exists()
+
+
+def test_agent_signals_max_iters_when_never_stops(tmp_path):
+    # model keeps calling a tool forever → loop must stop and report it (not silently)
+    s = _session(tmp_path)
+    forever = [_resp(_tc(i, "detect_state", {})) for i in range(10)]
+    res = run_agent(s, FakeProvider(forever), seed=0, max_iters=3)
+    assert res.stopped_reason == "max_iters"
+    assert res.stats.llm_turns == 3
+
+
+def test_anthropic_groups_consecutive_tool_results():
+    # multiple tool results for one assistant turn must collapse into ONE user message
+    from scpilot.llm.provider import _to_anthropic_messages
+    msgs = [
+        {"role": "user", "content": "go"},
+        {"role": "assistant_tool_calls", "text": "calling",
+         "tool_calls": [ToolCall("a", "t1", {}), ToolCall("b", "t2", {})]},
+        {"role": "tool", "tool_call_id": "a", "name": "t1", "content": "r1"},
+        {"role": "tool", "tool_call_id": "b", "name": "t2", "content": "r2"},
+    ]
+    out = _to_anthropic_messages(msgs)
+    tool_msgs = [m for m in out if m["role"] == "user" and isinstance(m["content"], list)
+                 and m["content"] and m["content"][0].get("type") == "tool_result"]
+    assert len(tool_msgs) == 1
+    assert [b["tool_use_id"] for b in tool_msgs[0]["content"]] == ["a", "b"]
+
+
+def test_openai_response_synthesizes_missing_tool_call_id():
+    from types import SimpleNamespace
+    from scpilot.llm.provider import _from_openai_response
+    fn = SimpleNamespace(name="cluster", arguments='{"resolution": 0.5}')
+    tc = SimpleNamespace(id=None, function=fn)               # local server omitted the id
+    msg = SimpleNamespace(content="", tool_calls=[tc])
+    resp = SimpleNamespace(choices=[SimpleNamespace(message=msg, finish_reason="tool_calls")],
+                           usage=None)
+    parsed = _from_openai_response(resp)
+    assert parsed.tool_calls[0].id == "call_0"               # deterministic fallback
+    assert parsed.tool_calls[0].arguments == {"resolution": 0.5}
+
+
+def test_provider_config_from_env_and_local_backend(monkeypatch):
+    # default backend = anthropic, default model name comes from config (not hardcoded in logic)
+    monkeypatch.delenv("SCPILOT_LLM_BACKEND", raising=False)
+    monkeypatch.delenv("SCPILOT_LLM_MODEL", raising=False)
+    cfg = ProviderConfig.from_env()
+    assert cfg.backend == "anthropic"
+    assert cfg.resolved_model() == "claude-opus-4-8"
+
+    # point at a local OpenAI-compatible endpoint via env
+    monkeypatch.setenv("SCPILOT_LLM_BACKEND", "openai")
+    monkeypatch.setenv("SCPILOT_LLM_BASE_URL", "http://localhost:11434/v1")
+    monkeypatch.setenv("SCPILOT_LLM_MODEL", "llama3.1")
+    cfg2 = ProviderConfig.from_env()
+    assert cfg2.backend == "openai"
+    assert cfg2.base_url == "http://localhost:11434/v1"
+    assert cfg2.resolved_model() == "llama3.1"
+
+
+def test_unknown_backend_raises_unavailable(monkeypatch):
+    from scpilot.llm.provider import ProviderUnavailable
+    import pytest
+    monkeypatch.setenv("SCPILOT_LLM_BACKEND", "nope")
+    with pytest.raises(ProviderUnavailable):
+        build_provider()
+
+
+def test_probe_backend_is_nonfatal(monkeypatch):
+    monkeypatch.setenv("SCPILOT_LLM_BACKEND", "anthropic")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("SCPILOT_LLM_API_KEY", raising=False)
+    p = probe_backend()
+    assert p["backend"] == "anthropic"
+    assert p["ready"] is False           # no key -> not ready, but no exception
+    assert "reason" in p

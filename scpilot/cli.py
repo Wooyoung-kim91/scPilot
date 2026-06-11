@@ -138,10 +138,97 @@ def run(
     inp: str = typer.Argument(..., metavar="INPUT", help="input .h5ad path"),
     workdir: str = typer.Option(None, "--workdir", help="session working directory"),
     goal: str = typer.Option(None, "--goal", help="analysis goal for the agent"),
-    effort: str = typer.Option("high", "--effort", help="LLM effort level"),
+    effort: str = typer.Option("high", "--effort", help="LLM effort level (high|medium|low)"),
+    backend: str = typer.Option(None, "--backend",
+                                help="LLM backend: anthropic | openai (default: env SCPILOT_LLM_BACKEND)"),
+    model: str = typer.Option(None, "--model", help="model name (default per backend; never hardcoded)"),
+    base_url: str = typer.Option(None, "--base-url",
+                                 help="OpenAI-compatible endpoint for a LOCAL LLM (e.g. http://localhost:11434/v1)"),
+    seed: int = typer.Option(0, "--seed", help="global RNG seed (recorded for replay)"),
+    max_iters: int = typer.Option(40, "--max-iters", help="max LLM tool-loop iterations"),
 ) -> None:
-    """Self-driving full pipeline via Anthropic API (plan D5/mode 2). Stub."""
-    _todo("run")
+    """Self-driving full pipeline (plan D5 / mode 2).
+
+    Builds the configured LLM provider (Anthropic by default, or a local/OpenAI-compatible
+    endpoint via --backend openai --base-url ...), drives the deterministic tool registry
+    autonomously, then writes a report (figures + interpretation). Every tool run + decision
+    is logged so ``scpilot replay`` reproduces the session with NO LLM.
+    """
+    import json
+    from pathlib import Path
+
+    from scpilot import schemas as S
+    from scpilot import tools
+    from scpilot.llm.agent import run_agent
+    from scpilot.llm import prompts
+    from scpilot.llm.provider import ProviderConfig, ProviderUnavailable, build_provider
+    from scpilot.repro import set_global_seed
+    from scpilot.session import DEFAULT_RUN_DIR, Session
+
+    if not Path(inp).exists():
+        typer.secho(f"input not found: {inp}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+
+    cfg = ProviderConfig.from_env(backend=backend, model=model, base_url=base_url,
+                                  effort=effort, thinking={"type": "adaptive"})
+    try:
+        provider = build_provider(cfg)
+    except ProviderUnavailable as exc:
+        typer.secho(f"[scpilot run] LLM backend unavailable: {exc}", fg=typer.colors.RED, err=True)
+        typer.secho("Run `scpilot doctor` and check the llm_provider section.", fg=typer.colors.YELLOW, err=True)
+        raise typer.Exit(code=2)
+
+    seed_rec = set_global_seed(seed)
+    wd = workdir or str(Path(DEFAULT_RUN_DIR) / "mode2")
+    session = Session.create(wd, input_path=inp)
+
+    typer.secho(f"[scpilot run] backend={provider.name} model={provider.model} -> {wd}",
+                fg=typer.colors.CYAN, err=True)
+
+    result = run_agent(session, provider, goal=goal, seed=seed, max_iters=max_iters)
+
+    # final interpretation + report (LLM prose injected into the deterministic report tool)
+    interp = ""
+    try:
+        sys_p = prompts.INTERPRETATION_PROMPT
+        runs = session.run_log_path.read_text() if session.run_log_path.exists() else ""
+        ctx = ("Write the final interpretation. Pipeline run log (JSONL):\n" + runs[-12000:]
+               + "\n\nAgent final note:\n" + (result.final_text or ""))
+        interp_resp = provider.complete([{"role": "user", "content": ctx}], system=sys_p)
+        interp = interp_resp.text
+        result.stats.add_usage(interp_resp.usage)
+        result.stats.llm_turns += 1
+    except Exception as exc:  # noqa: BLE001 — report still useful without prose
+        typer.secho(f"[scpilot run] interpretation step failed: {exc}", fg=typer.colors.YELLOW, err=True)
+
+    rep_params = {"interpretation": interp or result.final_text}
+    rep = tools.run("report", session, **rep_params)
+    # log the report run so `scpilot replay` reproduces it too (the interpretation prose is
+    # recorded here → replay re-runs report with the SAME text, no LLM re-query needed).
+    session.log_run(S.RunLogRecord(
+        tool="report", status=rep.status, stage="report", params=rep_params,
+        summary=rep.summary, seed=seed, output_checkpoint=rep.checkpoint,
+        determinism_grade=rep.determinism_grade, error_code=rep.error_code,
+        duration_s=rep.duration_s,
+    ).to_dict())
+
+    if result.stopped_reason == "max_iters":
+        typer.secho(f"[scpilot run] WARNING: agent hit max_iters ({max_iters}) — analysis may be "
+                    "INCOMPLETE; raise --max-iters or refine --goal.", fg=typer.colors.YELLOW, err=True)
+
+    out = {
+        "session": str(session.out),
+        "stage_reached": session.manifest.stage,
+        "stopped_reason": result.stopped_reason,
+        "provider": {"backend": provider.name, "model": provider.model},
+        "seed_record": seed_rec,
+        "stats": result.stats.to_dict(),
+        "report": rep.to_dict(),
+        "final_text": result.final_text,
+    }
+    typer.echo(json.dumps(out, indent=2, default=str))
+    incomplete = result.stopped_reason == "max_iters"
+    raise typer.Exit(code=0 if (rep.status == "success" and not incomplete) else 1)
 
 
 @app.command()

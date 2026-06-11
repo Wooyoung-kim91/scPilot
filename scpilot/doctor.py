@@ -124,6 +124,15 @@ def run() -> dict:
 
     smoke = _smoke()
 
+    # ---- mode-2 LLM provider preflight (plan D1) ----
+    # Configurable backend, no hardcoded model name; non-fatal (mode 2 is optional).
+    try:
+        from scpilot.llm.provider import probe_backend
+        llm_provider = probe_backend()
+    except Exception as exc:  # noqa: BLE001
+        llm_provider = {"ready": False, "reason": f"probe failed: {exc}"}
+    capabilities["mode2_llm_ready"] = bool(llm_provider.get("ready"))
+
     # ---- warnings (actionable) ----
     warnings = []
     missing_req = [m for m in _REQUIRED if not present[m]]
@@ -153,5 +162,6 @@ def run() -> dict:
         "data_gated": data_gated,
         "gpu": {"torch_cuda": torch_cuda},
         "smoke": smoke,
+        "llm_provider": llm_provider,
         "warnings": warnings,
     }
