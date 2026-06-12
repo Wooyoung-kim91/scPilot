@@ -173,7 +173,7 @@ def _system_prompt(goal: str | None, tissue: str | None = None,
                    resolutions: dict | None = None) -> str:
     parts = [prompts.ORCHESTRATION_PROMPT, prompts.ANNOTATION_PROMPT,
              prompts.ANNOTATION_REVIEW_PROMPT, prompts.TISSUE_CONTEXT_GUIDANCE,
-             prompts.DE_DESIGN_PROMPT]
+             prompts.MALIGNANCY_PROMPT, prompts.DE_DESIGN_PROMPT]
     if resolutions:
         # human-in-the-loop: the ONLY resolutions the agent may use (per embedding/model).
         res = ", ".join(f"{k}={v}" for k, v in resolutions.items())

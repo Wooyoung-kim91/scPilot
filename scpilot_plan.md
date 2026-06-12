@@ -455,16 +455,17 @@ B1~B7엔 장시간 도구 없음, scVI 실측 후 설계(과설계 회피). `lon
       ⚠️**harmony API(PoC 발견)**: scanpy 1.11.5의 `sc.external.pp.harmony_integrate`는 harmonypy 0.2.0 **torch 출력과 비호환**
       (`Z_corr.T` shape 오류), `sc.pp.harmony_integrate`(native harmony2)는 1.11.5에 **없음** → **`harmonypy.run_harmony` 직접
       호출 + `np.asarray(ho.Z_corr).T`** (PoC2에서 shape 검증). scanpy 업그레이드 시 native harmony2로 전환 가능.
-- [ ] **B10. `core/benchmark.py`** — `Benchmarker(label_key=major_cell_type, batch_key=...)` **2-tier**,
-      kNN 고비용 지표 기본 off, **overcorrection 경고·조건별 조성** 포함. 검증(서브샘플): 점수표.
+- [x] **B10. `core/benchmark.py`** — ✅**완료**: `benchmark`(scib-metrics, label_key=consensus/일관 라벨, batch_key,
+      embeddings=[X_pca,X_harmony,X_scVI], drop_labels=sentinel+caller-set) + **교차-합의 `consensus_annotation`**
+      (다중 통합법 라벨 majority vote→embedding-독립 label_key, 디리스크① 순환성 해소). overcorrection 경고. 검증: 통과.
 - [ ] **B10.5. 최종 cluster (명시)** — 선정 임베딩으로 neighbors→leiden→umap, **final-cluster 키 + 임베딩 provenance**
       를 Tier2/3 입력으로 고정(B6 재사용).
 - [ ] **B11. `core/compartment.py`** — **compartment 계획 tool**(실 카운트·coverage·marker, 임계 미달 분기 차단) +
       subset 재처리 **두 모드**(marker용 expression 재정규화·HVG / 클러스터링용 integration-aware) + batch-mixing 진단.
-- [~] **B12-pre. `annotate_genomic_positions` (좌표 주석 — CNV의 필수 preflight 서브툴)** — ✅**설계+PoC 검증 완료**(아래),
-      ⏳tool 구현·step·MCP 노출 미착수. 현 데이터 `var`엔 좌표가
-      없으므로(symbol만, `n_cells`뿐) CNV 전 반드시 수행. infercnvpy `genomic_position_from_gtf(gtf_gene_id="gene_name")`로
-      `var[chromosome,start,end]` 채움. **설계 핵심**:
+- [x] **B12-pre. `annotate_genomic_positions` (좌표 주석 — CNV의 필수 preflight 서브툴)** — ✅**완료(2026-06-12)**:
+      tool+레지스트리+MCP 자동노출+검증 완료. content-addressed GTF 캐시(`SCPILOT_GTF_CACHE`, 기본 `~/data/scpilot_run/gtf_cache`)
+      + 2-pass 매핑 + pc_coverage 게이트. **실데이터 재현(2026-06-12)**: pc_coverage 0.8982(17,981/20,020), make_unique 회수 63,
+      25 chrom, gate_pass=True — PoC와 일치. 단위테스트 `tests/test_cnv.py` 3종(2-pass·저커버리지경고·missing-gtf). 설계(아래)는 그대로 구현:
       - **좌표 소스**: 기본 = **고정 릴리스 GENCODE GRCh38 GTF 1회 다운로드 → sha256 content-addressed 캐시·재사용**
         (결정성 등급 A; **GTF 경로는 `gtfparse` 필수 — 미설치 시 infercnvpy가 ImportError, 실측 확인**). 대체 = 사용자 `--gtf`
         (정렬 ref면 최선), offline 불가 시 biomart `hgnc_symbol`(등급 B, 네트워크·Ensembl 버전 의존으로 플래그).
@@ -487,12 +488,18 @@ B1~B7엔 장시간 도구 없음, scVI 실측 후 설계(과설계 회피). `lon
         **CNV 진행에 충분**. 25개 chromosome `chr` prefix 확인. GTF 다운로드 ~57s/29.6MB(sha 3e52f82c…).
       - **불변식**: `var` 컬럼 추가만(비파괴) — `layers["counts"]`·`.X` 의미 불변. provenance(GTF 해시·build·매핑률)는
         `.uns["scpilot"]`. replay는 등급별 tolerance.
-- [ ] **B12. `core/cnv.py` (Tier 2 malignancy, fine보다 선행)** — **B12-pre 좌표 주석 통과 후** infercnvpy `tl.infercnv`:
-      reference 선택(본 데이터 `condition=Normal` 14,169셀 → 정상 췌장상피 또는 확실한 비악성 immune/stromal을 `reference_cat`;
-      깨끗한 normal-epi ref 없으면 immune/stromal·외부ref·advisory-only·skip 택1) + epithelial/후보 **범위한정** + 잡 모델.
-      **CNV+tumor marker+normal-epi ref+patient expansion** 통합 →
-      `obs["malignancy"]∈{malignant,non_malignant,uncertain,not_applicable}`(confidence).
-      `cnv_available=false`면 CNV 증거 없이 marker+ref+expansion만 → Tier5에서 `review_required`.
+- [x] **B12. `core/cnv.py` (Tier 2 malignancy, fine보다 선행)** — ✅**완료(2026-06-12)**. Tier-1과 동일한
+      증거→LLM→적용 분리:
+      ① `cnv_score`: infercnvpy `tl.infercnv`→cnv-space pca/neighbors/leiden→per-cell/per-cluster CNV burden +
+         reference_key/reference_cat(None=advisory) + reference↔비reference contrast + 기존 라벨 교차표 (grade B).
+      ② `malignancy_evidence`(read-only, grade A): group별 다축 증거 패키지 — reference 대비 CNV burden(ratio·
+         frac_above_ref_q, **데이터 기반 상대값, 절대임계 없음**) + clonal expansion(top_sample_fraction) + 선택적
+         caller marker score(하드코딩 패널 없음). 호출 없음.
+      ③ `apply_malignancy`(grade A): LLM의 group→label 맵을 **고정 vocabulary** {malignant,non_malignant,uncertain,
+         not_applicable}로 `obs["malignancy"]`+confidence+review_required에 기록. **HARD RULE 결정론적 강제**: CNV 증거
+         없이 malignant 호출 시 review_required 강제. decision_type=`malignancy_call` 로깅.
+      프롬프트 `MALIGNANCY_PROMPT`(agent system prompt에 배선) + 정식흐름 step 8. 검증: `tests/test_cnv.py` 11종
+      (좌표·cnv_score·evidence 다축·vocab 거부·HARD RULE 강제 등). (잡 모델은 C1서, 현재 동기 long_running.)
 - [ ] **B13. `core/annotate.py` (Tier 3 fine)** — compartment·malignancy에서 세분 → `obs["fine_cell_type"]` +
       `obs["facs_style_label"]`(예 `CD8+ PD-1+ T cells`) + evidence_for/against·confounders를 `.uns[...annotation_tree]`에.
       **LLM이 조직/질환 맥락으로 전략 결정**, 작은 클러스터 merge·insufficient-evidence 규칙.

@@ -159,10 +159,33 @@ CANONICAL FLOW (skip steps already satisfied per detect_state; stop when the goa
        -> apply_annotation(groupby=<that leiden key>, key=major_cell_type_<model>, labels=...)
    Keep each method's labels in a DISTINCT key (major_cell_type / _harmony / _scvi) so they
    coexist and can be compared. Ask the user for each embedding's resolution before clustering.
-7. benchmark -> compare embeddings on batch-correction vs biology conservation (do not trust
-   the aggregate alone; watch overcorrection). NOTE: for bio-conservation use a CONSISTENT
-   label set, not each embedding's own clustering-derived labels (that is circular).
-8. Fine annotation / malignancy / DE per the goal and available capabilities. Finish with a report.
+7. Benchmark the integration methods — but FIRST fix the label_key circularity (de-risk ①):
+   a. consensus_annotation(keys=[major_cell_type_merge, _harmony, _scvi, ...]) -> a per-cell
+      EMBEDDING-INDEPENDENT consensus label (majority vote; disagreements -> 'ambiguous').
+      NEVER benchmark an embedding with its OWN clustering-derived labels.
+   b. benchmark(label_key=<consensus>, batch_key=..., embeddings=[X_pca,X_harmony,X_scVI],
+      drop_labels=<non-cell-type labels>). drop_labels = the tool sentinels (Unknown/Mixed/
+      Low_quality/ambiguous, dropped by default) PLUS any dataset-specific NON-lineage labels
+      you assigned (e.g. Stress, Erythrocyte, Cycling) — you choose these per dataset; they are
+      NOT hardcoded. Do NOT recompute reductions: benchmark row-subsets the existing embeddings
+      (dropped/ambiguous cells excluded) and scib evaluates them as-produced.
+   c. Pick the integration method from batch-correction AND bio-conservation together (not the
+      aggregate alone; watch overcorrection warnings).
+8. Malignancy (Tier 2) — only if cnv_available AND the goal needs it:
+   a. annotate_genomic_positions FIRST (the merged var has only symbols). It fills
+      var[chromosome,start,end] from a pinned GENCODE GTF; gate on protein_coding_coverage
+      (>=0.8 ok). If the gate fails (build/symbol-version mismatch), fix the GTF before CNV.
+   b. cnv_score(reference_key, reference_cat) — pick a KNOWN non-malignant reference
+      (e.g. condition=Normal, or a confident immune/stromal cell type). No reference =>
+      advisory-only. This emits EVIDENCE (per-cell/per-cluster CNV burden), NOT a call.
+   c. malignancy_evidence(groupby, reference_key, reference_cat, sample_key) packages the
+      per-group multi-axis evidence; YOU judge; apply_malignancy(labels,...) writes
+      obs['malignancy'] over {malignant,non_malignant,uncertain,not_applicable}. The CALL is a
+      multi-evidence judgment (CNV burden + tumor markers + normal-epi reference + clonal
+      expansion) — never a CNV-score threshold alone. If cnv_available is false, decide from
+      markers+reference+expansion and flag review_required (apply_malignancy enforces this).
+      See MALIGNANCY_PROMPT.
+9. Fine annotation / DE per the goal and available capabilities. Finish with a report.
 
 When the analysis goal is achieved (or no further safe step exists), STOP calling tools
 and write a short final summary of what was done and the key results.
@@ -203,6 +226,37 @@ HARD RULES (do not violate)
   review_required. Authority hierarchy + evidence live in uns['scpilot']['annotation_tree'].
 For the deeper Tier panels / FACS mapping, defer to the annotation knowledge card; do not
 re-derive a divergent marker set here.
+"""
+
+# ---------------------------------------------------------------------------
+# Malignancy (Tier 2) — judge from multi-axis evidence; NEVER a lone threshold.
+# ---------------------------------------------------------------------------
+MALIGNANCY_PROMPT = """\
+You make the Tier-2 malignant / non-malignant call. Like Tier-1 annotation this is a
+two-step split: a deterministic tool packages EVIDENCE, you JUDGE, an apply tool records it.
+
+Flow:
+1. annotate_genomic_positions (fills var coordinates; gate protein_coding_coverage >=0.8).
+2. cnv_score(reference_key, reference_cat) — pick a KNOWN non-malignant reference (e.g.
+   condition=Normal, or a confident immune/stromal cell type). This writes per-cell CNV burden.
+3. malignancy_evidence(groupby, reference_key, reference_cat, sample_key,
+   [tumor_markers], [normal_markers]) — read its per-group JSON: CNV burden RELATIVE to the
+   reference (ratio_to_reference, frac_above_reference_q), clonal expansion (top_sample_fraction),
+   and any marker scores you supplied. There is NO marker database and NO built-in threshold.
+4. apply_malignancy(groupby, labels, confidence, review_required) over the FIXED vocabulary
+   {malignant, non_malignant, uncertain, not_applicable}.
+
+JUDGEMENT RULES (do not violate):
+- NEVER call malignant from epithelial markers alone, and never from a single CNV-score
+  cutoff. Require CONCORDANT evidence: elevated CNV burden vs the reference AND (clonal
+  expansion OR tumor-marker support). Immune/stromal groups with reference-level CNV ->
+  non_malignant. Conflicting or borderline axes -> uncertain + review_required=True.
+- If cnv_available is false (no CNV evidence at all), you may only judge from markers +
+  reference + expansion, and MUST set review_required=True for any malignant call (the
+  apply tool also enforces this).
+- not_applicable = the call does not make biological sense for that group (e.g. the chosen
+  normal reference group itself).
+Supply per-group confidence in [0,1]; flag thin/single-sample groups for review.
 """
 
 # ---------------------------------------------------------------------------
