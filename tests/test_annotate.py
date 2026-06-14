@@ -289,3 +289,57 @@ def test_consensus_annotation_needs_two_keys(tmp_path):
 
 def test_registry_has_annotate_broad():
     assert "annotate_broad" in {t["name"] for t in tools.list_tools()}
+
+
+def test_derive_dotplot_markers_are_the_de_evidence(tmp_path):
+    """The dotplot markers ARE the Tier-1 DE evidence: only genes that pass the positive-marker
+    gate (padj/pct/logFC) in a cell type's clusters appear, ranked by DE score — no injected
+    panel gene, and a gene a cell type does NOT up-regulate never shows up for it."""
+    from scpilot.core.annotate import derive_dotplot_markers
+
+    import scanpy as _sc
+    rng = np.random.default_rng(0)
+    aset, bset, cset = ["A1", "A2", "A3"], ["B1", "B2", "B3"], ["C1", "C2", "C3"]
+    shared = "SH1"                       # up in clusters 0 AND 1 (vs 2) → gated-in for BOTH A & B
+    genes = aset + bset + cset + [shared] + [f"N{i}" for i in range(20)]   # N* noise, never up
+    # cluster sizes: a big cluster 2 dilutes the one-vs-rest reference so SH passes logFC for 0 & 1
+    n0, n1, n2 = 60, 60, 180
+    n = n0 + n1 + n2
+    X = rng.poisson(0.2, (n, len(genes))).astype("float32")
+    def col(g): return genes.index(g)
+    s0, s1, s2 = slice(0, n0), slice(n0, n0 + n1), slice(n0 + n1, n)
+    for g in aset: X[s0, col(g)] += rng.poisson(8.0, n0).astype("float32")
+    for g in bset: X[s1, col(g)] += rng.poisson(8.0, n1).astype("float32")
+    for g in cset: X[s2, col(g)] += rng.poisson(8.0, n2).astype("float32")
+    X[s0, col(shared)] += rng.poisson(8.0, n0).astype("float32")     # SH strong in cluster 0 (A)
+    X[s1, col(shared)] += rng.poisson(5.0, n1).astype("float32")     # SH weaker in cluster 1 (B)
+    a = ad.AnnData(sparse.csr_matrix(X))
+    a.var_names = genes
+    leiden = np.array(["0"] * n0 + ["1"] * n1 + ["2"] * n2)
+    a.obs["leiden"] = leiden
+    a.obs["leiden"] = a.obs["leiden"].astype("category")
+    sc.pp.normalize_total(a, target_sum=1e4); sc.pp.log1p(a)
+    sc.tl.rank_genes_groups(a, groupby="leiden", method="wilcoxon", pts=True)
+    lmap = {"0": "TypeA", "1": "TypeB", "2": "TypeC"}
+
+    # the gated DE evidence set, computed DIRECTLY (no hardcoded expectation)
+    de = _sc.get.rank_genes_groups_df(a, group=None)
+    de = de[(de["pvals_adj"] < 0.05) & (de["pct_nz_group"] >= 0.25) & (de["logfoldchanges"] >= 1.0)]
+    evidence = {lmap[str(cl)]: set(sub["names"]) for cl, sub in de.groupby("group", observed=True)}
+    assert shared in evidence["TypeA"] and shared in evidence["TypeB"]   # genuinely CONTENDED
+
+    panels = derive_dotplot_markers(a, cluster_key="leiden", label_map=lmap, top_k=5)
+    assert set(panels) == {"TypeA", "TypeB", "TypeC"}
+    # every shown marker IS gated DE evidence of its OWN cell type — nothing injected
+    for ct, gs in panels.items():
+        assert set(gs) <= evidence[ct], (ct, gs, evidence[ct])
+    flat = [g for gs in panels.values() for g in gs]
+    assert not any(g.startswith("N") for g in flat), flat            # noise never appears
+    assert flat.count(shared) == 1                                   # contended gene deduped to one
+    assert shared in panels["TypeA"]                                 # owned by the stronger type (A)
+
+    # `order` changes ONLY layout, never content — including which type keeps the contended gene
+    ordered = derive_dotplot_markers(a, cluster_key="leiden", label_map=lmap, top_k=5,
+                                     order=["TypeC", "TypeB", "TypeA"])
+    assert list(ordered) == ["TypeC", "TypeB", "TypeA"]              # layout reordered
+    assert all(ordered[ct] == panels[ct] for ct in panels)          # per-type content identical

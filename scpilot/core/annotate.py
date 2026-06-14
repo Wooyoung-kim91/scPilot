@@ -612,3 +612,94 @@ def consensus_annotation(session, *, keys: list | None = None, out_key: str = "c
     return S.success("consensus_annotation", summary=summary, warnings=warnings, checkpoint=cp.path,
                      determinism_grade="A", duration_s=round(time.time() - t0, 3),
                      suggested_next_tools=["benchmark", "plots"])
+
+
+# --------------------------------------------------------------------------- #
+# dotplot marker derivation — the markers ARE the Tier-1 annotation evidence
+# --------------------------------------------------------------------------- #
+# OPTIONAL biological-compartment ROW/PANEL order (display layout only — NOT marker selection).
+# top→bottom: parenchymal → vascular/stromal/neural → immune → proliferating → artificial.
+# Pass as ``order=``; absent types are skipped. Leave None to order by cell-type abundance.
+COMPARTMENT_ORDER = [
+    "Epithelial", "Endothelial", "Acinar", "Endocrine", "Ductal",
+    "Stromal", "Schwann",
+    "T_NK", "B", "Plasma", "Myeloid", "Mast",
+    "Cycling",
+    "Erythrocyte", "Stress", "Low_quality",
+]
+
+
+def derive_dotplot_markers(adata, *, cluster_key, label_map, top_k=5,
+                           min_pct=0.25, min_lfc=1.0, padj_max=0.05, order=None):
+    """Per-cell-type dotplot markers that ARE the Tier-1 annotation EVIDENCE — the same DE-selected
+    significant markers the LLM read to make the call, shown per assigned cell type. No external
+    marker DB, no lineage prior: the marker SELECTION itself is the evidence (that is the point).
+
+    PHILOSOPHY: DE selection → LLM picks the combination → label. This builds the dotplot panels
+    from EXACTLY that DE selection: for each cluster the LLM mapped to a type (``label_map``:
+    cluster→label), take the cluster's Tier-1 positive markers from ``adata.uns['rank_genes_groups']``
+    — ``pvals_adj < padj_max`` AND ``pct_nz_group >= min_pct`` AND ``logfoldchanges >= min_lfc``
+    (the annotate_broad rule-2 gate) — ranked by the rank_genes_groups SCORE (the same order
+    annotation_review exposes to the LLM). The top ``top_k`` per cell type become its panel; a
+    shared gene stays with whichever cell type ranks it strongest. NOTHING is injected that the
+    DE didn't select — the figure shows the evidence, not a curated panel.
+
+    ``order`` (e.g. ``COMPARTMENT_ORDER``) only fixes the panel/row LAYOUT (display), never the
+    marker content; without it, cell types are laid out by abundance.
+
+    Returns ``{cell_type: [genes]}`` ready to pass as ``plots(kind='dotplot', marker_groups=...)``.
+    """
+    from collections import defaultdict
+
+    import scanpy as sc
+
+    rg = adata.uns.get("rank_genes_groups")
+    if not rg or rg.get("params", {}).get("groupby") != cluster_key:
+        raise ValueError(f"per-cluster DE for '{cluster_key}' absent — run markers(groupby={cluster_key}) first")
+    de = sc.get.rank_genes_groups_df(adata, group=None)
+    for col in ("pvals_adj", "pct_nz_group", "logfoldchanges", "scores"):
+        if col not in de.columns:
+            raise ValueError(f"DE lacks '{col}' — re-run markers with pts=True")
+    # Tier-1 positive-marker gate (annotate_broad rule 2) — the DATA selects the evidence.
+    de = de[(de["pvals_adj"] < padj_max) & (de["pct_nz_group"] >= min_pct)
+            & (de["logfoldchanges"] >= min_lfc)]
+
+    sizes = adata.obs[cluster_key].astype(str).value_counts().to_dict()
+    best = defaultdict(dict)           # cell type -> {gene: best DE score across its clusters}
+    ctsize = defaultdict(int)
+    for cl, sub in de.groupby("group", observed=True):
+        ct = label_map.get(str(cl))
+        if ct is None:
+            continue
+        ctsize[ct] += sizes.get(str(cl), 0)
+        for _, r in sub.iterrows():
+            g = str(r["names"])
+            sc_ = float(r["scores"])
+            if g not in best[ct] or sc_ > best[ct][g]:    # keep the cluster where it's strongest
+                best[ct][g] = sc_
+
+    # Ownership of a SHARED gene is decided by the evidence ALONE — it goes to the cell type that
+    # scores it strongest — so neither `order` nor abundance (display concerns) can change which
+    # markers land in which panel. (A tie keeps the first cluster-iteration encounter, still
+    # order-independent.) This keeps `order` a pure LAYOUT knob.
+    owner = {}                         # gene -> (cell_type, best score anywhere)
+    for ct, gs in best.items():
+        for g, s in gs.items():
+            if g not in owner or s > owner[g][1]:
+                owner[g] = (ct, s)
+    owned = defaultdict(dict)          # cell type -> {gene it owns: score}
+    for g, (ct, s) in owner.items():
+        owned[ct][g] = s
+
+    if order:
+        pos = {ct: i for i, ct in enumerate(order)}
+        ct_iter = sorted(owned, key=lambda c: pos.get(c, len(order)))     # LAYOUT only
+    else:
+        ct_iter = sorted(owned, key=lambda c: -ctsize[c])
+
+    panels = {}
+    for ct in ct_iter:
+        genes = [g for g, _ in sorted(owned[ct].items(), key=lambda kv: -kv[1])][:top_k]
+        if genes:
+            panels[ct] = genes
+    return panels
