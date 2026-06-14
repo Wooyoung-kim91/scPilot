@@ -25,6 +25,7 @@ _PLOTTING = {
     "max_w_col": 1.5, "max_h_col": 1.5, "square_limit_col": 1.0,
     "start_col": 0.5, "step_col": 0.25,
     "column_width_in": 3.5, "dpi_save": 300, "min_font_pt": 5, "base_font_pt": 7,
+    "formats": ["svg", "png"],     # vector SVG deliverable + PNG preview for every figure
 }
 _QC_KEYS = ["n_genes_by_counts", "total_counts", "pct_counts_mt"]
 
@@ -37,10 +38,16 @@ def _cfg(session):
 def _artifacts_from_fit(fit, cfg) -> list[S.Artifact]:
     col = cfg.plotting["column_width_in"]
     w, h = fit.size_col
-    return [S.artifact_png(p, width_in=w * col, height_in=h * col,
-                           dpi=cfg.plotting["dpi_save"],
-                           description=f"{w}x{h} col, font {fit.font_pt:g}pt")
-            for p in fit.path]
+    desc = f"{w}x{h} col, font {fit.font_pt:g}pt"
+    out = []
+    for p in fit.path:
+        if str(p).lower().endswith(".svg"):
+            out.append(S.Artifact(path=p, kind="svg", description=desc + " (vector SVG)",
+                                  meta={"width_in": round(w * col, 3), "height_in": round(h * col, 3)}))
+        else:
+            out.append(S.artifact_png(p, width_in=w * col, height_in=h * col,
+                                      dpi=cfg.plotting["dpi_save"], description=desc))
+    return out
 
 
 @register("plots", mutating=False,
@@ -50,9 +57,11 @@ def _artifacts_from_fit(fit, cfg) -> list[S.Artifact]:
                       "comparisons; many-category colors auto-use a generous canvas), "
                       "qc_violin (keys, groupby), hvg, pca_variance, "
                       "dotplot (annotation marker dotplot: groupby=major_cell_type, optional marker_groups; "
-                      "cell-type rows ordered as a staircase under their marker brackets). "
-                      "umap/qc_violin/hvg/pca_variance obey the journal-column size policy; "
-                      "dotplot and many-category umap are sized naturally for legibility.")
+                      "cell-type rows ordered as a staircase under their marker brackets; vertical gene "
+                      "labels). "
+                      "umap/qc_violin/hvg/pca_variance obey the journal-column size policy; the dotplot "
+                      "auto-fits to the SMALLEST 0.5–2.0×0.5–2.0 col size with no text/dot overlap and a "
+                      "size/colour legend ≤5% of the figure (many-category umap uses a generous canvas).")
 def plots(session, *, kind: str = "umap", color: str | None = None,
           basis: str = "X_umap", keys: list | None = None, groupby: str | None = None,
           marker_groups: dict | None = None, **params) -> S.ToolResult:
@@ -118,9 +127,9 @@ def plots(session, *, kind: str = "umap", color: str | None = None,
             if not groups:
                 return S.error("plots", "data_gate_failed", "no marker-panel genes present", recoverable=False)
 
-            # staircase: order y-axis cell types to mirror the marker-group columns
-            # (left→right), so each cell type's dots sit on the diagonal under its own
-            # marker block; cell types without a matching panel (e.g. Unknown) trail below.
+            # candidate y-axis set (paneled cell types first, non-panel labels trailing);
+            # save_dotplot then runs the DATA-DRIVEN staircase — it reorders rows by the marker
+            # block each cell type actually peaks in and flags any that peak off their own panel.
             present = list(adata.obs[gb].astype("category").cat.categories)
             cats_order = [ct for ct in groups if ct in present]
             cats_order += [ct for ct in present if ct not in cats_order]

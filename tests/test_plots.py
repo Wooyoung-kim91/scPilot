@@ -43,12 +43,14 @@ def test_plot_umap(tmp_path):
     s = _processed_session(tmp_path)
     r = tools.run("plots", s, kind="umap", color="leiden")
     assert r.status == "success"
-    assert r.artifacts and r.artifacts[0].kind == "png"
+    # every figure writes a vector SVG (deliverable) + a PNG (preview)
+    kinds = {a.kind for a in r.artifacts}
+    assert {"svg", "png"} <= kinds
     from pathlib import Path
-    png = Path(r.artifacts[0].path)
-    assert png.exists() and png.stat().st_size > 0
-    assert r.artifacts[0].meta["dpi"] == 300
-    _assert_size_policy(r)
+    assert all(Path(a.path).exists() and Path(a.path).stat().st_size > 0 for a in r.artifacts)
+    # categorical UMAP: height fixed at 1 col; width 1→2 col (only as wide as the legend needs)
+    w, h = r.summary["size_col"]
+    assert h == 1.0 and 1.0 <= w <= 2.0
     r.to_dict()
 
 
@@ -113,8 +115,10 @@ def test_plot_dotplot_staircase(tmp_path):
     from pathlib import Path
     png = Path(r.artifacts[0].path)
     assert png.exists() and png.stat().st_size > 0
-    # exempt from the column cap (wide marker grid) → fit must NOT fall back to best-effort
+    # bounded auto-fit (0.5–2.0 col square): a real fit, not the best-effort fallback
     assert r.summary["fit_at_max_failed"] is False
+    w, h = r.summary["size_col"]
+    assert 0.5 <= w <= 2.0 and 0.5 <= h <= 2.0
     # y-axis order is a staircase: cell types follow the marker-panel column order,
     # with non-panel labels (Unknown) trailing at the bottom.
     cats = list(s.adata.obs["major_cell_type"].astype("category").cat.categories)
@@ -122,6 +126,107 @@ def test_plot_dotplot_staircase(tmp_path):
                [ct for ct in cats if ct not in BROAD_MARKERS]
     assert s.adata.obs["major_cell_type"].cat.categories.tolist() == cats  # unchanged in obs
     assert expected[-1] == "Unknown"
+
+
+def test_dotplot_sizing_policy(tmp_path):
+    """The dotplot auto-fits within the dotplot bounds (≤1.8×1.0 col), at a font in
+    [6,12], with the saved canvas equal to the chosen size (no best-effort fallback)."""
+    from PIL import Image
+    from scpilot.core.annotate import BROAD_MARKERS
+    from scpilot.vendor import plotting as P
+    from scpilot.vendor.config import PipelineConfig
+
+    s = _annotated_session(tmp_path)
+    a = s.adata
+    groups = {ct: [g for g in gs if g in a.var_names] for ct, gs in BROAD_MARKERS.items()}
+    groups = {ct: gs for ct, gs in groups.items() if gs}
+    cats = [ct for ct in groups] + [ct for ct in a.obs["major_cell_type"].cat.categories
+                                    if ct not in groups]
+    fit = P.save_dotplot(a, PipelineConfig(), tmp_path / "dp", groups, "major_cell_type",
+                         categories_order=cats)
+    w, h = fit.size_col
+    assert 0.5 <= w <= 1.8 and 0.5 <= h <= 1.0
+    assert 6.0 <= fit.font_pt <= 12.0
+    assert not fit.knobs.get("best_effort"), fit.warnings
+    # both a vector SVG (deliverable) and a PNG (preview) are written
+    assert any(str(p).endswith(".svg") for p in fit.path)
+    png = next(p for p in fit.path if str(p).endswith(".png"))
+    # tight crop (brackets/labels live outside the axes): saved size ≥ figsize, and not
+    # wildly larger (the label margins are small relative to the panel).
+    col = P.plotting_cfg(PipelineConfig())["column_width_in"]
+    im = Image.open(png)
+    assert im.size[0] / 300 >= w * col - 0.1 and im.size[1] / 300 >= h * col - 0.1
+    assert im.size[0] / 300 <= w * col + 1.5 and im.size[1] / 300 <= h * col + 1.5
+
+
+def test_dot_clipped_invariant():
+    """check_constraints flags 'dot_clipped' IFF a boundary dot overflows the axis spine.
+
+    Edge dots are drawn clip_on=True, so a sliced dot vanishes before get_tightbbox sees it
+    → the generic tight-bbox 'clipping' check can't catch it (and it's skipped under
+    tight_save anyway). This invariant measures dot centre ± radius against the axis limits,
+    so an under-padded dotplot can't ship clipped boundary rows/cols silently."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from scpilot.vendor import plotting as P
+    from scpilot.vendor.config import PipelineConfig
+
+    p = {**P.plotting_cfg(PipelineConfig()), "dot_grid": (3, 3), "tight_save": True}
+
+    def make(xlim):
+        fig, ax = plt.subplots(figsize=(3, 3), dpi=p["dpi"])
+        xs, ys = np.meshgrid([0.5, 1.5, 2.5], [0.5, 1.5, 2.5])
+        ax.scatter(xs.ravel(), ys.ravel(), s=400, clip_on=True)  # area pt² → ~20pt dots
+        ax.set_xlim(*xlim); ax.set_ylim(0, 3)
+        return fig
+
+    tight = make((0.5, 2.5))      # limits hug the edge dot CENTRES → boundary dots overflow
+    assert "dot_clipped" in P.check_constraints(tight, p, None)
+    plt.close(tight)
+    roomy = make((-1.0, 4.0))     # generous limits fully contain every dot
+    assert "dot_clipped" not in P.check_constraints(roomy, p, None)
+    plt.close(roomy)
+    # non-dotplot figures (no dot_grid) are never subject to this check
+    plain = make((0.5, 2.5))
+    assert "dot_clipped" not in P.check_constraints(plain, {k: v for k, v in p.items()
+                                                            if k != "dot_grid"}, None)
+    plt.close(plain)
+
+
+def test_dotplot_staircase_invariant(tmp_path):
+    """Staircase: y-axis rows follow the marker-PANEL declaration order (so a caller's fixed
+    compartment order is honoured), and the verification flags a cell type whose strongest
+    marker block isn't its own panel (non-specificity / mislabel) via a 'staircase:' warning."""
+    from scpilot.vendor import plotting as P
+    from scpilot.vendor.config import PipelineConfig
+
+    genes = ["gA", "gB", "gC"]
+    panels = {"C": ["gC"], "A": ["gA"], "B": ["gB"]}          # deliberately NOT alphabetical
+
+    def adata_where(expr):           # expr[ct] = the gene ct's cells express strongly
+        rng = np.random.default_rng(0)
+        labels = np.repeat(["A", "B", "C"], 40)
+        X = rng.poisson(0.2, (120, 3)).astype("float32")
+        for i, ct in enumerate(labels):
+            X[i, genes.index(expr[ct])] += 8.0
+        a = ad.AnnData(sparse.csr_matrix(X))
+        a.var_names = genes
+        a.obs["celltype"] = labels
+        a.obs["celltype"] = a.obs["celltype"].astype("category")
+        sc.pp.log1p(a)
+        return a
+
+    clean = adata_where({"A": "gA", "B": "gB", "C": "gC"})    # each peaks on its own panel
+    fit = P.save_dotplot(clean, PipelineConfig(), tmp_path / "clean", panels, "celltype")
+    # rows follow PANEL order (C, A, B) — not alphabetical, not peak-driven
+    assert fit.knobs["row_order"] == ["C", "A", "B"], fit.knobs["row_order"]
+    assert not any("staircase:" in w for w in fit.warnings), fit.warnings
+
+    dirty = adata_where({"A": "gA", "B": "gB", "C": "gA"})    # C expresses A's marker
+    fit2 = P.save_dotplot(dirty, PipelineConfig(), tmp_path / "dirty", panels, "celltype")
+    assert fit2.knobs["row_order"] == ["C", "A", "B"], fit2.knobs["row_order"]   # order unchanged
+    assert any("staircase:" in w and "C↛A" in w for w in fit2.warnings), fit2.warnings
 
 
 def test_plot_umap_many_categories(tmp_path):

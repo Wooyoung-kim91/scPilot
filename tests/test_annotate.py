@@ -90,9 +90,11 @@ def test_dotplot_with_celltype_brackets(tmp_path):
     tools.run("annotate_broad", s, min_markers=3)
     r = tools.run("plots", s, kind="dotplot", groupby="major_cell_type")
     assert r.status == "success", r.error
-    assert r.artifacts and r.artifacts[0].kind == "png"
+    # dotplot writes a vector SVG (deliverable) + a PNG (preview)
+    kinds = {a.kind for a in r.artifacts}
+    assert {"svg", "png"} <= kinds
     from pathlib import Path
-    assert Path(r.artifacts[0].path).exists()
+    assert all(Path(a.path).exists() for a in r.artifacts)
 
 
 # ---------------------------------------------------------------------------

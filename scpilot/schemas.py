@@ -28,7 +28,7 @@ from typing import Any, Literal
 
 # ---- frozen vocabularies (Literal, not Enum, so dataclasses.asdict stays JSON-clean) ----
 Status = Literal["success", "error"]
-ArtifactKind = Literal["csv", "png", "h5ad", "json", "txt", "html", "other"]
+ArtifactKind = Literal["csv", "png", "svg", "h5ad", "json", "txt", "html", "other"]
 DeterminismGrade = Literal["A", "B", "C"]
 JobState = Literal["pending", "running", "succeeded", "failed", "cancelled"]
 
