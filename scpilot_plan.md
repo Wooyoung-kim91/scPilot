@@ -406,6 +406,11 @@ B1~B7엔 장시간 도구 없음, scVI 실측 후 설계(과설계 회피). `lon
       dry-run; executor는 tool 레지스트리 C1/A5서 연결) + pytest. **decision 스키마 동결 완료 → B11+ 진행 가능.**
       검증: `tests/test_repro.py` 7 passed(시드 결정성·해시·등급 tolerance·decision 검증·replay). provenance stamp는 A3(session).
 
+> **🔄 코드대조 갱신(2026-06-14)**: 6/12 이후 커밋(report·Phase D·consensus 등)이 본 체크리스트에 미반영이라
+> **실제 코드 기준으로 재대조**함. 등록된 도구 23개 확인(`scpilot/tools.py` 레지스트리 + `core/*.py`의 `@register`).
+> **진짜 미구현 = 5줄 stub 4종(`compartment`/`de`/`review`/`trajectory`) + fine annotation(B13) 부재 + B10.5**.
+> 그 외 `report`(B16)·Phase C·Phase D는 구현/와이어링 완료(일부 실run 검증만 잔여 → `[~]`).
+
 ### Phase B — core tool 단계별 구현 (annotation→benchmark 순서, 각 단계 = tool + step + MCP 동시 검증)
 - [x] **B1. `core/io.py`** — ✅**완료(2026-06-10)**: `load_h5ad`/`save_h5ad` 헬퍼 + `inspect`(A6, ToolResult명 정렬) +
       `load` 도구(input→세션 캐시 적재, summary 반환) self-register. load_10x/merge는 scqc 소유. 검증: 실데이터 적재·tiny fixture.
@@ -460,8 +465,14 @@ B1~B7엔 장시간 도구 없음, scVI 실측 후 설계(과설계 회피). `lon
       (다중 통합법 라벨 majority vote→embedding-독립 label_key, 디리스크① 순환성 해소). overcorrection 경고. 검증: 통과.
 - [ ] **B10.5. 최종 cluster (명시)** — 선정 임베딩으로 neighbors→leiden→umap, **final-cluster 키 + 임베딩 provenance**
       를 Tier2/3 입력으로 고정(B6 재사용).
-- [ ] **B11. `core/compartment.py`** — **compartment 계획 tool**(실 카운트·coverage·marker, 임계 미달 분기 차단) +
-      subset 재처리 **두 모드**(marker용 expression 재정규화·HVG / 클러스터링용 integration-aware) + batch-mixing 진단.
+- [x] **B11. `core/compartment.py`** — ✅**완료(2026-06-14)**. evidence→decision→apply 분리(하드코딩 임계 없음, 게이트=floor):
+      ① `compartment_plan`(read-only, grade A): major_cell_type별 **실 카운트 + sample/batch coverage + 단일환자 지배 +
+         batch-mixing 진단(정규화 batch entropy: ~1 잘섞임/~0 단일배치)**, `min_cells`/`min_samples` **floor로 미달 분기 차단**
+         (branch_recommended=false) → LLM이 `compartment_branch` 결정. 증거 JSON + instruction 동봉.
+      ② `compartment_subset`(mutating): 선택 compartment 추출 + **두 모드** — `markers`(counts→log1p→HVG seurat_v3→PCA,
+         구획특이 feature 재도출, grade B) / `clustering`(integration-aware: `use_rep`(X_scVI 등) subset 보존, 재정규화 X, grade A).
+         counts per-cell 불변·유전자 미삭제, subset 체크포인트(부모는 직전 체크포인트로 유지). 다음=cluster→markers/annotation_review.
+      레지스트리/MCP 자동노출. 검증: `tests/test_compartment.py` 8종(counts·floor·batch-mixing·2모드·에러 게이트). 전 suite 110 pass.
 - [x] **B12-pre. `annotate_genomic_positions` (좌표 주석 — CNV의 필수 preflight 서브툴)** — ✅**완료(2026-06-12)**:
       tool+레지스트리+MCP 자동노출+검증 완료. content-addressed GTF 캐시(`SCPILOT_GTF_CACHE`, 기본 `~/data/scpilot_run/gtf_cache`)
       + 2-pass 매핑 + pc_coverage 게이트. **실데이터 재현(2026-06-12)**: pc_coverage 0.8982(17,981/20,020), make_unique 회수 63,
@@ -500,9 +511,18 @@ B1~B7엔 장시간 도구 없음, scVI 실측 후 설계(과설계 회피). `lon
          없이 malignant 호출 시 review_required 강제. decision_type=`malignancy_call` 로깅.
       프롬프트 `MALIGNANCY_PROMPT`(agent system prompt에 배선) + 정식흐름 step 8. 검증: `tests/test_cnv.py` 11종
       (좌표·cnv_score·evidence 다축·vocab 거부·HARD RULE 강제 등). (잡 모델은 C1서, 현재 동기 long_running.)
-- [ ] **B13. `core/annotate.py` (Tier 3 fine)** — compartment·malignancy에서 세분 → `obs["fine_cell_type"]` +
-      `obs["facs_style_label"]`(예 `CD8+ PD-1+ T cells`) + evidence_for/against·confounders를 `.uns[...annotation_tree]`에.
-      **LLM이 조직/질환 맥락으로 전략 결정**, 작은 클러스터 merge·insufficient-evidence 규칙.
+- [x] **B13. `core/annotate.py` (Tier 3 fine)** — ✅**완료(2026-06-14)**. Tier-1/2와 동일한 evidence→LLM→apply 분리(고정 패널 없음):
+      ① `fine_annotation_review`(read-only, grade A): compartment subset(compartment_subset→cluster→markers) 내 subcluster별
+         **유의 DE(top-N, padj<0.05) + 지배 compartment(major_cell_type)·malignancy 조성 + sample 분포/단일환자 지배 +
+         confounders**(기존 obs score열 cell_cycle/stress/IFN/activation/doublet/%MT 판독 + 선택적 `confounder_genes` 즉석 스코어,
+         하드코딩 패널 없음). 증거 JSON + instruction → LLM이 DE에서 fine 추론.
+      ② `apply_fine_annotation`(mutating, grade A): LLM의 subcluster→{fine_cell_type, facs_style_label, cell_state, confidence,
+         review_required, evidence_for/against, confounders}를 **obs(타입/상태 분리 열)** + `.uns[...annotation_tree]`에 기록.
+         **HARD RULE 결정론적 강제**: ⓐ `merge_min_cells` 미만 subcluster → `<compartment>_unresolved`로 **merge + review** ⓑ
+         evidence_for 없는 호출 → **review_required 강제**. decision_type=`fine_llm_labels` 로깅.
+      프롬프트 `FINE_ANNOTATION_PROMPT`(agent system prompt 배선) + ORCHESTRATION step 9 구체화 + DEFAULT_TOOLSET/param hints에
+      B11·B13 도구 추가. 레지스트리/MCP 자동노출(총 27개). 검증: `tests/test_fine_annotate.py` 7종(증거패키징·merge·insufficient·
+      타입/상태 분리 등). 전 suite 117 pass.
 - [ ] **B14. `core/trajectory.py` (Tier 4, 선택, MVP=PAGA만)** — **compartment 내에서만**. PAGA(scanpy) 기본.
       나머지(Slingshot/Monocle3=R subprocess, scVelo=spliced/unspliced 하드게이트, CellRank velocity/non-velocity 분리,
       Palantir, CytoTRACE=구현 고정)는 **experimental 플래그**. → `obs["cell_state"]`/`obs["trajectory_state"]`
@@ -511,15 +531,18 @@ B1~B7엔 장시간 도구 없음, scVI 실측 후 설계(과설계 회피). `lon
       계층 모순 / 단일환자 지배 / batch특이 / 고 doublet·stress / **CNV·tumor 증거 없는 malignancy** → `obs["review_required"]`.
 - [ ] **B15. `core/de.py`** — **DE 설계 점검 tool**(그룹크기·복제·교란) + **pseudobulk(sample 단위)** 기본,
       cell-level wilcoxon 탐색용. major/fine/compartment/cell_state 축 비교.
-- [ ] **B16. `core/report.py`** — PNG + 표 + 해석 텍스트 → Markdown/HTML.
+- [x] **B16. `core/report.py`** — ✅**완료(코드대조 2026-06-14)**: PNG + 표 + 해석 텍스트 → Markdown/HTML.
+      `@register("report")` 등록·MCP 자동노출, `scpilot run`이 마지막에 호출(해석 prose 주입). (117줄 구현.)
 
 ### Phase C — tool 레지스트리 & 인터페이스 마감
-- [ ] **C1. `tools.py`** — B1~B12를 단일 레지스트리로 노출 + **장시간 tool은 잡 인터페이스**
-      (`start_*`/`get_job_status`/`get_job_result`/`cancel_job`).
-- [ ] **C2. `mcp_server.py` 완성** — 전 tool 등록 + **QC/통합/annotation/DE 최소 tool-use 가이드(설명문) 동봉**
-      (`qc_heuristics`·`integration_metrics` 핵심 기준은 Phase E를 기다리지 말고 여기서 최소판 포함).
-      검증: Claude Code + Codex 양쪽 풀 워크플로 도구호출.
-- [ ] **C3. `step` 완성** — 각 단계 결정론적 단독 실행(재현/디버그) 마무리.
+- [x] **C1. `tools.py`** — ✅**완료(코드대조 2026-06-14)**: `REGISTRY` + `@register`/`get`/`run`/`list_tools` 동작,
+      `mutating`/`long_running` 플래그 보유, lazy `_ensure_loaded()`로 core 모듈 import. 23개 도구 등록 확인.
+      ⏳**잔여**: `long_running` 도구의 별도 잡 인터페이스(`start_*`/`get_job_status`/`cancel_job`)는 미구현 — 현재 동기 실행.
+- [~] **C2. `mcp_server.py` 완성** — 🔶**대부분 완료(코드대조 2026-06-14)**: FastMCP가 레지스트리를 순회해 전 tool
+      자동노출(`<name>_tool`) + `scpilot_version`. ⏳**잔여**: `qc_heuristics`·`integration_metrics` **최소 tool-use 가이드
+      설명문 동봉** 확인 필요(현재 도구 docstring 기반) + Claude Code/Codex 양쪽 풀 워크플로 실호출 검증.
+- [x] **C3. `step` 완성** — ✅**완료(코드대조 2026-06-14)**: `scpilot step <stage> <input>` 결정론적 단독 실행 +
+      세션 체크포인트 재진입 + run-log 기록. `replay`(mode4)도 와이어링됨.
 
 ### Phase D — LLM 에이전트 & 자율 실행 (모드 2, 선택)
 > **📝 메모(2026-06-10 논의)**: 현재 **scpilot 자체가 LLM API를 호출하는 기능은 없음**(llm/ 전부 skeleton,
@@ -527,11 +550,14 @@ B1~B7엔 장시간 도구 없음, scVI 실측 후 설계(과설계 회피). `lon
 > `scpilot step` 구동)뿐. `scpilot step`(mode3)·`annotate_broad` 등은 **결정론적, LLM API 0**(ANTHROPIC_API_KEY 불필요).
 > → **scpilot 단독으로(호스트 없이) API 키로 자율 실행**이 필요해지면 **이 Phase D를 구축**: `scpilot run`이 Anthropic API
 > (`claude-opus-4-8`, tool_runner)를 직접 호출해 8단계 자율 수행. 빌드 시점은 MVP 루프(Tier1→통합→benchmark→report) 안정화 후.
-- [ ] **D1. preflight** — `claude-opus-4-8`·`tool_runner` 가용성 확인, **모델명 설정화**(하드코딩 금지).
-- [ ] **D2. `llm/provider.py`** — provider 추상화(기본 Claude/Anthropic).
-- [ ] **D3. `llm/prompts.py`** — 단계별 system prompt(오케스트레이션/annotation/해석/DE 설계).
-- [ ] **D4. `llm/agent.py`** — tool-runner 루프 + structured output(annotation 라벨, DE 설계 강제).
-- [ ] **D5. `cli.py run`** — 전체 자율 실행 + 리포트. 검증: 서브샘플 풀런, 토큰·호출수 로깅.
+> **🔄 코드대조(2026-06-14)**: Phase D는 커밋 `2469299`("모드 2 자체구동 LLM 계층 D1–D5")로 **구현 완료**.
+> `provider.py`(441줄)·`prompts.py`(342줄)·`agent.py`(352줄)·`cli.py run` 모두 존재. 위 6/10 메모(skeleton/stub)는 옛 상태.
+- [x] **D1. preflight** — ✅**완료**: `claude-opus-4-8`·`tool_runner` 가용성 확인, 모델명 설정화(provider).
+- [x] **D2. `llm/provider.py`** — ✅**완료**: provider 추상화(기본 Claude/Anthropic).
+- [x] **D3. `llm/prompts.py`** — ✅**완료**: 단계별 system prompt(오케스트레이션/annotation/malignancy/해석).
+- [x] **D4. `llm/agent.py`** — ✅**완료**: tool-runner 루프 + structured output 강제.
+- [~] **D5. `cli.py run`** — 🔶**구현 완료, 검증 잔여**: `run_agent` 호출 + 마지막 report 생성 와이어링됨.
+      ⏳**잔여**: 서브샘플 풀런으로 토큰·호출수 로깅 **실측 검증** 미수행.
 
 ### Phase E — 후속 확장 (선택)
 - [ ] **E1. 지식 카드 추출(Skills)** — 안정화된 프롬프트를 `knowledge/*.md` 단일 소스로 추출,

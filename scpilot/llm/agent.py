@@ -50,6 +50,8 @@ DEFAULT_TOOLSET = [
     "detect_state", "qc_metrics", "qc_filter", "preprocess", "cluster",
     "markers", "annotation_review", "apply_annotation", "plots",
     "integrate_scvi", "integrate_harmony",
+    "compartment_plan", "compartment_subset",
+    "fine_annotation_review", "apply_fine_annotation",
 ]
 
 # Per-tool parameter hints surfaced to the model (kept minimal; the registry's ToolSpec
@@ -82,6 +84,24 @@ _PARAM_HINTS: dict[str, dict] = {
         "review_required": {"type": "object", "description": "optional cluster_id -> bool"},
         "tissue": {"type": "string", "description": "tissue/condition context"}},
     "plots": {"kind": {"type": "string", "description": "umap | qc_violin | hvg | pca_variance | dotplot"}},
+    "compartment_plan": {"groupby": {"type": "string", "description": "compartment key (major_cell_type)"},
+                         "min_cells": {"type": "integer", "description": "branch floor — min cells"},
+                         "min_samples": {"type": "integer", "description": "branch floor — min samples"}},
+    "compartment_subset": {
+        "compartment": {"type": "string", "description": "the major_cell_type value to extract"},
+        "mode": {"type": "string", "description": "clustering (integration-aware) | markers (renormalize+HVG)"},
+        "use_rep": {"type": "string", "description": "integration embedding for mode=clustering (e.g. X_scVI)"}},
+    "fine_annotation_review": {"groupby": {"type": "string", "description": "subcluster key (leiden on the subset)"},
+                               "top_n": {"type": "integer", "description": "DE genes per subcluster to expose"},
+                               "confounder_genes": {"type": "object",
+                                                    "description": "optional {score_name: [genes]} scored on the fly"}},
+    "apply_fine_annotation": {
+        "groupby": {"type": "string", "description": "subcluster key the labels are keyed on"},
+        "fine_labels": {"type": "object", "description": "subcluster_id -> fine_cell_type (inferred from DE)"},
+        "facs_labels": {"type": "object", "description": "subcluster_id -> FACS-style display label"},
+        "cell_state": {"type": "object", "description": "optional subcluster_id -> functional state"},
+        "confidence": {"type": "object"}, "review_required": {"type": "object"},
+        "evidence_for": {"type": "object", "description": "subcluster_id -> [supporting evidence]"}},
 }
 
 # Decision-event type per tool (which step the agent's choice maps to in the frozen schema).
@@ -173,7 +193,7 @@ def _system_prompt(goal: str | None, tissue: str | None = None,
                    resolutions: dict | None = None) -> str:
     parts = [prompts.ORCHESTRATION_PROMPT, prompts.ANNOTATION_PROMPT,
              prompts.ANNOTATION_REVIEW_PROMPT, prompts.TISSUE_CONTEXT_GUIDANCE,
-             prompts.MALIGNANCY_PROMPT, prompts.DE_DESIGN_PROMPT]
+             prompts.MALIGNANCY_PROMPT, prompts.FINE_ANNOTATION_PROMPT, prompts.DE_DESIGN_PROMPT]
     if resolutions:
         # human-in-the-loop: the ONLY resolutions the agent may use (per embedding/model).
         res = ", ".join(f"{k}={v}" for k, v in resolutions.items())

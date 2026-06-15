@@ -1,7 +1,10 @@
-"""Annotation — Tier 1 broad (B8); Tier 3 fine lands later (B13).
+"""Annotation — Tier 1 broad (B8) + Tier 3 fine (B13).
 
 Tier 1 (``annotate_broad``) assigns ``obs['major_cell_type']`` — the broad
-compartment that becomes the scib benchmark ``label_key``.
+compartment that becomes the scib benchmark ``label_key``. Tier 3 (bottom of file:
+``fine_annotation_review`` → ``apply_fine_annotation``) refines WITHIN a compartment
+to ``obs['fine_cell_type']`` + ``obs['facs_style_label']`` (evidence→LLM→apply, same
+marker-DB-free split), recording authority/evidence in ``uns[...]['annotation_tree']``.
 
 LOGIC (user-confirmed 2026-06-10, extended 2026-06-11):
 1. **leiden-cluster DE** is the basis: ``rank_genes_groups`` (Wilcoxon, pts=True).
@@ -82,6 +85,16 @@ AMBIGUOUS_LABEL = "ambiguous"   # consensus_annotation sentinel: methods disagre
 # here; drop those per-run via the benchmark `drop_labels` param.)
 ARTIFACT_LABELS = {UNKNOWN_LABEL, MIXED_LABEL, LOWQ_LABEL, AMBIGUOUS_LABEL}
 UNS_ANNO = "scpilot_annotation"
+
+# ---- Tier 3 (fine) constants (B13) ----
+UNS_TREE = "annotation_tree"            # nested under UNS_ANNO: per-subcluster authority + evidence
+FINE_UNRESOLVED = "unresolved"          # merge fallback label for under-powered subclusters
+# Confounder obs columns surfaced per subcluster — these are SCORE/QC columns produced upstream
+# (NOT gene panels): reading them is evidence, not a hardcoded marker list. Genes for on-the-fly
+# scoring are caller-supplied via `confounder_genes` (no built-in panel).
+CONFOUNDER_KEYS = ("cell_cycle_score", "S_score", "G2M_score", "stress_score",
+                   "interferon_score", "activation_score", "doublet_score", "pct_counts_mt")
+FINE_DOUBLET_KEY = "predicted_doublet"
 
 
 def _expressed_fraction(adata, gene: str):
@@ -327,6 +340,7 @@ def annotate_broad(session, *, groupby: str = "leiden", min_pct: float = 0.25, m
                       "the calls via apply_annotation. Run after markers (which produces the pts DE). "
                       "See llm/prompts.py ANNOTATION_REVIEW_PROMPT + TISSUE_CONTEXT_GUIDANCE.")
 def annotation_review(session, *, groupby: str = "leiden", top_n: int = 50, padj_max: float = 0.05,
+                      min_specificity: float = 0.1, max_pct_out: float = 0.5, min_specific_markers: int = 3,
                       sample_key: str = "sample_id", tissue: str | None = None, max_samples_reported: int = 8,
                       doublet_key: str = "predicted_doublet", doublet_frac: float = 0.5,
                       single_source_frac: float = 0.8, mt_key: str = "pct_counts_mt", max_pct_mt: float = 25.0,
@@ -364,9 +378,19 @@ def annotation_review(session, *, groupby: str = "leiden", top_n: int = 50, padj
     if "pvals_adj" in de.columns:
         de = de[de["pvals_adj"] < padj_max]
     n_sig_total = int(len(de))
+    # SPECIFICITY axis added to the DE step (spec = pct_in - pct_out): a marker must be ENRICHED
+    # in-cluster, not broadly expressed. A high-pct_out gene (MALAT1, ribosomal, ...) is weak identity
+    # evidence even at high logFC, so the list the LLM reads is significant AND specific — the data
+    # sets specificity, no marker DB. spec is surfaced per gene and the surfaced top-N is the most
+    # specific markers (so the cluster's own identity leads).
+    has_spec = {"pct_nz_group", "pct_nz_reference"}.issubset(de.columns)
+    if has_spec:
+        de = de.assign(spec=(de["pct_nz_group"] - de["pct_nz_reference"]).round(4))
+        _spec_ok = (de["spec"] >= min_specificity) & (de["pct_nz_reference"] <= max_pct_out)
+    n_specific_total = int(_spec_ok.sum()) if has_spec else n_sig_total
 
     de_cols = {"names": "gene", "logfoldchanges": "logFC", "pvals_adj": "padj",
-               "pct_nz_group": "pct_in", "pct_nz_reference": "pct_out", "scores": "score"}
+               "pct_nz_group": "pct_in", "pct_nz_reference": "pct_out", "spec": "spec", "scores": "score"}
     present_cols = [c for c in de_cols if c in de.columns]
     obs_g = adata.obs[groupby].astype(str)
     has_sample = sample_key in adata.obs.columns
@@ -379,7 +403,11 @@ def annotation_review(session, *, groupby: str = "leiden", top_n: int = 50, padj
     for cl, sub in de.groupby("group", observed=True):
         cl = str(cl)
         n_sig = int(len(sub))                          # significant up-markers for this cluster
-        top = sub.head(top_n)                          # top-N AMONG significant (padj < padj_max)
+        # significant AND specific (delta + out-group ceiling), most-specific first.
+        spec_sub = sub[(sub["spec"] >= min_specificity) & (sub["pct_nz_reference"] <= max_pct_out)] \
+            .sort_values("spec", ascending=False) if has_spec else sub
+        n_specific = int(len(spec_sub))
+        top = spec_sub.head(top_n)                     # top-N SPECIFIC markers
         de_table = [{de_cols[c]: (round(float(r[c]), 4) if c != "names" else str(r[c]))
                      for c in present_cols} for _, r in top.iterrows()]
         mask = (obs_g == cl).values
@@ -407,16 +435,18 @@ def annotation_review(session, *, groupby: str = "leiden", top_n: int = 50, padj
             status = "artifact_suspected"
             if doublet_dominated: risk.append("doublet_dominated")
             if low_quality: risk.append("low_quality_qc")
-        elif single_source or n_cells < min_cells:
+        elif single_source or n_cells < min_cells or n_specific < min_specific_markers:
             status = "review"
             if single_source: risk.append("single_source")
             if n_cells < min_cells: risk.append("tiny_cluster")
+            if n_specific < min_specific_markers: risk.append("few_specific_markers")
         else:
             status = "clean"
         status_counts[status] += 1
 
         payloads.append({
             "cluster_id": cl, "cluster_size": n_cells, "n_significant_markers": n_sig,
+            "n_specific_markers": n_specific,
             "review_status": status, "risk_signals": risk,
             "deterministic_flags": {"doublet_dominated": doublet_dominated,
                                     "low_quality_qc": low_quality, "single_source": single_source},
@@ -433,11 +463,16 @@ def annotation_review(session, *, groupby: str = "leiden", top_n: int = 50, padj
     json_path.write_text(json.dumps(
         {"groupby": groupby, "top_n": top_n, "tissue_context": tissue,
          "significance_filter": f"pvals_adj < {padj_max}",
+         "specificity_filter": f"(pct_in - pct_out) >= {min_specificity} AND pct_out <= {max_pct_out}",
          "n_de_total": n_de_total, "n_significant_total": n_sig_total,
+         "n_specific_total": n_specific_total,
          "marker_db_used": False, "candidate_labels_provided": False,
-         "instruction": f"de_table = top-{top_n} SIGNIFICANT (padj<{padj_max}) up-markers per cluster. "
-                        "Infer each cluster's broad cell type from its de_table (no marker DB); "
-                        "use tissue_context as a soft prior; then call apply_annotation with the "
+         "instruction": f"de_table = top-{top_n} markers per cluster that are SIGNIFICANT (padj<{padj_max}) "
+                        f"AND SPECIFIC (spec = pct_in - pct_out >= {min_specificity}), most-specific first. "
+                        "Each gene shows spec so you can weigh enrichment vs broad expression. Infer each "
+                        "cluster's broad cell type from its de_table (no marker DB); use tissue_context as a "
+                        "soft prior; clusters flagged 'few_specific_markers' lack a distinct identity (likely "
+                        "low-quality/ambient/doublet) — treat with caution. Then call apply_annotation with the "
                         "cluster->label map.",
          "clusters": payloads}, indent=2, default=str))
 
@@ -447,13 +482,16 @@ def annotation_review(session, *, groupby: str = "leiden", top_n: int = 50, padj
     summary = {
         "groupby": groupby, "top_n": top_n, "n_clusters": len(payloads),
         "significance_filter": f"pvals_adj < {padj_max}", "padj_max": padj_max,
-        "n_significant_total": n_sig_total, "n_de_total": n_de_total,
+        "specificity_filter": f"(pct_in - pct_out) >= {min_specificity} AND pct_out <= {max_pct_out}",
+        "min_specificity": min_specificity, "max_pct_out": max_pct_out,
+        "n_significant_total": n_sig_total, "n_specific_total": n_specific_total, "n_de_total": n_de_total,
         "tissue_context": tissue, "marker_db_used": False,
         "status_counts": status_counts, "flagged_clusters": flagged,
         "review_input": str(json_path),
-        "note": f"DE-based annotation: de_table = top-{top_n} SIGNIFICANT up-markers (padj<{padj_max}) per "
-                "cluster; the LLM assigns cell types WITHOUT a marker panel (tissue_context = soft prior), "
-                "then calls apply_annotation. The flags here are panel-free QC/provenance only.",
+        "note": f"DE-based annotation: de_table = top-{top_n} markers that are SIGNIFICANT (padj<{padj_max}) "
+                f"AND SPECIFIC (spec=pct_in-pct_out>={min_specificity}), most-specific first; the LLM assigns "
+                "cell types WITHOUT a marker panel (tissue_context = soft prior), then calls apply_annotation. "
+                "'few_specific_markers' flags clusters lacking a distinct identity. Flags are panel-free QC only.",
     }
     warnings = [] if not flagged else [f"{len(flagged)} cluster(s) flagged (QC/provenance): {flagged}"]
     return S.success("annotation_review", summary=summary, tables={"review": table},
@@ -630,7 +668,8 @@ COMPARTMENT_ORDER = [
 
 
 def derive_dotplot_markers(adata, *, cluster_key, label_map, top_k=5,
-                           min_pct=0.25, min_lfc=1.0, padj_max=0.05, order=None):
+                           min_pct=0.25, min_lfc=1.0, padj_max=0.05, min_specificity=0.1,
+                           max_pct_out=0.5, order=None):
     """Per-cell-type dotplot markers that ARE the Tier-1 annotation EVIDENCE — the same DE-selected
     significant markers the LLM read to make the call, shown per assigned cell type. No external
     marker DB, no lineage prior: the marker SELECTION itself is the evidence (that is the point).
@@ -660,9 +699,16 @@ def derive_dotplot_markers(adata, *, cluster_key, label_map, top_k=5,
     for col in ("pvals_adj", "pct_nz_group", "logfoldchanges", "scores"):
         if col not in de.columns:
             raise ValueError(f"DE lacks '{col}' — re-run markers with pts=True")
-    # Tier-1 positive-marker gate (annotate_broad rule 2) — the DATA selects the evidence.
+    # Tier-1 positive-marker gate (annotate_broad rule 2) — the DATA selects the evidence. The
+    # SPECIFICITY gate has TWO parts so a near-saturated gene (pct_in≈1) can't slip through on the
+    # delta alone: (i) enrichment delta pct_in-pct_out >= min_specificity, AND (ii) an ABSOLUTE
+    # out-group ceiling pct_out <= max_pct_out — a gene expressed in a large fraction of OTHER cell
+    # types (HLA-DRA, ribosomal, FCER1G, ...) is shared, not identity, and is dropped here.
     de = de[(de["pvals_adj"] < padj_max) & (de["pct_nz_group"] >= min_pct)
             & (de["logfoldchanges"] >= min_lfc)]
+    if "pct_nz_reference" in de.columns:
+        de = de[((de["pct_nz_group"] - de["pct_nz_reference"]) >= min_specificity)
+                & (de["pct_nz_reference"] <= max_pct_out)]
 
     sizes = adata.obs[cluster_key].astype(str).value_counts().to_dict()
     best = defaultdict(dict)           # cell type -> {gene: best DE score across its clusters}
@@ -703,3 +749,350 @@ def derive_dotplot_markers(adata, *, cluster_key, label_map, top_k=5,
         if genes:
             panels[ct] = genes
     return panels
+
+
+# =========================================================================== #
+# Tier 3 — fine annotation (B13): evidence → LLM → apply (marker-DB-free)
+# =========================================================================== #
+# Same two-step split as Tier-1/Tier-2: a deterministic tool packages per-SUBCLUSTER
+# evidence WITHIN a compartment (from compartment_subset → cluster → markers), the LLM
+# infers fine_cell_type + a FACS-style display label from the DE itself (no fixed panel),
+# and apply_fine_annotation records the calls with deterministic HARD RULES (tiny-cluster
+# merge, insufficient-evidence → review). Evidence + authority live in
+# uns['scpilot_annotation']['annotation_tree']; cell type / state stay in SEPARATE columns.
+
+
+def _fine_score_genes(adata, genes, name):
+    """Per-cell sc.tl.score_genes for caller-supplied confounder genes (None-safe, local)."""
+    import scanpy as sc
+    present = [g for g in (genes or []) if g in adata.var_names]
+    if not present:
+        return None, []
+    sc.tl.score_genes(adata, present, score_name=name, ctrl_size=min(50, max(10, len(present) * 5)))
+    return adata.obs[name].astype(float), present
+
+
+@register("fine_annotation_review", mutating=False,
+          description="Tier-3 FINE annotation EVIDENCE (read-only, NO fixed marker panel). Run WITHIN a "
+                      "compartment subset (compartment_subset → cluster → markers): per subcluster it packages the "
+                      "top-N SIGNIFICANT ranked DE (logFC/padj/pct), size, sample distribution + single-patient "
+                      "dominance, the dominant parent compartment (major_cell_type) and malignancy composition (if "
+                      "present), and CONFOUNDER signals — existing obs score columns (cell_cycle/stress/IFN/"
+                      "activation/doublet) plus OPTIONAL caller confounder_genes scored on the fly (no built-in "
+                      "panel). The LLM infers fine_cell_type + a FACS-style display label FROM the DE (see "
+                      "FINE_ANNOTATION_PROMPT), then calls apply_fine_annotation.")
+def fine_annotation_review(session, *, groupby: str = "leiden", compartment: str | None = None,
+                           top_n: int = 40, padj_max: float = 0.05,
+                           min_specificity: float = 0.1, max_pct_out: float = 0.5, min_specific_markers: int = 3,
+                           sample_key: str = "sample_id",
+                           major_key: str = "major_cell_type", malignancy_key: str = "malignancy",
+                           confounder_keys: list | None = None, confounder_genes: dict | None = None,
+                           single_source_frac: float = 0.8, min_cells: int = 20,
+                           max_samples_reported: int = 8, **params) -> S.ToolResult:
+    import json
+
+    import numpy as np
+    import scanpy as sc
+
+    t0 = time.time()
+    adata = session.adata
+    if groupby not in adata.obs.columns:
+        return S.error("fine_annotation_review", "invalid_state",
+                       f"subcluster key '{groupby}' absent — run cluster on the compartment subset first",
+                       recoverable=True, suggested_next_tools=["cluster"])
+    rg = adata.uns.get("rank_genes_groups")
+    if not rg or rg.get("params", {}).get("groupby") != groupby:
+        return S.error("fine_annotation_review", "invalid_state",
+                       f"per-subcluster DE for '{groupby}' absent — run markers(groupby={groupby}) first",
+                       recoverable=True, suggested_next_tools=["markers"])
+    de = sc.get.rank_genes_groups_df(adata, group=None)
+    if "pct_nz_group" not in de.columns:
+        return S.error("fine_annotation_review", "invalid_state",
+                       "DE lacks expressed-fraction (pct) — re-run markers (it sets pts=True)",
+                       recoverable=True, suggested_next_tools=["markers"])
+    if "pvals_adj" in de.columns:
+        de = de[de["pvals_adj"] < padj_max]
+    # SPECIFICITY axis (spec = pct_in - pct_out): within a compartment the broadly-shared epithelial
+    # genes (and ambient MALAT1/ribosomal) are NOT identity evidence; the surfaced list is significant
+    # AND specific so fine subtypes are told apart by genes they actually concentrate.
+    has_spec = {"pct_nz_group", "pct_nz_reference"}.issubset(de.columns)
+    if has_spec:
+        de = de.assign(spec=(de["pct_nz_group"] - de["pct_nz_reference"]).round(4))
+
+    de_cols = {"names": "gene", "logfoldchanges": "logFC", "pvals_adj": "padj",
+               "pct_nz_group": "pct_in", "pct_nz_reference": "pct_out", "spec": "spec", "scores": "score"}
+    present_cols = [c for c in de_cols if c in de.columns]
+
+    obs_g = adata.obs[groupby].astype(str)
+    has_sample = sample_key in adata.obs.columns
+    has_major = major_key in adata.obs.columns
+    has_malig = malignancy_key in adata.obs.columns
+    # overall compartment context: the parent major label when the subset is one compartment
+    overall_comp = compartment
+    if overall_comp is None and has_major:
+        majs = adata.obs[major_key].astype(str).unique()
+        overall_comp = str(majs[0]) if len(majs) == 1 else None
+
+    # confounder evidence — READ existing upstream score columns (numeric); never a gene panel.
+    ckeys = list(confounder_keys) if confounder_keys is not None else list(CONFOUNDER_KEYS)
+    conf_cols = [k for k in ckeys if k in adata.obs.columns
+                 and np.issubdtype(adata.obs[k].dtype, np.number)]
+    has_dbl = FINE_DOUBLET_KEY in adata.obs.columns
+    # OPTIONAL caller-supplied confounder gene sets scored on the fly (no built-in panel)
+    scored, scored_used, scratch = {}, {}, []
+    for sname, genes in (confounder_genes or {}).items():
+        col = f"_fine_conf_{sname}"
+        s, used = _fine_score_genes(adata, genes, col)
+        if s is not None:
+            scored[sname] = s.values
+            scored_used[sname] = used
+            scratch.append(col)
+
+    payloads, rows = [], []
+    for cl in sorted(obs_g.unique()):
+        cl = str(cl)
+        sub = de[de["group"].astype(str) == cl]
+        # significant AND specific (delta + out-group ceiling), most-specific first.
+        spec_sub = sub[(sub["spec"] >= min_specificity) & (sub["pct_nz_reference"] <= max_pct_out)] \
+            .sort_values("spec", ascending=False) if has_spec else sub
+        n_specific = int(len(spec_sub))
+        top = spec_sub.head(top_n)
+        de_table = [{de_cols[c]: (round(float(r[c]), 4) if c != "names" else str(r[c]))
+                     for c in present_cols} for _, r in top.iterrows()]
+        mask = (obs_g == cl).values
+        n_cells = int(mask.sum())
+
+        ev: dict = {"subcluster": cl, "n_cells": n_cells, "n_significant_markers": int(len(sub)),
+                    "n_specific_markers": n_specific, "de_table": de_table}
+        if has_major:
+            mv = adata.obs[major_key].astype(str)[mask].value_counts(normalize=True)
+            ev["compartment"] = str(mv.index[0])
+            ev["compartment_purity"] = round(float(mv.iloc[0]), 3)
+        if has_malig:
+            mc = adata.obs[malignancy_key].astype(str)[mask].value_counts(normalize=True)
+            ev["malignancy_composition"] = {str(k): round(float(v), 3) for k, v in mc.head(4).items()}
+        if has_sample:
+            sv = adata.obs[sample_key].astype(str)[mask].value_counts(normalize=True)
+            ev["sample_distribution"] = {str(k): round(float(v), 3) for k, v in sv.head(max_samples_reported).items()}
+            ev["single_patient_dominated"] = bool(sv.iloc[0] >= single_source_frac)
+        conf = {}
+        for k in conf_cols:
+            conf[k] = round(float(np.nanmean(adata.obs[k].values[mask])), 4)
+        if has_dbl:
+            conf["doublet_frac"] = round(float(np.asarray(adata.obs[FINE_DOUBLET_KEY].values[mask],
+                                                          dtype=float).mean()), 3)
+        for sname, vals in scored.items():
+            conf[sname] = round(float(np.nanmean(vals[mask])), 4)
+        if conf:
+            ev["confounders"] = conf
+        flags = []
+        if n_cells < min_cells:
+            flags.append("tiny_subcluster")
+        if n_specific < min_specific_markers:
+            flags.append("few_specific_markers")     # no distinct identity (low-quality/ambient/doublet)
+        if flags:
+            ev["flag"] = ",".join(flags)
+        payloads.append(ev)
+        rows.append({"subcluster": cl, "n_cells": n_cells,
+                     "compartment": ev.get("compartment"),
+                     "n_sig_markers": int(len(sub)), "n_specific": n_specific,
+                     "single_patient": ev.get("single_patient_dominated"),
+                     "top_markers": ", ".join(d["gene"] for d in de_table[:6])})
+
+    for c in scratch:                          # read-only contract: drop scratch score columns
+        if c in adata.obs.columns:
+            del adata.obs[c]
+
+    import pandas as pd
+    df = pd.DataFrame(rows)
+    art_dir = session.artifacts_dir
+    art_dir.mkdir(parents=True, exist_ok=True)
+    json_path = art_dir / "fine_annotation_evidence.json"
+    json_path.write_text(json.dumps({
+        "groupby": groupby, "compartment": overall_comp,
+        "padj_max": padj_max,
+        "specificity_filter": f"(pct_in - pct_out) >= {min_specificity} AND pct_out <= {max_pct_out}",
+        "confounder_keys_used": conf_cols,
+        "confounder_genes_used": scored_used,
+        "instruction": "de_table = markers that are SIGNIFICANT (padj) AND SPECIFIC (spec=pct_in-pct_out, "
+                       "most-specific first); 'few_specific_markers' flags a subcluster with no distinct "
+                       "identity (low-quality/ambient/doublet). Within this compartment, infer each subcluster's "
+                       "fine_cell_type FROM the ranked DE (no marker database) and a FACS-style display label "
+                       "(e.g. 'CD8+ PD-1+ T cells'). Keep "
+                       "cell TYPE separate from cell STATE. Weigh confounders (cell-cycle/stress/IFN/activation/"
+                       "doublet, single-patient dominance) — a state program (cycling/stressed) is NOT a cell "
+                       "type. Provide evidence_for / evidence_against / confounders per subcluster + confidence "
+                       "[0,1] + review_required. Tiny subclusters (n_cells < merge floor) and calls with no "
+                       "evidence_for are auto-flagged for review by apply_fine_annotation. Then call "
+                       "apply_fine_annotation(groupby, fine_labels, facs_labels, ...).",
+        "subclusters": payloads}, indent=2, default=str))
+
+    warnings = []
+    if not has_major:
+        warnings.append(f"major_cell_type key '{major_key}' absent — no compartment-purity context.")
+    if not has_sample:
+        warnings.append(f"sample_key '{sample_key}' absent — no single-patient-dominance signal.")
+    if not conf_cols and not scored:
+        warnings.append("no confounder score columns found and none supplied — state/confound signals limited "
+                        "(pass confounder_genes={name:[genes]} to score cycle/stress/IFN on the fly).")
+
+    summary = {
+        "groupby": groupby, "compartment": overall_comp, "n_subclusters": len(payloads),
+        "specificity_filter": f"(pct_in - pct_out) >= {min_specificity} AND pct_out <= {max_pct_out}",
+        "min_specificity": min_specificity, "max_pct_out": max_pct_out,
+        "confounder_keys_used": conf_cols, "confounder_genes_used": scored_used,
+        "evidence_input": str(json_path),
+        "note": "Evidence only — no fine call. de_table is SIGNIFICANT AND SPECIFIC markers (spec=pct_in-pct_out, "
+                "most-specific first); the LLM infers fine_cell_type + FACS label from the DE, then writes them "
+                "via apply_fine_annotation (tiny-cluster merge + insufficient-evidence enforced).",
+    }
+    return S.success("fine_annotation_review", summary=summary,
+                     tables={"subclusters": S.table_preview(df, max_rows=len(df))},
+                     artifacts=[S.Artifact(path=str(json_path), kind="json",
+                                           description="per-subcluster fine-annotation evidence for the LLM")],
+                     warnings=warnings, determinism_grade="A", duration_s=round(time.time() - t0, 3),
+                     suggested_next_tools=["apply_fine_annotation"])
+
+
+@register("apply_fine_annotation", mutating=True,
+          description="Write the LLM's Tier-3 FINE calls: obs['fine_cell_type'] + obs['facs_style_label'] (display, "
+                      "e.g. 'CD8+ PD-1+ T cells') + optional obs['cell_state'], keyed on the subcluster map the LLM "
+                      "inferred from fine_annotation_review. Cell TYPE and STATE stay in separate columns. "
+                      "Deterministic HARD RULES: a subcluster below merge_min_cells is MERGED to a fallback label "
+                      "(<compartment>_unresolved) + review_required; a call with no evidence_for is forced "
+                      "review_required. Per-subcluster authority + evidence_for/against + confounders are recorded "
+                      "in uns['scpilot_annotation']['annotation_tree'].")
+def apply_fine_annotation(session, *, groupby: str = "leiden", fine_labels: dict | None = None,
+                          facs_labels: dict | None = None, cell_state: dict | None = None,
+                          confidence: dict | None = None, review_required: dict | None = None,
+                          evidence_for: dict | None = None, evidence_against: dict | None = None,
+                          confounders: dict | None = None, compartment: str | None = None,
+                          major_key: str = "major_cell_type", fine_key: str = "fine_cell_type",
+                          facs_key: str = "facs_style_label", merge_min_cells: int = 20,
+                          min_evidence: int = 1, merge_label: str | None = None,
+                          method: str = "DE_LLM_fine_marker_free", unassigned: str = "Unassigned",
+                          **params) -> S.ToolResult:
+    t0 = time.time()
+    adata = session.adata
+    if groupby not in adata.obs.columns:
+        return S.error("apply_fine_annotation", "invalid_state",
+                       f"subcluster key '{groupby}' absent — run cluster first", recoverable=True,
+                       suggested_next_tools=["cluster"])
+    if not fine_labels:
+        return S.error("apply_fine_annotation", "missing_input",
+                       "no 'fine_labels' map given (expected {subcluster_id: fine_cell_type} from the LLM)",
+                       recoverable=True, suggested_next_tools=["fine_annotation_review"])
+
+    obs_g = adata.obs[groupby].astype(str)
+    sizes = obs_g.value_counts().to_dict()
+    clusters = sorted(obs_g.unique())
+    fine = {str(k): str(v) for k, v in fine_labels.items()}
+    facs = {str(k): str(v) for k, v in (facs_labels or {}).items()}
+    state = {str(k): str(v) for k, v in (cell_state or {}).items()}
+    cf = {str(k): float(v) for k, v in (confidence or {}).items()}
+    rv = {str(k): bool(v) for k, v in (review_required or {}).items()}
+    ef = {str(k): list(v) for k, v in (evidence_for or {}).items()}
+    eg = {str(k): list(v) for k, v in (evidence_against or {}).items()}
+    conf_map = {str(k): list(v) for k, v in (confounders or {}).items()}
+
+    has_major = major_key in adata.obs.columns
+    # global compartment for the merge fallback label (parent major, when the subset is uniform)
+    overall_comp = compartment
+    if overall_comp is None and has_major:
+        majs = adata.obs[major_key].astype(str).unique()
+        overall_comp = str(majs[0]) if len(majs) == 1 else None
+    fallback = merge_label or (f"{overall_comp}_{FINE_UNRESOLVED}" if overall_comp else FINE_UNRESOLVED)
+
+    fine_final, facs_final, state_final, conf_final, review_final = {}, {}, {}, {}, {}
+    tree: dict = {}
+    n_merged = n_insufficient = 0
+    for cl in clusters:
+        n_cells = int(sizes.get(cl, 0))
+        proposed = fine.get(cl)
+        reasons: list[str] = []
+        merged = False
+        forced_review = False
+
+        if proposed is None:
+            final = unassigned
+            reasons.append("not_labeled")
+            forced_review = True
+        elif n_cells < merge_min_cells:                 # HARD RULE: tiny subcluster → merge + review
+            final = fallback
+            merged = True
+            forced_review = True
+            n_merged += 1
+            reasons.append(f"below_merge_min_cells(<{merge_min_cells})")
+        else:
+            final = proposed
+
+        ev_for = ef.get(cl, [])
+        if proposed is not None and len(ev_for) < min_evidence:   # HARD RULE: no evidence → review
+            forced_review = True
+            n_insufficient += 1
+            reasons.append("insufficient_evidence")
+
+        review = bool(rv.get(cl, False) or forced_review)
+        # per-subcluster compartment context
+        comp_cl = overall_comp
+        if has_major:
+            comp_cl = str(adata.obs[major_key].astype(str)[(obs_g == cl).values].value_counts().index[0])
+
+        fine_final[cl] = final
+        facs_final[cl] = facs.get(cl, "")
+        state_final[cl] = state.get(cl, "")
+        conf_final[cl] = cf.get(cl, float("nan"))
+        review_final[cl] = review
+        tree[cl] = {
+            "n_cells": n_cells, "major_cell_type": comp_cl,
+            "fine_cell_type": final, "proposed_fine_cell_type": proposed,
+            "facs_style_label": facs.get(cl, ""), "cell_state": state.get(cl, ""),
+            "confidence": cf.get(cl), "review_required": review, "merged": merged,
+            "evidence_for": ev_for, "evidence_against": eg.get(cl, []),
+            "confounders": conf_map.get(cl, []), "review_reasons": reasons,
+        }
+
+    adata.obs[fine_key] = obs_g.map(lambda c: fine_final.get(c, unassigned)).astype("category")
+    adata.obs[facs_key] = obs_g.map(lambda c: facs_final.get(c, "")).astype("category")
+    adata.obs[f"{fine_key}_confidence"] = obs_g.map(lambda c: conf_final.get(c, float("nan"))).astype(float)
+    adata.obs[f"{fine_key}_review_required"] = obs_g.map(lambda c: review_final.get(c, False)).astype(bool)
+    if any(state_final.values()):
+        adata.obs["cell_state"] = obs_g.map(lambda c: state_final.get(c, "")).astype("category")
+
+    adata.uns.setdefault(UNS_ANNO, {})
+    adata.uns[UNS_ANNO][UNS_TREE] = {
+        "method": method, "groupby": groupby, "compartment": overall_comp,
+        "fine_key": fine_key, "facs_key": facs_key, "marker_db_used": False,
+        "merge_min_cells": merge_min_cells, "merge_label": fallback, "min_evidence": min_evidence,
+        "subclusters": tree,
+    }
+    try:
+        session.log_decision(S.DecisionEvent(
+            decision_type="fine_llm_labels",
+            choice={cl: fine_final[cl] for cl in clusters}, candidates=[],
+            rationale=f"DE-based marker-free Tier-3 fine labels (compartment={overall_comp})",
+            stage="apply_fine_annotation", params={"groupby": groupby, "fine_key": fine_key}).to_dict())
+    except Exception:  # noqa: BLE001
+        pass
+
+    dist = adata.obs[fine_key].value_counts().to_dict()
+    n_review = int(sum(1 for v in review_final.values() if v))
+    n_unassigned = int((adata.obs[fine_key].astype(str) == unassigned).sum())
+    summary = {
+        "fine_key": fine_key, "facs_key": facs_key, "groupby": groupby, "compartment": overall_comp,
+        "method": method, "marker_db_used": False, "n_subclusters": len(clusters),
+        "n_merged_subclusters": n_merged, "merge_label": fallback,
+        "n_insufficient_evidence": n_insufficient, "n_review_required_subclusters": n_review,
+        "n_unassigned_cells": n_unassigned,
+        "label_distribution": {str(k): int(v) for k, v in dist.items()},
+    }
+    warnings = []
+    if n_merged:
+        warnings.append(f"{n_merged} subcluster(s) below merge_min_cells={merge_min_cells} → '{fallback}' + review")
+    if n_insufficient:
+        warnings.append(f"{n_insufficient} subcluster(s) had no evidence_for → review_required forced")
+    cp = session.checkpoint("apply_fine_annotation", x_state=session.manifest.x_state,
+                            params={"groupby": groupby, "fine_key": fine_key, "method": method})
+    return S.success("apply_fine_annotation", summary=summary, warnings=warnings, checkpoint=cp.path,
+                     determinism_grade="A", duration_s=round(time.time() - t0, 3),
+                     suggested_next_tools=["plots", "trajectory", "report"])

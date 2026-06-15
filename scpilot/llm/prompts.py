@@ -185,7 +185,21 @@ CANONICAL FLOW (skip steps already satisfied per detect_state; stop when the goa
       expansion) — never a CNV-score threshold alone. If cnv_available is false, decide from
       markers+reference+expansion and flag review_required (apply_malignancy enforces this).
       See MALIGNANCY_PROMPT.
-9. Fine annotation / DE per the goal and available capabilities. Finish with a report.
+9. Fine annotation (Tier 3) — refine WITHIN compartments, per the goal.
+   a. compartment_plan(groupby=major_cell_type, batch_key, min_cells, min_samples) -> read REAL
+      per-compartment counts/coverage + batch-mixing; the floor marks under-powered branches.
+      Record a compartment_branch decision (which compartments to recurse into; do not branch
+      blocked/under-powered ones unless justified).
+   b. For each chosen compartment: compartment_subset(compartment, mode='clustering',
+      use_rep=<chosen integration emb>) to subcluster on the batch-corrected embedding (or
+      mode='markers' to re-derive compartment-relevant HVGs). Then cluster(use_rep, resolution=
+      <HUMAN-set>) -> markers(groupby=<subset leiden>) on the SUBSET.
+   c. fine_annotation_review(groupby=<subset leiden>) -> read each subcluster's DE + confounders;
+      INFER fine_cell_type + a FACS-style label from the DE (see FINE_ANNOTATION_PROMPT; keep
+      type vs state separate). apply_fine_annotation(groupby, fine_labels, facs_labels, cell_state,
+      confidence, review_required, evidence_for) -> writes obs['fine_cell_type','facs_style_label']
+      + annotation_tree (tiny clusters merged + no-evidence calls flagged automatically).
+   Then DE per the goal and a final report.
 
 When the analysis goal is achieved (or no further safe step exists), STOP calling tools
 and write a short final summary of what was done and the key results.
@@ -257,6 +271,44 @@ JUDGEMENT RULES (do not violate):
 - not_applicable = the call does not make biological sense for that group (e.g. the chosen
   normal reference group itself).
 Supply per-group confidence in [0,1]; flag thin/single-sample groups for review.
+"""
+
+# ---------------------------------------------------------------------------
+# Tier-3 fine annotation — infer subtypes WITHIN a compartment from the DE itself.
+# Consumes fine_annotation_review JSON; commits via apply_fine_annotation.
+# ---------------------------------------------------------------------------
+FINE_ANNOTATION_PROMPT = """\
+You make the Tier-3 FINE annotation call WITHIN one broad compartment (after
+compartment_subset → cluster → markers). Like Tiers 1–2 this is a split: a tool packages
+per-subcluster EVIDENCE (fine_annotation_review), you JUDGE, apply_fine_annotation records it.
+
+You receive, per subcluster (from fine_annotation_review):
+- de_table: top-N SIGNIFICANT ranked DE (logFC, padj, pct_in, pct_out, score)
+- n_cells, compartment (dominant parent major_cell_type) + compartment_purity
+- malignancy_composition (if Tier-2 ran), sample_distribution + single_patient_dominated
+- confounders: cell-cycle / stress / interferon / activation / doublet scores + %MT
+
+HARD CONSTRAINTS (do not violate)
+- Marker-database-INDEPENDENT: infer the subtype from the ranked DE program itself; do NOT
+  look genes up in a fixed panel. Stay tissue-context-aware (soft prior only).
+- Keep cell TYPE separate from cell STATE. A proliferation/stress/IFN program is a STATE
+  (cell_state), NOT a fine_cell_type — do not name a cluster "cycling cells" as its type.
+  Put functional state in cell_state; put the lineage subtype in fine_cell_type.
+- A subcluster that is single-patient-dominated, doublet-high, or whose top DE is a pure
+  state/QC program is weak evidence for a NEW subtype — prefer merging it or flagging review.
+- Respect the parent compartment: a fine subtype must be compatible with the compartment
+  (e.g. within T/NK: CD4 T, CD8 T, Treg, NK — not a myeloid subtype).
+
+OUTPUT — call apply_fine_annotation with per-subcluster maps:
+- fine_labels{sub: fine_cell_type}      biological subtype (the computational record)
+- facs_labels{sub: facs_style_label}    FACS-style DISPLAY label, e.g. 'CD8+ PD-1+ T cells',
+                                         'FOXP3+ Tregs', 'CD68+ CD163+ TAMs' (pair gates to the
+                                         DE you actually saw; see the annotation knowledge card)
+- cell_state{sub: state}                exhausted / cycling / EMT-like / hypoxic / ... (optional)
+- confidence{sub: 0..1}, review_required{sub: bool}
+- evidence_for{sub:[...]}, evidence_against{sub:[...]}, confounders{sub:[...]}  reasoning trace
+Tiny subclusters (n_cells < merge floor) are auto-MERGED to '<compartment>_unresolved' + review;
+a call with empty evidence_for is forced review_required — surface those rather than overclaiming.
 """
 
 # ---------------------------------------------------------------------------
