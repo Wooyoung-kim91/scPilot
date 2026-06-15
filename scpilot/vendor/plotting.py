@@ -853,8 +853,14 @@ def save_dotplot(adata, cfg, base_path, groups, groupby, *, categories_order=Non
     def build(size, font, draft=False):
         w_in, h_in = size
         view = _draft_view(adata, draft)
+        # The draft subsample can drop a rare category entirely; categories_order must only list
+        # rows actually present in THIS view, or scanpy raises KeyError. The final render uses the
+        # full data (draft=False) so it keeps every category.
+        grp_v = view.obs[groupby].astype("category")
+        cats_v = [c for c in cats if (grp_v == c).to_numpy().any()]
+        n_groups_v = len(cats_v)
         plt.close("all")
-        dp = sc.pl.dotplot(view, groups, groupby=groupby, categories_order=cats,
+        dp = sc.pl.dotplot(view, groups, groupby=groupby, categories_order=cats_v,
                            figsize=(w_in, h_in), var_group_rotation=var_group_rotation,
                            layer=layer, swap_axes=swap_axes, standard_scale=standard_scale,
                            vmax=vmax, dendrogram=False, return_fig=True, show=False)
@@ -864,7 +870,7 @@ def save_dotplot(adata, cfg, base_path, groups, groupby, *, categories_order=Non
         # (legend/brackets take the rest); cells are kept ≥ dot_min_*_px by elements_cramped,
         # so the dots can't become invisibly small either.
         x_cell_in = w_in * 0.6 / max(n_genes, 1)
-        y_cell_in = h_in * 0.75 / max(n_groups, 1)
+        y_cell_in = h_in * 0.75 / max(n_groups_v, 1)
         cell_in = min(x_cell_in, y_cell_in)
         diam_pt = cell_in * 72.0 * dot_cell_frac        # ≤ cell → no neighbour overlap
         largest = float(diam_pt ** 2)                   # scanpy dot size = area (pt²)
