@@ -195,9 +195,9 @@ def _system_prompt(goal: str | None, tissue: str | None = None,
              prompts.ANNOTATION_REVIEW_PROMPT, prompts.TISSUE_CONTEXT_GUIDANCE,
              prompts.MALIGNANCY_PROMPT, prompts.FINE_ANNOTATION_PROMPT, prompts.DE_DESIGN_PROMPT]
     if resolutions:
-        # human-in-the-loop: the ONLY resolutions the agent may use (per embedding/model).
+        # clustering resolution(s) the agent must use (per embedding/model); 'all' applies to every stage.
         res = ", ".join(f"{k}={v}" for k, v in resolutions.items())
-        parts.insert(0, f"Human-set clustering resolution (use ONLY these; ask if one is missing): {res}\n")
+        parts.insert(0, f"Clustering resolution (use these; default 0.25 unless overridden): {res}\n")
     if tissue:
         parts.insert(0, f"TISSUE / CONTEXT: {tissue}\n")
     if goal:

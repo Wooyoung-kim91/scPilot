@@ -141,7 +141,7 @@ def run(
     tissue: str = typer.Option(None, "--tissue",
                                help="tissue/condition (e.g. 'human pancreas, PDAC') — soft annotation prior"),
     resolution: str = typer.Option(None, "--resolution",
-                                   help="HUMAN-set clustering resolution(s) (agent never auto-picks). "
+                                   help="clustering resolution(s) (default 0.25 at every stage if omitted). "
                                         "Single value '1.0' or per-embedding 'baseline=1.0,harmony=0.8,scvi=0.5'"),
     effort: str = typer.Option("high", "--effort", help="LLM effort level (high|medium|low)"),
     backend: str = typer.Option(None, "--backend",
@@ -190,14 +190,17 @@ def run(
     typer.secho(f"[scpilot run] backend={provider.name} model={provider.model} -> {wd}",
                 fg=typer.colors.CYAN, err=True)
 
-    # parse human-set clustering resolution(s): "1.0" -> {all:1.0}; "baseline=1.0,scvi=0.5" -> dict
-    resolutions = None
+    # parse clustering resolution(s): "1.0" -> {all:1.0}; "baseline=1.0,scvi=0.5" -> dict.
+    # When omitted, default to 0.25 at every stage (single source of truth = cluster.DEFAULT_RESOLUTION).
+    from scpilot.core.cluster import DEFAULT_RESOLUTION
     if resolution:
         if "=" in resolution:
             resolutions = {k.strip(): float(v) for k, v in
                            (kv.split("=", 1) for kv in resolution.split(","))}
         else:
             resolutions = {"all": float(resolution)}
+    else:
+        resolutions = {"all": DEFAULT_RESOLUTION}
 
     result = run_agent(session, provider, goal=goal, tissue=tissue, resolutions=resolutions,
                        seed=seed, max_iters=max_iters)

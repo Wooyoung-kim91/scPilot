@@ -13,6 +13,11 @@ import time
 from scpilot import schemas as S
 from scpilot.tools import register
 
+# Default leiden resolution applied at EVERY clustering stage (baseline / harmony / scVI /
+# compartment subsets) when the caller does not pass one. The user may still override per call
+# (or per embedding via `scpilot run --resolution`). Single source of truth for the default.
+DEFAULT_RESOLUTION = 0.25
+
 
 def _model_suffix(use_rep: str) -> str:
     """Derive a per-model suffix from the embedding key (X_pca→'' baseline; X_scVI→'scvi')."""
@@ -22,9 +27,9 @@ def _model_suffix(use_rep: str) -> str:
 
 
 @register("cluster", mutating=True,
-          description="neighbors → leiden → umap on a PCA/integration embedding. resolution is HUMAN-IN-THE-LOOP "
-                      "and REQUIRED (no auto-default) — the user sets it per clustering. ALL reductions kept "
-                      "per-model (baseline X_umap/leiden; X_umap_<model>/leiden_<model>) — never overwritten (plan B6).")
+          description="neighbors → leiden → umap on a PCA/integration embedding. resolution DEFAULTS to 0.25 at every "
+                      "clustering stage; the user may override per call (or per embedding via `scpilot run --resolution`). "
+                      "ALL reductions kept per-model (baseline X_umap/leiden; X_umap_<model>/leiden_<model>) — never overwritten (plan B6).")
 def cluster(session, *, use_rep: str = "X_pca", n_neighbors: int = 15, n_pcs: int | None = None,
             resolution: float | None = None, seed: int = 0, key_added: str | None = None,
             key_suffix: str | None = None, **params) -> S.ToolResult:
@@ -36,12 +41,10 @@ def cluster(session, *, use_rep: str = "X_pca", n_neighbors: int = 15, n_pcs: in
         return S.error("cluster", "invalid_state",
                        f"embedding '{use_rep}' absent in obsm{sorted(adata.obsm)} — run preprocess/integrate first",
                        recoverable=True, suggested_next_tools=["preprocess"])
-    # resolution is a human decision (plan: human-in-the-loop) — never silently defaulted.
-    if resolution is None:
-        return S.error("cluster", "missing_input",
-                       "clustering 'resolution' must be set explicitly by the user (human-in-the-loop) — "
-                       "pass resolution=<float>; scpilot does not auto-choose it.",
-                       recoverable=True)
+    # resolution defaults to 0.25 at every stage; an explicit value (per call / per embedding) wins.
+    resolution_defaulted = resolution is None
+    if resolution_defaulted:
+        resolution = DEFAULT_RESOLUTION
 
     # per-model namespacing so integration-before/after reductions all coexist
     suf = key_suffix if key_suffix is not None else _model_suffix(use_rep)
@@ -71,7 +74,8 @@ def cluster(session, *, use_rep: str = "X_pca", n_neighbors: int = 15, n_pcs: in
         "cluster_key": leiden_key, "umap_key": umap_key, "neighbors_key": nkey,
         "model_suffix": suf or "baseline", "use_rep": use_rep,
         "n_clusters": int(sizes.shape[0]),
-        "resolution": resolution, "n_neighbors": n_neighbors, "n_pcs": use_pcs,
+        "resolution": resolution, "resolution_defaulted": resolution_defaulted,
+        "n_neighbors": n_neighbors, "n_pcs": use_pcs,
         "cluster_sizes": {str(k): int(v) for k, v in sizes.items()},
         "smallest_cluster": int(sizes.min()), "largest_cluster": int(sizes.max()),
         "embeddings_present": sorted(adata.obsm.keys()),

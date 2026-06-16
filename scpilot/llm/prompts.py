@@ -127,10 +127,11 @@ GOLDEN RULES
   HVG/PC counts, integration method, annotation strategy, DE design), state the candidates
   you considered, your choice, and a one-line rationale in your prose BEFORE the tool call.
   The harness records this as a decision event.
-- CLUSTERING RESOLUTION IS HUMAN-IN-THE-LOOP — you do NOT choose it. The `cluster` tool
-  requires an explicit `resolution` and will not guess. Use ONLY the resolution(s) the user
-  provided (see "Human-set clustering resolution" in context). If a clustering step needs a
-  resolution the user has not given, STOP and ASK the user for it — never invent or default one.
+- CLUSTERING RESOLUTION DEFAULTS TO 0.25 at every clustering stage. Use the resolution(s) the
+  user provided (see "Clustering resolution" in context); when 'all' is given, apply it to every
+  embedding. Do NOT invent your own value — if you want to deviate from the given/default
+  resolution, state your reason and the candidate value, then proceed with the user-set one
+  unless told otherwise.
 - If a tool returns status="error", read error_code: `invalid_state` -> run the
   prerequisite tool first; `capability_unavailable`/`dependency_missing` -> skip that
   optional branch and continue; `data_gate_failed` -> do not retry that path.
@@ -141,8 +142,8 @@ CANONICAL FLOW (skip steps already satisfied per detect_state; stop when the goa
    rate). qc_filter -> choose cutoffs that are permissive enough to keep real biology
    (avoid global cutoffs that erase sample/tissue-specific populations).
 3. preprocess -> from variance_ratio + suggested_n_pcs_elbow choose n_top_genes and n_pcs.
-4. cluster (baseline, use_rep=X_pca) -> pick a resolution giving interpretable, not
-   over-fragmented, clusters. markers -> per-cluster ranked DE (Wilcoxon, with pts).
+4. cluster (baseline, use_rep=X_pca) -> uses resolution 0.25 by default (or the user-set value).
+   markers -> per-cluster ranked DE (Wilcoxon, with pts).
 5. Tier-1 annotation is MARKER-DB-FREE — do NOT use a fixed marker panel (annotate_broad is
    legacy/opt-in only): call annotation_review -> read each cluster's de_table and INFER its
    broad cell type from the DE itself (see the annotation-review prompt; apply the tissue
@@ -153,12 +154,12 @@ CANONICAL FLOW (skip steps already satisfied per detect_state; stop when the goa
    (or train_scvi). Then, FOR EACH embedding separately — baseline X_pca AND every
    integration (X_harmony, X_scVI) — repeat the SAME annotation pipeline on that
    embedding's own clustering:
-     cluster(use_rep=<emb>, resolution=<HUMAN-set for this embedding>)
+     cluster(use_rep=<emb>, resolution=<user-set for this embedding, else default 0.25>)
        -> markers(groupby=<that leiden key>)
        -> annotation_review(groupby=<that leiden key>, tissue=...)
        -> apply_annotation(groupby=<that leiden key>, key=major_cell_type_<model>, labels=...)
    Keep each method's labels in a DISTINCT key (major_cell_type / _harmony / _scvi) so they
-   coexist and can be compared. Ask the user for each embedding's resolution before clustering.
+   coexist and can be compared. Each embedding uses resolution 0.25 by default (or the user-set value).
 7. Benchmark the integration methods — but FIRST fix the label_key circularity (de-risk ①):
    a. consensus_annotation(keys=[major_cell_type_merge, _harmony, _scvi, ...]) -> a per-cell
       EMBEDDING-INDEPENDENT consensus label (majority vote; disagreements -> 'ambiguous').
@@ -193,7 +194,7 @@ CANONICAL FLOW (skip steps already satisfied per detect_state; stop when the goa
    b. For each chosen compartment: compartment_subset(compartment, mode='clustering',
       use_rep=<chosen integration emb>) to subcluster on the batch-corrected embedding (or
       mode='markers' to re-derive compartment-relevant HVGs). Then cluster(use_rep, resolution=
-      <HUMAN-set>) -> markers(groupby=<subset leiden>) on the SUBSET.
+      <user-set, else default 0.25>) -> markers(groupby=<subset leiden>) on the SUBSET.
    c. fine_annotation_review(groupby=<subset leiden>) -> read each subcluster's DE + confounders;
       INFER fine_cell_type + a FACS-style label from the DE (see FINE_ANNOTATION_PROMPT; keep
       type vs state separate). apply_fine_annotation(groupby, fine_labels, facs_labels, cell_state,

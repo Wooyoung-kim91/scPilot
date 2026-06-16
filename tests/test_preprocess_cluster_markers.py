@@ -86,13 +86,19 @@ def test_cluster_and_markers_chain(tmp_path):
     rm.to_dict()
 
 
-def test_cluster_requires_explicit_resolution(tmp_path):
-    # resolution is human-in-the-loop: cluster refuses to guess it
+def test_cluster_defaults_resolution(tmp_path):
+    # resolution defaults to 0.25 at every stage when the caller omits it
+    from scpilot.core.cluster import DEFAULT_RESOLUTION
     s = _session(tmp_path)
     tools.run("preprocess", s, n_top_genes=100, n_pcs=20)
     r = tools.run("cluster", s, use_rep="X_pca")             # no resolution given
-    assert r.status == "error" and r.error_code == "missing_input"
-    assert "resolution" in (r.error or "")
+    assert r.status == "success"
+    assert r.summary["resolution"] == DEFAULT_RESOLUTION == 0.25
+    assert r.summary["resolution_defaulted"] is True
+    # an explicit value still wins and is not flagged as defaulted
+    r2 = tools.run("cluster", s, use_rep="X_pca", resolution=0.5)
+    assert r2.summary["resolution"] == 0.5
+    assert r2.summary["resolution_defaulted"] is False
 
 
 def test_cluster_preserves_reductions_per_model(tmp_path):
