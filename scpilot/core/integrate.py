@@ -106,6 +106,7 @@ def integrate_scvi(session, *, model_dir: str = DEFAULT_SCVI_MODEL, out_key: str
                       "(plan B9b). For data without a compatible pretrained model (e.g. PDAC+Control). CPU = slow.")
 def train_scvi(session, *, batch_key: str = "GSM", n_latent: int = 30, n_layers: int = 2,
                max_epochs: int | None = None, out_key: str = "X_scVI", model_out: str | None = None,
+               num_workers: int | None = None, batch_size: int | None = None,
                seed: int = 0, **params) -> S.ToolResult:
     import time as _t
     from pathlib import Path as _P
@@ -123,10 +124,16 @@ def train_scvi(session, *, batch_key: str = "GSM", n_latent: int = 30, n_layers:
                        suggested_next_tools=["preprocess"])
 
     scvi.settings.seed = seed
+    # CPU throughput: overlap sparse->dense batch loading across workers (default 0 = single-thread bottleneck)
+    if num_workers is not None:
+        scvi.settings.dl_num_workers = int(num_workers)
     sub = adata[:, adata.var["highly_variable"]].copy()      # train on HVG counts
     scvi.model.SCVI.setup_anndata(sub, layer="counts", batch_key=batch_key)
     model = scvi.model.SCVI(sub, n_latent=n_latent, n_layers=n_layers)
-    model.train(max_epochs=max_epochs, early_stopping=True, accelerator="cpu")
+    train_kwargs = {"max_epochs": max_epochs, "early_stopping": True, "accelerator": "cpu"}
+    if batch_size is not None:
+        train_kwargs["batch_size"] = int(batch_size)
+    model.train(**train_kwargs)
     epochs_run = len(model.history.get("elbo_train", []))
 
     out = model_out or str(_P(session.out) / "models" / f"scvi_{batch_key}_trained")
@@ -138,11 +145,13 @@ def train_scvi(session, *, batch_key: str = "GSM", n_latent: int = 30, n_layers:
         "n_latent": n_latent, "n_layers": n_layers, "n_hvg": int(sub.n_vars),
         "n_cells": int(adata.n_obs), "epochs_run": int(epochs_run),
         "train_time_s": round(_t.time() - t0, 1), "model_out": out,
+        "num_workers": num_workers, "batch_size": batch_size,
         "embeddings_present": sorted(adata.obsm.keys()),
     }
     cp = session.checkpoint("train_scvi", x_state=session.manifest.x_state,
                             params={"batch_key": batch_key, "n_latent": n_latent, "n_layers": n_layers,
-                                    "max_epochs": max_epochs, "out_key": out_key, "model_out": out, "seed": seed})
+                                    "max_epochs": max_epochs, "out_key": out_key, "model_out": out,
+                                    "num_workers": num_workers, "batch_size": batch_size, "seed": seed})
     return S.success("train_scvi", summary=summary, checkpoint=cp.path, determinism_grade="B",
                      duration_s=round(_t.time() - t0, 1),
                      suggested_next_tools=["cluster", "benchmark"])

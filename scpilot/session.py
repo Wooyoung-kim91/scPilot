@@ -112,6 +112,62 @@ if __name__ == "__main__":
 '''
 
 
+# Cell-delimited (jupytext "percent") notebook — open directly in Jupyter/VSCode and run
+# CELL BY CELL: each step prints its result summary and renders its plot inline. MCP-free
+# (uses the pinned scpilot package only). This is the human-facing, visual repro artifact.
+_NOTEBOOK_TEMPLATE = '''# %% [markdown]
+# # scpilot pipeline — reproducible notebook (AUTO-GENERATED)
+# Run top-to-bottom, **cell by cell**, to watch every step: each prints its result
+# summary and renders its plot inline. No MCP server needed.
+#
+# Provenance:
+# {prov_md}
+#
+# Input: `{input_cp}`
+
+# %%
+import json, sys
+from pathlib import Path
+# RISK #21: resolve the pinned-source dir relative to THIS file (robust to the run CWD);
+# fall back to CWD only in interactive sessions where __file__ is undefined.
+try:
+    _HERE = Path(__file__).resolve().parent
+except NameError:
+    _HERE = Path.cwd()
+sys.path.insert(0, str(_HERE / "{snapshot_rel}"))   # pin exact scpilot source
+_RUN_DIR = _HERE.parent                              # code/ -> session root
+try:
+    from IPython.display import Image, display
+except Exception:                       # noqa: BLE001 — allow plain `python` execution too
+    def display(x): print(x)
+    def Image(filename=None): return f"[plot] {{filename}}"
+
+from scpilot import tools
+from scpilot.repro import set_global_seed
+from scpilot.session import Session
+from scpilot.core.autoplot import auto_plots
+
+set_global_seed({seed})
+sess = Session.create(str(_RUN_DIR / "repro_notebook"), input_path=r"{input_cp}", exist_ok=True)
+sess.load_input()
+
+def _show(stage, res):
+    print(json.dumps(res.summary, indent=2, default=str)[:2500])
+    for _a in (auto_plots(sess, stage, res.summary) or []):
+        if getattr(_a, "kind", None) == "png":
+            display(Image(filename=_a.path))
+{cells}
+'''
+
+
+def _notebook_cell(cid: str, stage: str, params: dict) -> str:
+    """One markdown + one code cell for a pipeline step (percent format)."""
+    return (
+        f'\n# %% [markdown]\n# ## {cid} · {stage}\n# params: `{params!r}`\n\n'
+        f'# %%\n_res = tools.run("{stage}", sess, **{params!r})\n_show("{stage}", _res)\n'
+    )
+
+
 def counts_fingerprint(adata) -> dict | None:
     """Fingerprint of ``layers['counts']`` to detect accidental mutation.
 
@@ -205,6 +261,10 @@ class Session:
     @property
     def decisions_path(self) -> Path:
         return self.out / "decisions.jsonl"
+
+    @property
+    def reasoning_log_path(self) -> Path:
+        return self.out / "reasoning_log.md"
 
     def _ensure_dirs(self) -> None:
         for d in (self.out, self.checkpoints_dir, self.artifacts_dir, self.logs_dir):
@@ -340,7 +400,12 @@ class Session:
                         params=params or {})
         self.manifest.checkpoints.append(cp.__dict__)
         # (re)write the FULL pipeline script (entire flow, all steps, + inlined tool source)
+        # + the cell-by-cell Jupyter notebook (MCP-free, plots inline) for human replay
         self.manifest.pipeline_script = self._write_pipeline()
+        try:
+            self._write_notebook()
+        except Exception:  # noqa: BLE001 — notebook emission must never break a checkpoint
+            pass
         self.manifest.stage = stage
         if self.manifest.counts_fingerprint is None:
             self.manifest.counts_fingerprint = counts_fingerprint(a)
@@ -405,6 +470,31 @@ class Session:
             tmp.write_text(text)
         return str(path)
 
+    def _write_notebook(self) -> str:
+        """(Re)write code/pipeline_notebook.py — a jupytext cell-delimited notebook that
+        runs CELL BY CELL in Jupyter, printing each step's summary and rendering its plot
+        inline. MCP-free (pinned scpilot package only). The human-facing visual repro."""
+        self.code_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_rel = self._snapshot_source()
+        prov = build_provenance()
+        prov_md = "\n".join(
+            f"# - {k}: {prov.get(k)}" for k in ("scpilot_version", "source_hash", "git_commit", "timestamp"))
+        inp = self.manifest.input.get("path", "")
+        seed = 0
+        cells = []
+        for cp in self.manifest.checkpoints:
+            params = cp.get("params", {}) or {}
+            if "seed" in params:
+                seed = int(params["seed"])
+            cells.append(_notebook_cell(cp["id"], cp["stage"], params))
+        text = _NOTEBOOK_TEMPLATE.format(
+            prov_md=prov_md, input_cp=inp, snapshot_rel=snapshot_rel, seed=seed,
+            cells="".join(cells) if cells else "")
+        path = self.code_dir / "pipeline_notebook.py"
+        with atomic_path(path) as tmp:
+            tmp.write_text(text)
+        return str(path)
+
     # ---------- append-only logs ----------
     def log_run(self, record: dict) -> None:
         """Append one tool-run record to run_log.jsonl (full schema frozen in A7)."""
@@ -428,6 +518,36 @@ class Session:
                 raise ValueError(f"invalid decision event: {problems}")
         rec = {"ts": _now(), "session_id": self.manifest.session_id, **record}
         self._append_jsonl(self.decisions_path, rec)
+
+    def log_reasoning(self, *, tool: str, params: dict | None = None, summary: dict | None = None,
+                      reasoning: str | None = None, status: str = "success",
+                      checkpoint: str | None = None, plots: list | None = None) -> None:
+        """Append a human-readable Markdown entry to reasoning_log.md — one section per
+        tool run so the analysis can be read top-to-bottom as a narrative (plan: result
+        plot + reasoning rule). ``reasoning`` is the caller/LLM's WHY (optional); the rest
+        is auto-captured from the ToolResult so a log entry exists even without an LLM note.
+        """
+        n = self.manifest.n_runs
+        lines = [f"\n## {n:02d} · {tool}  ({status})  {_now()}"]
+        if reasoning:
+            lines.append(f"\n**Reasoning:** {reasoning}")
+        if params:
+            kv = ", ".join(f"`{k}={v}`" for k, v in params.items() if k != "reasoning")
+            if kv:
+                lines.append(f"\n**Params:** {kv}")
+        if summary:
+            keys = ("n_cells", "n_genes", "n_clusters", "n_hvg", "n_samples_merged",
+                    "label_distribution", "best", "ranking_by_total", "n_cells_after",
+                    "scores", "out_key", "label_key")
+            picked = {k: summary[k] for k in keys if k in summary}
+            if picked:
+                lines.append("\n**Result:** " + "; ".join(f"{k}={v}" for k, v in picked.items()))
+        if plots:
+            for p in plots:
+                lines.append(f"\n![{tool}]({p})")
+        self.reasoning_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.reasoning_log_path, "a") as fh:
+            fh.write("\n".join(lines) + "\n")
 
     @staticmethod
     def _append_jsonl(path: Path, record: dict) -> None:

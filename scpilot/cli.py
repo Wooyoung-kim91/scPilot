@@ -90,6 +90,7 @@ def step(
         raise typer.Exit(code=2)
 
     params = _parse_params(param or [])
+    reasoning = params.pop("reasoning", None)   # narration for reasoning_log.md, not a tool param
     seed_rec = set_global_seed(seed)
     wd = workdir or DEFAULT_RUN_DIR
     if inp is None and not (Path(wd) / Session.MANIFEST).exists():
@@ -99,12 +100,28 @@ def step(
     session = Session.create(wd, input_path=inp)   # inp None on resume → opens existing session
 
     result = spec.fn(session, **params)
+    # result-plot rule: attach a stage-appropriate figure so every step returns a plot
+    if result.status == "success":
+        try:
+            from scpilot.core.autoplot import auto_plots
+            extra = auto_plots(session, stage, result.summary)
+            if extra:
+                result.artifacts = list(result.artifacts or []) + extra
+        except Exception:  # noqa: BLE001 — a missing plot must never break the step
+            pass
     session.log_run(S.RunLogRecord(
         tool=stage, status=result.status, params=params, summary=result.summary, seed=seed,
         determinism_grade=result.determinism_grade,
         output_checkpoint=result.checkpoint, error_code=result.error_code,
         duration_s=result.duration_s, lib_versions={"seed_record": seed_rec},
     ).to_dict())
+    try:
+        plot_paths = [a.path for a in (result.artifacts or []) if getattr(a, "kind", None) == "png"]
+        session.log_reasoning(tool=stage, params=params, summary=result.summary,
+                              reasoning=reasoning, status=result.status,
+                              checkpoint=result.checkpoint, plots=plot_paths)
+    except Exception:  # noqa: BLE001 — logging must never break the result
+        pass
 
     typer.echo(json.dumps(result.to_dict(), indent=2))
     raise typer.Exit(code=0 if result.status == "success" else 1)
