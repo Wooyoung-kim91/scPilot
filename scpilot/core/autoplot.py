@@ -55,6 +55,10 @@ def plan_autoplots(tool: str, summary: dict, *, obs: set, obsm: set) -> list[dic
         key = summary.get("out_key")
         if key and key in obs:
             specs.append({"kind": "umap", "color": key, "basis": _best_basis(obsm)})
+    elif tool == "merge_fine_annotations":
+        key = summary.get("fine_key", "fine_cell_type")
+        if key in obs:
+            specs.append({"kind": "umap", "color": key, "basis": _best_basis(obsm)})
     return specs
 
 

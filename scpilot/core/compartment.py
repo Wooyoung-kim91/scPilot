@@ -314,3 +314,122 @@ def compartment_subset(session, *, compartment: str | None = None, groupby: str 
                      warnings=warnings, determinism_grade=grade, duration_s=round(time.time() - t0, 3),
                      params=resolved,
                      suggested_next_tools=["cluster"] if mode == "clustering" else ["cluster", "markers"])
+
+
+# --------------------------------------------------------------------------- #
+# Tool 3 — assemble Tier-3 fine labels back onto the parent (B11 closing step)
+# --------------------------------------------------------------------------- #
+def _latest_fine_checkpoint(comp_dir, fine_key: str):
+    """Return the highest-numbered checkpoint .h5ad under comp_dir/checkpoints whose
+    obs carries ``fine_key`` (the per-compartment fine result), else None."""
+    from pathlib import Path
+    import anndata as ad
+    cps = sorted((Path(comp_dir) / "checkpoints").glob("*.h5ad"), reverse=True)
+    for cp in cps:
+        try:
+            obs = ad.read_h5ad(cp, backed="r").obs
+        except Exception:  # noqa: BLE001
+            continue
+        if fine_key in obs.columns:
+            return cp
+    return None
+
+
+@register("merge_fine_annotations", mutating=True,
+          description="Assemble Tier-3 FINE labels from per-compartment subset sessions back onto the PARENT "
+                      "dataset by cell barcode (obs_names) — the harness-tracked closing step of the compartment "
+                      "loop (replaces an out-of-session merge script). Pass compartments_root (globs each "
+                      "<root>/<compartment>/checkpoints for its latest fine checkpoint) or explicit "
+                      "compartment_checkpoints paths. Cells in no subclustered compartment carry their Tier-1 "
+                      "major_cell_type forward (carry_terminal). Writes obs[fine_key]/[facs_key]/[cell_state] + a "
+                      "provenance-stamped checkpoint, so the final annotation is fully reproducible.")
+def merge_fine_annotations(session, *, compartments_root: str | None = None,
+                           compartment_checkpoints: list | None = None,
+                           fine_key: str = "fine_cell_type", facs_key: str = "facs_style_label",
+                           state_key: str = "cell_state", major_key: str = "major_cell_type",
+                           carry_terminal: bool = True, **params) -> S.ToolResult:
+    from pathlib import Path
+
+    import anndata as ad
+    import pandas as pd
+
+    t0 = time.time()
+    adata = session.adata
+    if major_key not in adata.obs.columns:
+        return S.error("merge_fine_annotations", "invalid_state",
+                       f"parent lacks Tier-1 '{major_key}' — run apply_annotation first", recoverable=True,
+                       suggested_next_tools=["apply_annotation"])
+
+    # resolve the source per-compartment checkpoints
+    sources: list = []
+    if compartment_checkpoints:
+        sources = [Path(p) for p in compartment_checkpoints]
+    elif compartments_root:
+        root = Path(compartments_root)
+        if not root.exists():
+            return S.error("merge_fine_annotations", "missing_input",
+                           f"compartments_root not found: {root}", recoverable=True)
+        for comp_dir in sorted(d for d in root.iterdir() if d.is_dir()):
+            cp = _latest_fine_checkpoint(comp_dir, fine_key)
+            if cp is not None:
+                sources.append(cp)
+    if not sources:
+        return S.error("merge_fine_annotations", "missing_input",
+                       "no fine-annotation checkpoints found (pass compartments_root or compartment_checkpoints)",
+                       recoverable=True, suggested_next_tools=["compartment_subset", "apply_fine_annotation"])
+
+    n_parent = int(adata.n_obs)
+    fine = pd.Series(index=adata.obs_names, dtype=object)
+    facs = pd.Series(index=adata.obs_names, dtype=object)
+    state = pd.Series(index=adata.obs_names, dtype=object)
+
+    per_source, warnings = [], []
+    for src in sources:
+        try:
+            sub_obs = ad.read_h5ad(src, backed="r").obs
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"unreadable source skipped: {src} ({type(exc).__name__})")
+            continue
+        if fine_key not in sub_obs.columns:
+            warnings.append(f"no '{fine_key}' in {src} — skipped")
+            continue
+        idx = sub_obs.index.intersection(adata.obs_names)         # map by barcode
+        n_overlap = int(len(idx))
+        # don't let one compartment overwrite another's already-assigned cells
+        free = idx[fine.loc[idx].isna().values]
+        fine.loc[free] = sub_obs.loc[free, fine_key].astype(str).values
+        if facs_key in sub_obs.columns:
+            facs.loc[free] = sub_obs.loc[free, facs_key].astype(str).values
+        if state_key in sub_obs.columns:
+            state.loc[free] = sub_obs.loc[free, state_key].astype(str).values
+        per_source.append({"source": str(src), "n_overlap": n_overlap, "n_written": int(len(free))})
+
+    n_from_compartments = int(fine.notna().sum())
+    maj = adata.obs[major_key].astype(str)
+    n_carried = 0
+    if carry_terminal:
+        unset = fine.isna()
+        n_carried = int(unset.sum())
+        fine.loc[unset.values] = maj[unset.values].values
+    n_uncovered = int(fine.isna().sum())
+    if n_uncovered:
+        warnings.append(f"{n_uncovered} cells left unlabeled (carry_terminal={carry_terminal})")
+
+    adata.obs[fine_key] = pd.Categorical(fine.astype(str))
+    adata.obs[facs_key] = facs.fillna("").astype(str)
+    adata.obs[state_key] = state.fillna("").astype(str)
+
+    dist = adata.obs[fine_key].value_counts()
+    resolved = {"compartments_root": str(compartments_root) if compartments_root else None,
+                "n_sources": len(per_source), "fine_key": fine_key, "carry_terminal": carry_terminal}
+    cp = session.checkpoint("merge_fine_annotations", x_state=session.manifest.x_state, params=resolved)
+    summary = {
+        "fine_key": fine_key, "n_parent_cells": n_parent, "n_sources": len(per_source),
+        "n_from_compartments": n_from_compartments, "n_carried_terminal": n_carried,
+        "n_uncovered": n_uncovered, "n_fine_types": int(adata.obs[fine_key].nunique()),
+        "per_source": per_source,
+        "label_distribution": {str(k): int(v) for k, v in dist.head(40).items()},
+    }
+    return S.success("merge_fine_annotations", summary=summary, checkpoint=cp.path,
+                     warnings=warnings, determinism_grade="A", duration_s=round(time.time() - t0, 3),
+                     params=resolved, suggested_next_tools=["plots", "report"])
