@@ -51,6 +51,11 @@ def plan_autoplots(tool: str, summary: dict, *, obs: set, obsm: set) -> list[dic
         key = summary.get("fine_key", "fine_cell_type")
         if key in obs:
             specs.append({"kind": "umap", "color": key, "basis": _best_basis(obsm)})
+        # dotplot of per-subcluster marker evidence (DE was just computed on the subcluster
+        # key by `markers`, so derive from it); gives every compartment a marker dotplot too.
+        gb = summary.get("groupby")
+        if gb and gb in obs:
+            specs.append({"kind": "dotplot", "groupby": gb})
     elif tool == "consensus_annotation":
         key = summary.get("out_key")
         if key and key in obs:

@@ -115,17 +115,32 @@ def plots(session, *, kind: str = "umap", color: str | None = None,
         elif kind == "dotplot":
             # annotation dotplot: sc.pl.dotplot with marker panels AS A DICT → cell-type
             # brackets + labels above the x-axis (built-in var-group rendering).
-            from scpilot.core.annotate import BROAD_MARKERS
+            from scpilot.core.annotate import BROAD_MARKERS, derive_dotplot_markers
             gb = groupby or ("major_cell_type" if "major_cell_type" in adata.obs else "leiden")
             if gb not in adata.obs:
                 return S.error("plots", "invalid_state",
                                f"groupby '{gb}' absent — run annotate_broad/cluster first",
                                recoverable=True, suggested_next_tools=["annotate_broad"])
-            src = marker_groups or BROAD_MARKERS
+            # marker source priority: caller panel > DATA-DRIVEN derivation from this groupby's DE
+            # (organism-agnostic — works for mouse fine types) > human BROAD_MARKERS fallback.
+            src = marker_groups
+            if src is None:
+                rg = adata.uns.get("rank_genes_groups")
+                if rg and rg.get("params", {}).get("groupby") == gb:
+                    try:
+                        labels = [str(c) for c in adata.obs[gb].astype("category").cat.categories]
+                        src = derive_dotplot_markers(adata, cluster_key=gb,
+                                                     label_map={lab: lab for lab in labels})
+                    except Exception:  # noqa: BLE001 — fall through to the fixed panel
+                        src = None
+                if not src:
+                    src = BROAD_MARKERS
             groups = {ct: [g for g in gs if g in adata.var_names] for ct, gs in src.items()}
             groups = {ct: gs for ct, gs in groups.items() if gs}   # drop empty panels
             if not groups:
-                return S.error("plots", "data_gate_failed", "no marker-panel genes present", recoverable=False)
+                return S.error("plots", "data_gate_failed",
+                               "no marker-panel genes present (pass marker_groups or run markers on this groupby)",
+                               recoverable=False)
 
             # candidate y-axis set (paneled cell types first, non-panel labels trailing);
             # save_dotplot then runs the DATA-DRIVEN staircase — it reorders rows by the marker
