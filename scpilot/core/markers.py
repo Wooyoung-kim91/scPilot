@@ -59,7 +59,11 @@ def markers(session, *, groupby: str = "leiden", n_genes: int = 25, layer: str |
                                "n_samples": n_samp, "top_genes": [str(x) for x in names[:10]]})
 
     full_df = pd.DataFrame(rows)
-    csv_path = session.artifacts_dir / "markers_full.csv"
+    # key the CSV by the clustering it ranks so per-reduction DE (leiden / leiden_harmony /
+    # leiden_scvi) ALL persist — a fixed name would overwrite earlier reductions' DE.
+    import re as _re
+    safe_gb = _re.sub(r"[^0-9A-Za-z]+", "_", str(groupby)).strip("_") or "groupby"
+    csv_path = session.artifacts_dir / f"markers_{safe_gb}.csv"
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     full_df.to_csv(csv_path, index=False)
 
