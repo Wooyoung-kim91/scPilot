@@ -740,15 +740,38 @@ def save_umap(adata, cfg, base_path, color, size_pt=UMAP_DOT_SIZE_PT, logger=Non
     n = adata.obs[color].nunique() if cat else None
     emb = basis[2:] if basis.startswith("X_") else basis   # sc.pl.embedding strips the X_ prefix itself
 
+    # Legend categories + colours are taken from the FULL data (not the draft subsample) so
+    # the size search measures the REAL legend, and a fixed category→colour map is passed to
+    # every render so the draft and final point colours match (a subsample can otherwise drop
+    # rare categories from scanpy's auto palette and shift every colour). When the key has no
+    # colours yet (a freshly created label like fine_cell_type), generate the scanpy-default
+    # categorical palette ONCE and pin it in uns so legend + points agree.
+    full_cats, full_colors = (None, None)
+    if cat:
+        full_cats = list(adata.obs[color].astype("category").cat.categories)
+        pcfg = plotting_cfg(cfg)
+        if pcfg["palette"] is not None or pcfg["palette_overrides"].get(color):
+            full_colors = palette_for(cfg, color, full_cats)
+        else:
+            existing = list(adata.uns.get(f"{color}_colors", []))
+            if len(existing) >= len(full_cats):
+                full_colors = existing[:len(full_cats)]
+            else:
+                from scanpy.plotting import palettes as _pal
+                base = (_pal.default_20 if len(full_cats) <= 20 else
+                        _pal.default_28 if len(full_cats) <= 28 else _pal.default_102)
+                full_colors = [base[i % len(base)] for i in range(len(full_cats))]
+            adata.uns[f"{color}_colors"] = full_colors
+
     def build(size, font, draft=False):
         ad = _draft_view(adata, draft)
         fig = _new_fig(size)
         ax = fig.subplots()
         sc.pl.embedding(ad, basis=emb, color=color, size=size_pt, ax=ax, show=False,
-                        color_map=cmap, legend_loc=None, colorbar_loc=None)
+                        color_map=cmap, legend_loc=None, colorbar_loc=None,
+                        palette=full_colors if cat else None)
         if cat:
-            cats, colors = _legend_cats_colors(ad, color, cfg)
-            _add_cat_legend(fig, cats, colors, font=font, marker_pt=mk,
+            _add_cat_legend(fig, full_cats, full_colors, font=font, marker_pt=mk,
                             fig_h_in=size[1], fig_w_in=size[0], force_right=True)
         else:
             _add_colorbar(fig, [ax], ad.obs[color], cmap, font=font, label=color)
@@ -759,9 +782,20 @@ def save_umap(adata, cfg, base_path, color, size_pt=UMAP_DOT_SIZE_PT, logger=Non
     # height → the square panel + FIXED dot size are identical across integration methods
     # (X_umap / X_umap_harmony / X_umap_scVI), so they are directly comparable; the legend
     # widens the figure (never taller) and the width is hard-capped at 2 col.
+    #
+    # EXCEPTION — high-cardinality keys (fine cell types, ~20-40 categories): a right-side
+    # legend can't fit that many rows at 1-col height, so it spills into extra columns that
+    # collide with each other / the title (text_overlap). For n > 14 we let the figure grow
+    # TALLER (up to 2 col) so the legend fits in a single column. Broad comparison UMAPs
+    # (≤14 types) keep the fixed 1-col height, preserving cross-method comparability.
     if cat:
+        max_h = 1.0
+        if n is not None and n > 14:
+            p = plotting_cfg(cfg)
+            need_in = n * p["base_font_pt"] * 1.7 / 72.0 * 1.1   # single-column legend height + headroom
+            max_h = round(min(2.0, max(1.0, need_in / p["column_width_in"])), 2)
         overrides = {"start_col": 1.0, "step_col": 0.25, "max_w_col": 2.0,
-                     "max_h_col": 1.0, "square_limit_col": None}
+                     "max_h_col": max_h, "square_limit_col": None}
         return fit_and_save(build, cfg, base_path, n_categories=None,
                             overrides=overrides, logger=logger)
     return fit_and_save(build, cfg, base_path, logger=logger)   # continuous → auto-fit
