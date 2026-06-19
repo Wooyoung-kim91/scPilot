@@ -64,7 +64,7 @@ def _artifacts_from_fit(fit, cfg) -> list[S.Artifact]:
                       "size/colour legend ≤5% of the figure (many-category umap uses a generous canvas).")
 def plots(session, *, kind: str = "umap", color: str | None = None,
           basis: str = "X_umap", keys: list | None = None, groupby: str | None = None,
-          marker_groups: dict | None = None, **params) -> S.ToolResult:
+          marker_groups: dict | None = None, order: list | None = None, **params) -> S.ToolResult:
     import matplotlib
     matplotlib.use("Agg")  # headless (MCP/CLI: no display)
 
@@ -129,12 +129,18 @@ def plots(session, *, kind: str = "umap", color: str | None = None,
                 if rg and rg.get("params", {}).get("groupby") == gb:
                     try:
                         labels = [str(c) for c in adata.obs[gb].astype("category").cat.categories]
+                        # `order` = caller lineage order (LAYOUT only) so rows group by cell
+                        # family, not by abundance; staircase then follows this panel order.
                         src = derive_dotplot_markers(adata, cluster_key=gb,
-                                                     label_map={lab: lab for lab in labels})
+                                                     label_map={lab: lab for lab in labels},
+                                                     order=order)
                     except Exception:  # noqa: BLE001 — fall through to the fixed panel
                         src = None
                 if not src:
                     src = BROAD_MARKERS
+            # honour an explicit lineage `order` even when marker_groups was supplied directly
+            if order and marker_groups:
+                src = {ct: src[ct] for ct in order if ct in src} | {ct: gs for ct, gs in src.items() if ct not in order}
             groups = {ct: [g for g in gs if g in adata.var_names] for ct, gs in src.items()}
             groups = {ct: gs for ct, gs in groups.items() if gs}   # drop empty panels
             if not groups:
@@ -142,9 +148,8 @@ def plots(session, *, kind: str = "umap", color: str | None = None,
                                "no marker-panel genes present (pass marker_groups or run markers on this groupby)",
                                recoverable=False)
 
-            # candidate y-axis set (paneled cell types first, non-panel labels trailing);
-            # save_dotplot then runs the DATA-DRIVEN staircase — it reorders rows by the marker
-            # block each cell type actually peaks in and flags any that peak off their own panel.
+            # y-axis rows follow the (now lineage-ordered) panel order; save_dotplot's staircase
+            # keeps each cell type under its own marker bracket in that biological order.
             present = list(adata.obs[gb].astype("category").cat.categories)
             cats_order = [ct for ct in groups if ct in present]
             cats_order += [ct for ct in present if ct not in cats_order]
