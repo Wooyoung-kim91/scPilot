@@ -518,3 +518,42 @@ def test_derive_dotplot_markers_family_contiguous():
     order = list(panels)
     mac = [i for i, ct in enumerate(order) if ct.startswith("Macrophage")]
     assert len(mac) == 2 and mac[1] == mac[0] + 1, order      # Macrophage* block is contiguous
+
+
+def test_phase_b_annotation_evidence(tmp_path):
+    # mean_in exposure + marker_sets recording + broad dotplot (recorded + derived paths)
+    import json
+
+    from scpilot import tools
+    from scpilot.repro import set_global_seed
+
+    inp = tmp_path / "in.h5ad"
+    _two_group_adata(n_obs=220, n_vars=120).write_h5ad(inp)
+    set_global_seed(0)
+    s = Session.create(tmp_path / "sess", input_path=str(inp))
+    s.load_input()
+    assert tools.run("preprocess", s, n_top_genes=60, n_pcs=15).status == "success"
+    assert tools.run("cluster", s, resolution=0.5).status == "success"
+    assert tools.run("markers", s, groupby="leiden").status == "success"
+
+    rev = tools.run("annotation_review", s, groupby="leiden")
+    assert rev.status == "success"
+    art = next(a.path for a in rev.artifacts if a.path.endswith("annotation_review.json"))
+    data = json.loads(open(art).read())
+    de0 = data["clusters"][0]["de_table"]
+    assert de0 and "mean_in" in de0[0]                       # (1) expression exposed alongside pct
+
+    clusters = [str(c["cluster_id"]) for c in data["clusters"]]
+    labels = {c: ("Macrophage SPP1+" if i == 0 else f"Type{i}") for i, c in enumerate(clusters)}
+    ms = {labels[clusters[0]]: ["G0", "G1", "G2"]}
+    ap = tools.run("apply_annotation", s, groupby="leiden", labels=labels, marker_sets=ms)
+    assert ap.status == "success"
+    assert ap.summary["marker_sets"] == {labels[clusters[0]]: ["G0", "G1", "G2"]}   # (2) recorded
+
+    # (3) broad dotplot via the recorded marker_sets (rows = major_cell_type)
+    d1 = tools.run("plots", s, kind="dotplot", groupby="major_cell_type", marker_groups=ms)
+    assert d1.status == "success" and d1.artifacts
+    # (4) broad dotplot via the derived path (leiden DE mapped through label_map)
+    d2 = tools.run("plots", s, kind="dotplot", groupby="major_cell_type",
+                   cluster_key="leiden", label_map=labels)
+    assert d2.status == "success" and d2.artifacts

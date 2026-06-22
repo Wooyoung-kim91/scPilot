@@ -90,6 +90,9 @@ _PARAM_HINTS: dict[str, dict] = {
     "apply_annotation": {
         "groupby": {"type": "string", "description": "cluster key the labels are keyed on (leiden)"},
         "labels": {"type": "object", "description": "cluster_id -> broad cell type (inferred from DE, NO panel)"},
+        "marker_sets": {"type": "object",
+                        "description": "cell_type -> [>=3 genes] chosen combination (high mean_in + high spec); "
+                                       "the annotation evidence + broad dotplot panels"},
         "confidence": {"type": "object", "description": "optional cluster_id -> 0..1 confidence"},
         "review_required": {"type": "object", "description": "optional cluster_id -> bool"},
         "tissue": {"type": "string", "description": "tissue/condition context"}},

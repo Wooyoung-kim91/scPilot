@@ -104,6 +104,15 @@ def plan_autoplots(tool: str, summary: dict, *, obs: set, obsm: set,
         key = summary.get("label_key")
         if key and key in obs:
             specs.append({"kind": "umap", "color": key, "basis": _best_basis(obsm)})
+            # broad annotation-evidence dotplot (cell types × their marker set). Prefer the LLM's
+            # recorded >=3-gene marker_sets; else derive cell-type panels from the leiden DE via the
+            # cluster->label map. Rows are family-contiguous (staircase) by default.
+            ms = summary.get("marker_sets") or {}
+            if ms:
+                specs.append({"kind": "dotplot", "groupby": key, "marker_groups": ms})
+            elif summary.get("groupby") and summary.get("labels"):
+                specs.append({"kind": "dotplot", "groupby": key,
+                              "cluster_key": summary["groupby"], "label_map": summary["labels"]})
     elif tool == "apply_fine_annotation":
         key = summary.get("fine_key", "fine_cell_type")
         if key in obs:

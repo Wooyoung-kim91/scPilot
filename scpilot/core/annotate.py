@@ -408,10 +408,18 @@ def annotation_review(session, *, groupby: str = "leiden", top_n: int = 50, padj
             .sort_values("spec", ascending=False) if has_spec else sub
         n_specific = int(len(spec_sub))
         top = spec_sub.head(top_n)                     # top-N SPECIFIC markers
-        de_table = [{de_cols[c]: (round(float(r[c]), 4) if c != "names" else str(r[c]))
-                     for c in present_cols} for _, r in top.iterrows()]
         mask = (obs_g == cl).values
         n_cells = int(mask.sum())
+        # mean expression (log-normalized X) per top gene IN this cluster — the "expression" the
+        # LLM weighs together with pct (high mean_in + high spec = a confident identity marker).
+        _genes = [str(g) for g in top["names"] if str(g) in adata.var_names]
+        _mean = {}
+        if _genes and n_cells:
+            _vals = np.asarray(adata[:, _genes].X[mask].mean(axis=0)).ravel()
+            _mean = {_genes[k]: round(float(_vals[k]), 4) for k in range(len(_genes))}
+        de_table = [{**{de_cols[c]: (round(float(r[c]), 4) if c != "names" else str(r[c]))
+                        for c in present_cols}, "mean_in": _mean.get(str(r["names"]))}
+                    for _, r in top.iterrows()]
 
         sample_dist, single_source = {}, False
         if has_sample:
@@ -469,11 +477,13 @@ def annotation_review(session, *, groupby: str = "leiden", top_n: int = 50, padj
          "marker_db_used": False, "candidate_labels_provided": False,
          "instruction": f"de_table = top-{top_n} markers per cluster that are SIGNIFICANT (padj<{padj_max}) "
                         f"AND SPECIFIC (spec = pct_in - pct_out >= {min_specificity}), most-specific first. "
-                        "Each gene shows spec so you can weigh enrichment vs broad expression. Infer each "
-                        "cluster's broad cell type from its de_table (no marker DB); use tissue_context as a "
-                        "soft prior; clusters flagged 'few_specific_markers' lack a distinct identity (likely "
-                        "low-quality/ambient/doublet) — treat with caution. Then call apply_annotation with the "
-                        "cluster->label map.",
+                        "Each gene shows mean_in (mean log-normalized EXPRESSION in-cluster), pct_in/pct_out "
+                        "and spec. For each cluster choose a MARKER-SET COMBINATION of >=3 genes that are both "
+                        "HIGHLY EXPRESSED (high mean_in) and HIGHLY SPECIFIC (high spec, low pct_out), infer the "
+                        "cell type from that set (no marker DB; tissue_context is a soft prior), and record the "
+                        "chosen set via apply_annotation(marker_sets={cell_type:[genes]}) alongside the "
+                        "cluster->label map. Clusters flagged 'few_specific_markers' lack a >=3 confident set — "
+                        "treat as low-quality/ambient/doublet and set review_required.",
          "clusters": payloads}, indent=2, default=str))
 
     import pandas as pd
@@ -509,6 +519,7 @@ def annotation_review(session, *, groupby: str = "leiden", top_n: int = 50, padj
 def apply_annotation(session, *, groupby: str = "leiden", labels: dict | None = None,
                      key: str = "major_cell_type", confidence: dict | None = None,
                      review_required: dict | None = None, cell_state: dict | None = None,
+                     marker_sets: dict | None = None,
                      tissue: str | None = None, method: str = "DE_LLM_marker_free",
                      unassigned: str = "Unassigned", **params) -> S.ToolResult:
     t0 = time.time()
@@ -537,10 +548,13 @@ def apply_annotation(session, *, groupby: str = "leiden", labels: dict | None = 
         cs = {str(k): str(v) for k, v in cell_state.items()}
         adata.obs["cell_state"] = obs_g.map(lambda c: cs.get(c, "")).astype("category")
 
+    # the LLM's chosen >=3-gene marker-set COMBINATION per cell type (high expr + high spec) —
+    # the annotation EVIDENCE; recorded as a first-class artifact and used as the dotplot panels.
+    msets = {str(k): [str(g) for g in v] for k, v in (marker_sets or {}).items()}
     adata.uns.setdefault(UNS_ANNO, {})
     adata.uns[UNS_ANNO]["tier1_llm"] = {
         "method": method, "groupby": groupby, "label_key": key, "tissue_context": tissue,
-        "labels": lab, "marker_db_used": False,
+        "labels": lab, "marker_sets": msets, "marker_db_used": False,
     }
     dist = adata.obs[key].value_counts().to_dict()
     n_unassigned = int((adata.obs[key].astype(str) == unassigned).sum())
@@ -548,7 +562,8 @@ def apply_annotation(session, *, groupby: str = "leiden", labels: dict | None = 
         session.log_decision(S.DecisionEvent(
             decision_type="tier1_llm_labels", choice=lab, candidates=[],
             rationale=f"DE-based marker-free Tier-1 labels (tissue={tissue})",
-            stage="apply_annotation", params={"groupby": groupby, "key": key}).to_dict())
+            stage="apply_annotation",
+            params={"groupby": groupby, "key": key, "marker_sets": msets}).to_dict())
     except Exception:  # noqa: BLE001
         pass
 
@@ -557,6 +572,8 @@ def apply_annotation(session, *, groupby: str = "leiden", labels: dict | None = 
         "marker_db_used": False, "n_clusters_labeled": len(lab),
         "unlabeled_clusters": missing, "n_unassigned_cells": n_unassigned,
         "label_distribution": {str(k): int(v) for k, v in dist.items()},
+        "marker_sets": msets,                          # LLM's >=3-gene combos (dotplot panels)
+        "labels": lab,                                 # cluster->cell type (broad dotplot derive path)
     }
     warnings = [] if not missing else [f"{len(missing)} cluster(s) not in labels → '{unassigned}': {missing}"]
     cp = session.checkpoint("apply_annotation", x_state=session.manifest.x_state,

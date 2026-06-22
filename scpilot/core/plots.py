@@ -71,7 +71,8 @@ def _artifacts_from_fit(fit, cfg) -> list[S.Artifact]:
 def plots(session, *, kind: str = "umap", color: str | None = None,
           basis: str = "X_umap", keys: list | None = None, groupby: str | None = None,
           marker_groups: dict | None = None, order: list | None = None,
-          family_map: dict | None = None,
+          family_map: dict | None = None, cluster_key: str | None = None,
+          label_map: dict | None = None,
           tag: str | None = None, cutoffs: dict | None = None, **params) -> S.ToolResult:
     import matplotlib
     matplotlib.use("Agg")  # headless (MCP/CLI: no display)
@@ -176,6 +177,16 @@ def plots(session, *, kind: str = "umap", color: str | None = None,
             # marker source priority: caller panel > DATA-DRIVEN derivation from this groupby's DE
             # (organism-agnostic — works for mouse fine types) > human BROAD_MARKERS fallback.
             src = marker_groups
+            if src is None and cluster_key and label_map:
+                # broad dotplot: rows = cell types (gb=major_cell_type) but DE is on the leiden
+                # cluster_key — derive cell-type panels by mapping the cluster DE through label_map
+                # (no DE recompute on the cell-type key needed).
+                try:
+                    src = derive_dotplot_markers(adata, cluster_key=cluster_key,
+                                                 label_map={str(k): str(v) for k, v in label_map.items()},
+                                                 order=order, family_map=family_map)
+                except Exception:  # noqa: BLE001 — fall through to gb-DE / fixed panel
+                    src = None
             if src is None:
                 rg = adata.uns.get("rank_genes_groups")
                 if rg and rg.get("params", {}).get("groupby") == gb:

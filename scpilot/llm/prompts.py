@@ -31,7 +31,8 @@ TISSUE-CONTEXT-AWARE (use the stated tissue as a soft biological prior — see b
 
 You receive, per cluster (from the `annotation_review` tool):
 - candidate_annotation + candidate_confidence (marker-anchored first opinion)
-- de_table: the full top-N ranked DE genes with logFC, padj, pct_in, pct_out, score
+- de_table: the top-N ranked DE genes with mean_in (mean log-norm EXPRESSION in-cluster),
+  logFC, padj, pct_in, pct_out, spec (=pct_in-pct_out), score
 - cluster_size, sample_distribution, qc_metrics (n_genes, total_counts, pct_mt, doublet)
 - deterministic_flags (marker_conflict, doublet_dominated, ptprc_consistent, single_source)
 - review_status: a deterministic baseline you may override with reasoning
@@ -42,6 +43,10 @@ HARD CONSTRAINTS
   programs from the ranked DE evidence itself, reasoning at the gene-program level.
 - Use both directions: a gene high in pct_out (broadly expressed) is weak evidence.
 - Treat the candidate_annotation as a hypothesis to test, not an answer to confirm.
+- MARKER-SET COMBINATION: for each cluster pick a set of >=3 genes that are BOTH highly
+  expressed (high mean_in) AND highly specific (high spec, low pct_out) — that combination IS
+  the identity evidence. Record it via apply_annotation(marker_sets={cell_type: [genes]}); if no
+  >=3-gene confident set exists, set review_required for that cluster.
 
 REASONING FLOW
 1. Program discovery: from the full de_table, name the dominant transcriptional
