@@ -58,16 +58,20 @@ def _artifacts_from_fit(fit, cfg) -> list[S.Artifact]:
                       "qc_violin (keys, groupby; tag='pre'/'post' for before/after QC), "
                       "scatter (QC: total_counts × n_genes_by_counts colored by pct_counts_mt), "
                       "qc_thresholds (chosen cutoffs overlaid on QC distributions — the param "
-                      "justification figure; pass cutoffs={min_genes,max_pct_mt,...}), hvg, pca_variance, "
+                      "justification figure; pass cutoffs={min_genes,max_pct_mt,...}), "
+                      "resolution_sweep (n_clusters vs resolution + chosen knee; pass sweep + suggested), "
+                      "hvg, pca_variance, "
                       "dotplot (annotation marker dotplot: groupby=major_cell_type, optional marker_groups; "
-                      "cell-type rows ordered as a staircase under their marker brackets; vertical gene "
-                      "labels). "
+                      "cell-type rows ordered as a staircase under their marker brackets, and FAMILY-CONTIGUOUS "
+                      "so subtypes stay together — e.g. all Macrophage* in one block (pass family_map to set "
+                      "families explicitly, else derived from the label's leading token); vertical gene labels). "
                       "umap/qc_violin/hvg/pca_variance obey the journal-column size policy; the dotplot "
                       "auto-fits to the SMALLEST 0.5–2.0×0.5–2.0 col size with no text/dot overlap and a "
                       "size/colour legend ≤5% of the figure (many-category umap uses a generous canvas).")
 def plots(session, *, kind: str = "umap", color: str | None = None,
           basis: str = "X_umap", keys: list | None = None, groupby: str | None = None,
           marker_groups: dict | None = None, order: list | None = None,
+          family_map: dict | None = None,
           tag: str | None = None, cutoffs: dict | None = None, **params) -> S.ToolResult:
     import matplotlib
     matplotlib.use("Agg")  # headless (MCP/CLI: no display)
@@ -136,6 +140,16 @@ def plots(session, *, kind: str = "umap", color: str | None = None,
             fit = P.save_qc_thresholds(adata, cfg, base, keys=ks, cutoffs=bounds)
             label = "QC cutoffs over distributions"
 
+        elif kind == "resolution_sweep":
+            sweep = params.get("sweep")
+            if not sweep:
+                return S.error("plots", "missing_input",
+                               "resolution_sweep needs sweep=[{resolution,n_clusters},...]",
+                               recoverable=True, suggested_next_tools=["cluster_sweep"])
+            base = art_dir / (f"resolution_sweep_{tag}" if tag else "resolution_sweep")
+            fit = P.save_resolution_sweep(cfg, base, sweep, suggested=params.get("suggested"))
+            label = "resolution sweep (n_clusters vs resolution)"
+
         elif kind == "hvg":
             if "highly_variable" not in adata.var:
                 return S.error("plots", "invalid_state", "no HVG — run preprocess first",
@@ -171,7 +185,7 @@ def plots(session, *, kind: str = "umap", color: str | None = None,
                         # family, not by abundance; staircase then follows this panel order.
                         src = derive_dotplot_markers(adata, cluster_key=gb,
                                                      label_map={lab: lab for lab in labels},
-                                                     order=order)
+                                                     order=order, family_map=family_map)
                     except Exception:  # noqa: BLE001 — fall through to the fixed panel
                         src = None
                 if not src:
@@ -198,8 +212,8 @@ def plots(session, *, kind: str = "umap", color: str | None = None,
 
         else:
             return S.error("plots", "missing_input",
-                           f"unknown kind '{kind}' (umap|qc_violin|scatter|qc_thresholds|hvg|pca_variance|dotplot)",
-                           recoverable=True)
+                           f"unknown kind '{kind}' (umap|qc_violin|scatter|qc_thresholds|"
+                           "resolution_sweep|hvg|pca_variance|dotplot)", recoverable=True)
     except Exception as exc:  # noqa: BLE001
         return S.error("plots", "internal", f"{type(exc).__name__}: {exc}")
 

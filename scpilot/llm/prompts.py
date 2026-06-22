@@ -127,11 +127,12 @@ GOLDEN RULES
   HVG/PC counts, integration method, annotation strategy, DE design), state the candidates
   you considered, your choice, and a one-line rationale in your prose BEFORE the tool call.
   The harness records this as a decision event.
-- CLUSTERING RESOLUTION DEFAULTS TO 0.25 at every clustering stage. Use the resolution(s) the
-  user provided (see "Clustering resolution" in context); when 'all' is given, apply it to every
-  embedding. Do NOT invent your own value — if you want to deviate from the given/default
-  resolution, state your reason and the candidate value, then proceed with the user-set one
-  unless told otherwise.
+- CLUSTERING RESOLUTION IS CHOSEN DYNAMICALLY. For each embedding call `cluster_sweep` FIRST
+  (sweeps 0.1–0.5); read the n_clusters-vs-resolution curve and pick the `suggested_resolution`
+  at the knee (the value JUST BEFORE n_clusters jumps) — state candidates (the sweep) + your
+  choice + rationale, then call `cluster(use_rep, resolution=<chosen>)`. If the user provided an
+  explicit resolution (see "Clustering resolution" in context), that OVERRIDES the sweep; absent
+  both, cluster falls back to 0.25.
 - If a tool returns status="error", read error_code: `invalid_state` -> run the
   prerequisite tool first; `capability_unavailable`/`dependency_missing` -> skip that
   optional branch and continue; `data_gate_failed` -> do not retry that path.
@@ -142,8 +143,8 @@ CANONICAL FLOW (skip steps already satisfied per detect_state; stop when the goa
    rate). qc_filter -> choose cutoffs that are permissive enough to keep real biology
    (avoid global cutoffs that erase sample/tissue-specific populations).
 3. preprocess -> from variance_ratio + suggested_n_pcs_elbow choose n_top_genes and n_pcs.
-4. cluster (baseline, use_rep=X_pca) -> uses resolution 0.25 by default (or the user-set value).
-   markers -> per-cluster ranked DE (Wilcoxon, with pts).
+4. cluster_sweep (use_rep=X_pca) -> pick resolution at the knee; then cluster (baseline,
+   use_rep=X_pca, resolution=<chosen>). markers -> per-cluster ranked DE (Wilcoxon, with pts).
 5. Tier-1 annotation is MARKER-DB-FREE — do NOT use a fixed marker panel (annotate_broad is
    legacy/opt-in only): call annotation_review -> read each cluster's de_table and INFER its
    broad cell type from the DE itself (see the annotation-review prompt; apply the tissue
@@ -154,12 +155,13 @@ CANONICAL FLOW (skip steps already satisfied per detect_state; stop when the goa
    (or train_scvi). Then, FOR EACH embedding separately — baseline X_pca AND every
    integration (X_harmony, X_scVI) — repeat the SAME annotation pipeline on that
    embedding's own clustering:
-     cluster(use_rep=<emb>, resolution=<user-set for this embedding, else default 0.25>)
+     cluster_sweep(use_rep=<emb>) -> choose resolution at the knee
+       -> cluster(use_rep=<emb>, resolution=<chosen>)
        -> markers(groupby=<that leiden key>)
        -> annotation_review(groupby=<that leiden key>, tissue=...)
        -> apply_annotation(groupby=<that leiden key>, key=major_cell_type_<model>, labels=...)
    Keep each method's labels in a DISTINCT key (major_cell_type / _harmony / _scvi) so they
-   coexist and can be compared. Each embedding uses resolution 0.25 by default (or the user-set value).
+   coexist and can be compared. Resolution is chosen per embedding from its own sweep (user value overrides).
 7. Benchmark the integration methods — but FIRST fix the label_key circularity (de-risk ①):
    a. consensus_annotation(keys=[major_cell_type_merge, _harmony, _scvi, ...]) -> a per-cell
       EMBEDDING-INDEPENDENT consensus label (majority vote; disagreements -> 'ambiguous').

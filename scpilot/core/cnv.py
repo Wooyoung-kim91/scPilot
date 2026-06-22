@@ -316,9 +316,9 @@ def cnv_score(session, *, reference_key: str | None = None, reference_cat: list 
               .agg(["size", "mean"]).reset_index()
               .rename(columns={"size": "n_cells", "mean": "mean_cnv_score"})
               .sort_values("mean_cnv_score", ascending=False))
-        celltype_cnv = S.table_preview(ct, full_csv=str(session.artifacts_dir / "cnv_by_celltype.csv"))
-        session.artifacts_dir.mkdir(parents=True, exist_ok=True)
-        ct.to_csv(session.artifacts_dir / "cnv_by_celltype.csv", index=False)
+        cnv_csv = session.artifact_path("cnv_by_celltype.csv")   # no-overwrite on re-run (P1-2)
+        celltype_cnv = S.table_preview(ct, full_csv=str(cnv_csv))
+        ct.to_csv(cnv_csv, index=False)
 
     summary = {
         "n_cells": int(adata.n_obs), "n_genes_with_coords": n_coord,
@@ -465,7 +465,7 @@ def malignancy_evidence(session, *, groupby: str | None = None, reference_key: s
 
     art_dir = session.artifacts_dir
     art_dir.mkdir(parents=True, exist_ok=True)
-    json_path = art_dir / "malignancy_evidence.json"
+    json_path = session.artifact_path("malignancy_evidence.json")   # no-overwrite (P1-2)
     json_path.write_text(json.dumps({
         "groupby": groupby, "reference": ref_desc, "advisory_only": advisory,
         "reference_quantile": ref_quantile,

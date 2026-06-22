@@ -459,7 +459,7 @@ def annotation_review(session, *, groupby: str = "leiden", top_n: int = 50, padj
 
     art_dir = session.artifacts_dir
     art_dir.mkdir(parents=True, exist_ok=True)
-    json_path = art_dir / "annotation_review.json"
+    json_path = session.artifact_path("annotation_review.json")   # no-overwrite on re-run (P1-2)
     json_path.write_text(json.dumps(
         {"groupby": groupby, "top_n": top_n, "tissue_context": tissue,
          "significance_filter": f"pvals_adj < {padj_max}",
@@ -669,7 +669,7 @@ COMPARTMENT_ORDER = [
 
 def derive_dotplot_markers(adata, *, cluster_key, label_map, top_k=5,
                            min_pct=0.25, min_lfc=1.0, padj_max=0.05, min_specificity=0.1,
-                           max_pct_out=0.5, order=None):
+                           max_pct_out=0.5, order=None, family_map=None):
     """Per-cell-type dotplot markers that ARE the Tier-1 annotation EVIDENCE — the same DE-selected
     significant markers the LLM read to make the call, shown per assigned cell type. No external
     marker DB, no lineage prior: the marker SELECTION itself is the evidence (that is the point).
@@ -684,7 +684,11 @@ def derive_dotplot_markers(adata, *, cluster_key, label_map, top_k=5,
     DE didn't select — the figure shows the evidence, not a curated panel.
 
     ``order`` (e.g. ``COMPARTMENT_ORDER``) only fixes the panel/row LAYOUT (display), never the
-    marker content; without it, cell types are laid out by abundance.
+    marker content. Without ``order`` the layout is FAMILY-CONTIGUOUS: cell types of the same
+    family stay adjacent (so subtypes — e.g. every ``Macrophage *`` — form one block instead of
+    scattering by abundance), families ordered by total abundance, within-family by abundance.
+    Family is derived generically from ``family_map`` if given, else the label's leading token
+    (organism-agnostic, never hardcoded). ``order`` still wins when provided.
 
     Returns ``{cell_type: [genes]}`` ready to pass as ``plots(kind='dotplot', marker_groups=...)``.
     """
@@ -741,7 +745,20 @@ def derive_dotplot_markers(adata, *, cluster_key, label_map, top_k=5,
         pos = {ct: i for i, ct in enumerate(order)}
         ct_iter = sorted(owned, key=lambda c: pos.get(c, len(order)))     # LAYOUT only
     else:
-        ct_iter = sorted(owned, key=lambda c: -ctsize[c])
+        # FAMILY-CONTIGUOUS default: same-family cell types stay together (subtypes don't
+        # scatter by abundance). Family = family_map[ct] if given, else the label's leading
+        # token (generic, organism-agnostic — NOT a hardcoded type list). Families are ordered
+        # by total abundance, within a family by abundance; including the family string in the
+        # sort key guarantees same-family rows are contiguous.
+        def _family(ct):
+            if family_map and ct in family_map:
+                return str(family_map[ct])
+            toks = str(ct).split()
+            return toks[0] if toks else str(ct)
+        fam_size: dict = defaultdict(int)
+        for c in owned:
+            fam_size[_family(c)] += ctsize[c]
+        ct_iter = sorted(owned, key=lambda c: (-fam_size[_family(c)], _family(c), -ctsize[c]))
 
     panels = {}
     for ct in ct_iter:
@@ -907,7 +924,7 @@ def fine_annotation_review(session, *, groupby: str = "leiden", compartment: str
     df = pd.DataFrame(rows)
     art_dir = session.artifacts_dir
     art_dir.mkdir(parents=True, exist_ok=True)
-    json_path = art_dir / "fine_annotation_evidence.json"
+    json_path = session.artifact_path("fine_annotation_evidence.json")   # no-overwrite (P1-2)
     json_path.write_text(json.dumps({
         "groupby": groupby, "compartment": overall_comp,
         "padj_max": padj_max,

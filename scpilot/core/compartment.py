@@ -164,7 +164,7 @@ def compartment_plan(session, *, groupby: str | None = None, batch_key: str | No
 
     art_dir = session.artifacts_dir
     art_dir.mkdir(parents=True, exist_ok=True)
-    json_path = art_dir / "compartment_plan.json"
+    json_path = session.artifact_path("compartment_plan.json")   # no-overwrite (P1-2)
     json_path.write_text(json.dumps({
         "groupby": gkey, "batch_key": bkey, "sample_key": sample_key if has_sample else None,
         "floor": {"min_cells": min_cells, "min_samples": min_samples},

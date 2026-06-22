@@ -114,7 +114,7 @@ def benchmark(session, *, label_key: str = "major_cell_type", batch_key: str = "
     # --- artifacts: results CSV + scib summary-table figure ---------------------
     art_dir = session.artifacts_dir
     art_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = art_dir / "benchmark_scib.csv"
+    csv_path = session.artifact_path("benchmark_scib.csv")   # no-overwrite (P1-2)
     res.to_csv(csv_path)
     arts = [S.artifact_csv(str(csv_path), n_rows=int(res.shape[0]), n_cols=int(res.shape[1]),
                            description="scib-metrics results (per-embedding metrics + aggregate scores)")]

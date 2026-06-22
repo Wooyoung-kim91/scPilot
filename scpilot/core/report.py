@@ -99,6 +99,7 @@ def report(session, *, interpretation: str | None = None, title: str = "scpilot 
         "artifacts": catalog,
         "figures": [c["path"] for c in figures],
         "checkpoints": [cp.get("id") for cp in man.checkpoints],
+        "log_consistency": session.log_consistency(),   # run_log ↔ outputs.jsonl coupling (C-2)
     }
 
     # ---- render Markdown ----
@@ -151,8 +152,8 @@ def report(session, *, interpretation: str | None = None, title: str = "scpilot 
         md.append("")
 
     session.artifacts_dir.mkdir(parents=True, exist_ok=True)
-    md_path = session.artifacts_dir / "report.md"
-    json_path = session.artifacts_dir / "report.json"
+    md_path = session.artifact_path("report.md")        # no-overwrite on re-run (P1-2)
+    json_path = session.artifact_path("report.json")
     md_path.write_text("\n".join(md))
     json_path.write_text(json.dumps(report_json, indent=2, default=str))
 

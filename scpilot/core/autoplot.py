@@ -87,6 +87,11 @@ def plan_autoplots(tool: str, summary: dict, *, obs: set, obsm: set,
                       "cutoffs": summary.get("cutoffs", {})})
     elif tool == "preprocess":
         specs += [{"kind": "pca_variance"}, {"kind": "hvg"}]
+    elif tool == "cluster_sweep":
+        sw = summary.get("sweep")
+        if sw:
+            specs.append({"kind": "resolution_sweep", "sweep": sw,
+                          "suggested": summary.get("suggested_resolution")})
     elif tool == "cluster":
         ck = summary.get("cluster_key")
         bk = summary.get("umap_key", "X_umap")

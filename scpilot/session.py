@@ -251,6 +251,8 @@ class Manifest:
     checkpoints: list = field(default_factory=list)     # list[dict] (Checkpoint asdict)
     pipeline_script: str | None = None                  # code/pipeline.py (full flow)
     n_runs: int = 0
+    n_outputs: int = 0                                   # outputs.jsonl records written (should track n_runs)
+    log_inconsistencies: int = 0                         # times the outputs record failed to write after run_log
 
 
 class Session:
@@ -626,7 +628,10 @@ class Session:
             lib_versions=libs, duration_s=result.duration_s, error_code=result.error_code,
         ).to_dict())
 
-        # outputs index: bind this step's artifacts + reasoning + provenance (never raises)
+        # outputs index: bind this step's artifacts + reasoning + provenance, COUPLED to the
+        # run log by the run index n. A failure here must not break the result, but it is NOT
+        # swallowed silently — it is counted (manifest.log_inconsistencies) and logged, so a
+        # run_log↔outputs divergence is DETECTABLE via log_consistency() rather than hidden (C-2).
         try:
             out_rec = {"ts": _now(), "session_id": self.manifest.session_id,
                        **S.OutputRecord(
@@ -636,7 +641,16 @@ class Session:
                            reasoning=reasoning, warnings=list(result.warnings or []),
                        ).to_dict()}
             self._append_jsonl(self.outputs_path, out_rec)
-        except Exception:  # noqa: BLE001 — the outputs index must never break the result
+            self.manifest.n_outputs += 1
+        except Exception as exc:  # noqa: BLE001 — surface (count + log), never silently swallow
+            self.manifest.log_inconsistencies += 1
+            import logging
+            logging.getLogger("scpilot.session").error(
+                "outputs.jsonl write FAILED for '%s' — run_log↔outputs diverged (n_runs=%d): %s",
+                result.tool, self.manifest.n_runs, exc)
+        try:
+            self.save()                      # persist the n_outputs / inconsistency counters
+        except Exception:  # noqa: BLE001
             pass
 
         # regenerate the FULL repro pipeline + notebook from the run log (covers every step)
@@ -678,6 +692,31 @@ class Session:
                                checkpoint=result.checkpoint, plots=plot_paths)
         except Exception:  # noqa: BLE001 — logging must never break the result
             pass
+
+    def log_consistency(self) -> dict:
+        """run_log ↔ outputs.jsonl coupling check (C-2): every logged run should have one
+        outputs record. Returns counts + a ``consistent`` flag; a mismatch means an outputs
+        write failed after the run-log append (recorded in ``log_inconsistencies``)."""
+        m = self.manifest
+        consistent = m.log_inconsistencies == 0 and m.n_outputs == m.n_runs
+        return {"n_runs": m.n_runs, "n_outputs": m.n_outputs,
+                "log_inconsistencies": m.log_inconsistencies, "consistent": bool(consistent)}
+
+    def artifact_path(self, name: str) -> Path:
+        """A non-colliding path under ``artifacts_dir`` for an output file (P1-2).
+
+        Returns ``artifacts_dir/name`` when free; if a prior run already wrote that name,
+        inserts the current run index so the earlier evidence file is NOT silently overwritten
+        (the returned path is what the tool writes + reports, so outputs.jsonl/report point at it).
+        """
+        self._ensure_dirs()
+        p = self.artifacts_dir / name
+        if not p.exists():
+            return p
+        stem, dot, ext = name.rpartition(".")
+        base = stem if dot else name
+        suffix = f".{ext}" if dot else ""
+        return self.artifacts_dir / f"{base}.{self.manifest.n_runs:02d}{suffix}"
 
     def log_decision(self, record: dict, *, validate: bool = True) -> None:
         """Append one LLM decision event to decisions.jsonl (schema frozen in A7).

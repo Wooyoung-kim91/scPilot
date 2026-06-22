@@ -705,6 +705,25 @@ def save_qc_thresholds(adata, cfg, base_path, keys, cutoffs, logger=None):
     return fit_and_save(build, cfg, base_path, grid=(1, len(keys)), logger=logger)
 
 
+def save_resolution_sweep(cfg, base_path, sweep, suggested=None, logger=None):
+    """n_clusters vs leiden resolution line with the CHOSEN resolution marked — the
+    justification figure for the dynamic-resolution knee. ``sweep`` = ordered list of
+    {resolution, n_clusters}; ``suggested`` (optional) draws a vertical marker."""
+    xs = [float(d["resolution"]) for d in sweep]
+    ys = [int(d["n_clusters"]) for d in sweep]
+
+    def build(size, font, draft=False):
+        fig = _new_fig(size)
+        ax = fig.subplots()
+        ax.plot(xs, ys, marker="o")
+        ax.set_xlabel("leiden resolution")
+        ax.set_ylabel("n_clusters")
+        if suggested is not None:
+            ax.axvline(float(suggested), color="crimson", lw=1.0)
+        return fig
+    return fit_and_save(build, cfg, base_path, logger=logger)
+
+
 def save_highly_variable_genes(adata, cfg, base_path, logger=None):
     """sc.pl.highly_variable_genes(adata) — harness sizes it."""
     def build(size, font, draft=False):

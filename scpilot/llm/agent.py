@@ -47,7 +47,7 @@ from scpilot.llm.provider import Provider, ToolCall
 # default autonomous set; integration tools are allowed but optional. This is a policy
 # list, not a hardcode of behaviour — the registry remains the single source of truth.
 DEFAULT_TOOLSET = [
-    "detect_state", "qc_metrics", "qc_filter", "preprocess", "cluster",
+    "detect_state", "qc_metrics", "qc_filter", "preprocess", "cluster_sweep", "cluster",
     "markers", "annotation_review", "apply_annotation", "plots",
     "integrate_scvi", "integrate_harmony",
     "compartment_plan", "compartment_subset",
@@ -71,9 +71,16 @@ _PARAM_HINTS: dict[str, dict] = {
                           "description": "obs column for batch-aware HVG (auto-detected from "
                                          "sample_id/sample/batch if omitted)"},
     },
+    "cluster_sweep": {
+        "use_rep": {"type": "string", "description": "embedding to sweep (X_pca | X_harmony | X_scVI)"},
+        "res_min": {"type": "number", "description": "sweep start (default 0.1)"},
+        "res_max": {"type": "number", "description": "sweep end (default 0.5)"},
+        "res_step": {"type": "number", "description": "sweep step (default 0.1)"},
+        "jump_ratio": {"type": "number", "description": "n_clusters jump factor flagged as the knee (default 1.5)"},
+    },
     "cluster": {
         "use_rep": {"type": "string", "description": "X_pca | X_harmony | X_scVI"},
-        "resolution": {"type": "number", "description": "leiden resolution"},
+        "resolution": {"type": "number", "description": "leiden resolution (use cluster_sweep's suggested value)"},
         "n_neighbors": {"type": "integer"},
     },
     "markers": {"n_genes": {"type": "integer"}},

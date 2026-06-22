@@ -360,3 +360,161 @@ def test_plots_scatter_and_qc_thresholds_kinds(tmp_path):
     assert tools.run("plots", s, kind="scatter").artifacts
     assert tools.run("plots", s, kind="qc_thresholds",
                      cutoffs={"min_genes": 3, "max_pct_mt": 50}).artifacts
+
+
+# --------------------------------------------------------------------------- #
+# Annotation Phase A — dynamic resolution sweep + knee
+# --------------------------------------------------------------------------- #
+def _two_group_adata(n_obs=200, n_vars=120):
+    rng = np.random.default_rng(0)
+    base = rng.poisson(0.5, (n_obs, n_vars)).astype("float32")
+    h = n_obs // 2
+    base[:h, :30] += rng.poisson(4.0, (h, 30)).astype("float32")
+    base[h:, 30:60] += rng.poisson(4.0, (n_obs - h, 30)).astype("float32")
+    a = ad.AnnData(sparse.csr_matrix(base))
+    a.var_names = [f"G{i}" for i in range(n_vars)]
+    a.layers["counts"] = a.X.copy()
+    return a
+
+
+def test_suggest_resolution_knee():
+    from scpilot.core.cluster import _suggest_resolution
+
+    # n_clusters jumps 6→15 between 0.3 and 0.4 → choose 0.3 (just before the jump)
+    jump = [(0.1, 5), (0.2, 6), (0.3, 6), (0.4, 15), (0.5, 16)]
+    assert _suggest_resolution(jump, jump_ratio=1.5)[0] == 0.3
+    # no abrupt jump → conservative lowest resolution
+    flat = [(0.1, 4), (0.2, 4), (0.3, 5), (0.4, 5), (0.5, 6)]
+    assert _suggest_resolution(flat, jump_ratio=1.5)[0] == 0.1
+
+
+def test_cluster_sweep_curve_and_cleanup(tmp_path):
+    from scpilot import tools
+    from scpilot.repro import set_global_seed
+
+    inp = tmp_path / "in.h5ad"
+    _two_group_adata().write_h5ad(inp)
+    set_global_seed(0)
+    s = Session.create(tmp_path / "sess", input_path=str(inp))
+    s.load_input()
+    assert tools.run("preprocess", s, n_top_genes=60, n_pcs=15).status == "success"
+    res = tools.run("cluster_sweep", s, use_rep="X_pca")
+    assert res.status == "success"
+    assert [round(d["resolution"], 1) for d in res.summary["sweep"]] == [0.1, 0.2, 0.3, 0.4, 0.5]
+    assert 0.1 <= res.summary["suggested_resolution"] <= 0.5
+    # non-mutating: the throwaway sweep keys must not pollute the working AnnData
+    assert "_sweep_leiden" not in s.adata.obs.columns
+    assert "_sweep_nbr" not in s.adata.uns
+
+
+def test_plots_resolution_sweep_kind(tmp_path):
+    from scpilot import tools
+
+    s = Session.create(tmp_path / "sess")
+    s.set_adata(_tiny_adata())                          # adata present but unused by this kind
+    res = tools.run("plots", s, kind="resolution_sweep", suggested=0.2,
+                    sweep=[{"resolution": 0.1, "n_clusters": 2},
+                           {"resolution": 0.2, "n_clusters": 4},
+                           {"resolution": 0.3, "n_clusters": 9}])
+    assert res.status == "success" and res.artifacts
+
+
+def test_cluster_sweep_autoplots_resolution_curve(tmp_path):
+    from typer.testing import CliRunner
+
+    from scpilot.cli import app
+
+    inp = tmp_path / "in.h5ad"
+    _two_group_adata().write_h5ad(inp)
+    wd = tmp_path / "sess"
+    runner = CliRunner()
+    assert runner.invoke(app, ["step", "preprocess", str(inp), "-w", str(wd),
+                               "-p", "n_top_genes=60", "-p", "n_pcs=15"]).exit_code == 0
+    assert runner.invoke(app, ["step", "cluster_sweep", "-w", str(wd),
+                               "-p", "use_rep=X_pca"]).exit_code == 0
+    assert {p.name for p in (wd / "artifacts").glob("resolution_sweep*")}
+
+
+# --------------------------------------------------------------------------- #
+# Harness integrity — run_log↔outputs coupling (C-2) + no-overwrite artifacts (P1-2)
+# --------------------------------------------------------------------------- #
+def test_log_consistency_tracks_run_and_outputs(tmp_path):
+    s = Session.create(tmp_path / "sess")
+    s.set_adata(_tiny_adata())
+    for _ in range(3):
+        s.record_run(_result("cluster", n_clusters=4), params={"resolution": 0.3}, seed=0)
+    lc = s.log_consistency()
+    assert lc["n_runs"] == 3 and lc["n_outputs"] == 3
+    assert lc["log_inconsistencies"] == 0 and lc["consistent"] is True
+    # the coupling is detectable: every run_log line has a matching outputs line
+    n_runlog = len(s.run_log_path.read_text().splitlines())
+    n_out = len(s.outputs_path.read_text().splitlines())
+    assert n_runlog == n_out == 3
+
+
+def test_log_consistency_flags_divergence(tmp_path):
+    s = Session.create(tmp_path / "sess")
+    s.set_adata(_tiny_adata())
+    # force the outputs.jsonl append to fail → divergence must be COUNTED + flagged, not silent
+    orig = Session._append_jsonl
+
+    def boom(path, record):
+        if str(path).endswith("outputs.jsonl"):
+            raise OSError("disk full")
+        return orig(path, record)
+
+    import scpilot.session as _sess
+    s_cls = _sess.Session
+    s_cls._append_jsonl = staticmethod(boom)
+    try:
+        s.record_run(_result("cluster"), params={}, seed=0)
+    finally:
+        s_cls._append_jsonl = staticmethod(orig)
+    lc = s.log_consistency()
+    assert lc["log_inconsistencies"] == 1 and lc["consistent"] is False
+    assert lc["n_runs"] == 1 and lc["n_outputs"] == 0
+
+
+def test_artifact_path_no_overwrite_on_rerun(tmp_path):
+    s = Session.create(tmp_path / "sess")
+    s._ensure_dirs()
+    p1 = s.artifact_path("annotation_review.json")
+    assert p1.name == "annotation_review.json"          # first run → plain name
+    p1.write_text("{}")
+    s.manifest.n_runs = 5                                # simulate a later run
+    p2 = s.artifact_path("annotation_review.json")
+    assert p2 != p1 and p2.name == "annotation_review.05.json"   # versioned, no overwrite
+    assert p1.exists()                                  # prior evidence preserved
+
+
+def test_derive_dotplot_markers_family_contiguous():
+    # subtypes of the same family must stay ADJACENT on the y-axis (not scattered by abundance):
+    # sizes here would, by pure abundance, split the two Macrophage subtypes with Monocyte between.
+    import scanpy as sc
+
+    from scpilot.core.annotate import derive_dotplot_markers
+
+    rng = np.random.default_rng(0)
+    labels = {"0": "Macrophage SPP1+", "1": "Monocyte", "2": "Macrophage C1Q+", "3": "DC"}
+    sizes = {"0": 50, "1": 40, "2": 30, "3": 20}
+    blocks = {"0": range(0, 8), "1": range(8, 16), "2": range(16, 24), "3": range(24, 32)}
+    n_vars, parts, grp = 40, [], []
+    for cl, n in sizes.items():
+        b = rng.poisson(0.3, (n, n_vars)).astype("float32")
+        for j in blocks[cl]:
+            b[:, j] += rng.poisson(8.0, n).astype("float32")
+        parts.append(b)
+        grp += [cl] * n
+    a = ad.AnnData(sparse.csr_matrix(np.vstack(parts)))
+    a.var_names = [f"G{i}" for i in range(n_vars)]
+    a.layers["counts"] = a.X.copy()
+    a.obs["grp"] = grp
+    a.obs["grp"] = a.obs["grp"].astype("category")
+    sc.pp.normalize_total(a, target_sum=1e4)
+    sc.pp.log1p(a)
+    sc.tl.rank_genes_groups(a, "grp", method="wilcoxon", pts=True)
+
+    panels = derive_dotplot_markers(a, cluster_key="grp", label_map=labels)   # no `order` → family-contiguous
+    order = list(panels)
+    mac = [i for i, ct in enumerate(order) if ct.startswith("Macrophage")]
+    assert len(mac) == 2 and mac[1] == mac[0] + 1, order      # Macrophage* block is contiguous
