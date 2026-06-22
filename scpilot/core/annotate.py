@@ -583,6 +583,33 @@ def apply_annotation(session, *, groupby: str = "leiden", labels: dict | None = 
                      suggested_next_tools=["plots", "consensus_annotation", "integrate_scvi", "benchmark"])
 
 
+def _majority_vote(adata, keys, *, min_agreement, ambiguous_label):
+    """Per-cell majority vote across obs annotation columns ``keys``. Returns (out, agree, pairwise):
+    ``out[i]`` = the unique-winner label held by a fraction > ``min_agreement`` of the columns
+    (else ``ambiguous_label``); ``agree[i]`` = winner fraction; ``pairwise`` = per-pair concordance.
+    Shared by consensus_annotation and harmonize_annotations' fallback (single source, no drift)."""
+    import numpy as np
+    import pandas as pd
+
+    n_keys = len(keys)
+    cats = pd.unique(np.concatenate([adata.obs[k].astype(str).values for k in keys]))
+    codes = np.column_stack([
+        pd.Categorical(adata.obs[k].astype(str).values, categories=cats).codes for k in keys])
+    out = np.empty(adata.n_obs, dtype=object)
+    agree = np.zeros(adata.n_obs, dtype=float)
+    for i in range(adata.n_obs):
+        counts = np.bincount(codes[i], minlength=len(cats))
+        mx = counts.max()
+        winners = np.flatnonzero(counts == mx)
+        agree[i] = mx / n_keys
+        out[i] = cats[winners[0]] if (winners.size == 1 and mx / n_keys > min_agreement) else ambiguous_label
+    pairwise = {}
+    for a in range(n_keys):
+        for b in range(a + 1, n_keys):
+            pairwise[f"{keys[a]}__vs__{keys[b]}"] = round(float((codes[:, a] == codes[:, b]).mean()), 3)
+    return out, agree, pairwise
+
+
 @register("consensus_annotation", mutating=True,
           description="Build a per-cell CONSENSUS cell-type label by majority vote across SEVERAL annotation "
                       "columns you pass in `keys` (e.g. the per-integration-method annotations). Purpose: an "
@@ -614,29 +641,10 @@ def consensus_annotation(session, *, keys: list | None = None, out_key: str = "c
                        suggested_next_tools=["apply_annotation"])
 
     n_keys = len(keys)
-    cats = pd.unique(np.concatenate([adata.obs[k].astype(str).values for k in keys]))
-    code = {c: i for i, c in enumerate(cats)}
-    codes = np.column_stack([
-        pd.Categorical(adata.obs[k].astype(str).values, categories=cats).codes for k in keys])  # (n, n_keys)
-
-    out = np.empty(adata.n_obs, dtype=object)
-    agree = np.zeros(adata.n_obs, dtype=float)
-    for i in range(adata.n_obs):
-        counts = np.bincount(codes[i], minlength=len(cats))
-        mx = counts.max()
-        winners = np.flatnonzero(counts == mx)
-        agree[i] = mx / n_keys
-        out[i] = cats[winners[0]] if (winners.size == 1 and mx / n_keys > min_agreement) else ambiguous_label
-
+    out, agree, pairwise = _majority_vote(adata, keys, min_agreement=min_agreement,
+                                          ambiguous_label=ambiguous_label)
     adata.obs[out_key] = pd.Categorical(out)
     adata.obs[f"{out_key}_agreement"] = agree.astype("float32")
-
-    # pairwise agreement between the input annotations (how concordant the methods are)
-    pairwise = {}
-    for a in range(n_keys):
-        for b in range(a + 1, n_keys):
-            frac = float((codes[:, a] == codes[:, b]).mean())
-            pairwise[f"{keys[a]}__vs__{keys[b]}"] = round(frac, 3)
 
     dist = adata.obs[out_key].value_counts().to_dict()
     n_amb = int((adata.obs[out_key].astype(str) == ambiguous_label).sum())
@@ -667,6 +675,95 @@ def consensus_annotation(session, *, keys: list | None = None, out_key: str = "c
     return S.success("consensus_annotation", summary=summary, warnings=warnings, checkpoint=cp.path,
                      determinism_grade="A", duration_s=round(time.time() - t0, 3),
                      suggested_next_tools=["benchmark", "plots"])
+
+
+def _harmonize_with_cellhint(adata, keys, out_key):
+    """cellhint label-vocabulary harmonization (Phase C, capability-gated).
+
+    NOT yet wired: cellhint's canonical model harmonizes cell types across *datasets* (different
+    cells), whereas here we reconcile several annotation columns on the SAME cells — the exact
+    cellhint API for that needs verification against an installed cellhint. Until then this raises
+    so harmonize_annotations falls back to the embedding-independent majority vote. (Tracked in
+    annotation-pipeline-roadmap: "cellhint 실경로 설치 검증".)"""
+    raise NotImplementedError("cellhint harmonization path not yet wired (needs cellhint install + API check)")
+
+
+@register("harmonize_annotations", mutating=True,
+          description="Harmonize per-reduction cell-type labels (e.g. major_cell_type / _harmony / _scvi) into one "
+                      "unified obs[out_key] for an UNBIASED scIB benchmark label_key. method='auto' uses cellhint "
+                      "(label-vocabulary alignment) WHEN INSTALLED, else falls back to an embedding-independent "
+                      "majority vote (always available). NO hardcoded vocabulary; keys are caller-supplied. Run "
+                      "after the per-method apply_annotation calls, before benchmark.")
+def harmonize_annotations(session, *, keys: list | None = None, out_key: str = "celltype_harmonized",
+                          method: str = "auto", min_agreement: float = 0.5,
+                          ambiguous_label: str = AMBIGUOUS_LABEL, **params) -> S.ToolResult:
+    import pandas as pd
+
+    from scpilot.doctor import _findable
+
+    t0 = time.time()
+    adata = session.adata
+    keys = list(keys or [])
+    if len(keys) < 2:
+        return S.error("harmonize_annotations", "missing_input",
+                       "pass >=2 annotation columns in 'keys' (e.g. per-method labels)",
+                       recoverable=True, suggested_next_tools=["apply_annotation"])
+    missing = [k for k in keys if k not in adata.obs.columns]
+    if missing:
+        return S.error("harmonize_annotations", "missing_input",
+                       f"annotation column(s) absent in obs: {missing}", recoverable=True,
+                       suggested_next_tools=["apply_annotation"])
+
+    warnings: list[str] = []
+    cellhint_present = _findable("cellhint")
+    method_used = None
+    if method in ("auto", "cellhint") and cellhint_present:
+        try:
+            _harmonize_with_cellhint(adata, keys, out_key)
+            method_used = "cellhint"
+        except Exception as exc:  # noqa: BLE001 — degrade to consensus, never fail the step
+            warnings.append(f"cellhint path unavailable ({type(exc).__name__}) → consensus majority-vote fallback")
+    elif method == "cellhint" and not cellhint_present:
+        warnings.append("method='cellhint' but cellhint not installed → consensus majority-vote fallback")
+
+    pairwise: dict = {}
+    if method_used is None:                          # embedding-independent majority-vote fallback
+        out, agree, pairwise = _majority_vote(adata, keys, min_agreement=min_agreement,
+                                              ambiguous_label=ambiguous_label)
+        adata.obs[out_key] = pd.Categorical(out)
+        adata.obs[f"{out_key}_agreement"] = agree.astype("float32")
+        method_used = "consensus_fallback"
+
+    dist = adata.obs[out_key].value_counts().to_dict()
+    n_amb = int((adata.obs[out_key].astype(str) == ambiguous_label).sum())
+    adata.uns.setdefault(UNS_ANNO, {})
+    adata.uns[UNS_ANNO]["harmonized"] = {
+        "out_key": out_key, "source_keys": keys, "method_used": method_used,
+        "min_agreement": min_agreement, "n_ambiguous": n_amb, "pairwise_agreement": pairwise,
+    }
+    try:
+        session.log_decision(S.DecisionEvent(
+            decision_type="annotation_harmonization",
+            choice={"out_key": out_key, "method_used": method_used, "keys": keys},
+            candidates=[], rationale=f"harmonize {keys} via {method_used}",
+            stage="harmonize_annotations", params={"out_key": out_key, "method": method}).to_dict())
+    except Exception:  # noqa: BLE001
+        pass
+
+    summary = {
+        "out_key": out_key, "source_keys": keys, "method": method, "method_used": method_used,
+        "cellhint_available": bool(cellhint_present),
+        "n_ambiguous": n_amb, "ambiguous_frac": round(n_amb / adata.n_obs, 3),
+        "pairwise_agreement": pairwise,
+        "label_distribution": {str(k): int(v) for k, v in dist.items()},
+        "note": "Harmonized label → use as benchmark label_key (embedding-independent). Pass "
+                f"'{ambiguous_label}' + non-cell-type labels to benchmark drop_labels (caller-chosen).",
+    }
+    cp = session.checkpoint("harmonize_annotations", x_state=session.manifest.x_state,
+                            params={"out_key": out_key, "method": method, "keys": keys})
+    return S.success("harmonize_annotations", summary=summary, warnings=warnings, checkpoint=cp.path,
+                     determinism_grade="A", duration_s=round(time.time() - t0, 3),
+                     suggested_next_tools=["benchmark"])
 
 
 # --------------------------------------------------------------------------- #

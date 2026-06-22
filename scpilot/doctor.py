@@ -33,7 +33,7 @@ _REQUIRED = [
 # Optional packages — enable specific (gated) tools when present.
 _OPTIONAL = [
     "celltypist", "infercnvpy", "gtfparse", "pybiomart",
-    "scvelo", "cellrank", "palantir", "cytotrace",
+    "scvelo", "cellrank", "palantir", "cytotrace", "cellhint",
 ]
 # import name -> distribution name (for version lookup) when they differ.
 _DIST = {"scvi": "scvi-tools", "skmisc": "scikit-misc", "igraph": "igraph"}
@@ -137,6 +137,7 @@ def run() -> dict:
         "benchmark_scib": present["scib_metrics"],
         "cluster_leiden": present["leidenalg"] and present["igraph"],
         "annotate_celltypist": present["celltypist"],
+        "harmonize_cellhint": present["cellhint"],            # optional label-vocab alignment (else consensus)
         # CNV (Tier 2): infercnvpy + at least one coordinate source (GTF via gtfparse, or biomart)
         "cnv_available": present["infercnvpy"] and (present["gtfparse"] or present["pybiomart"]),
         "velocity_available": present["scvelo"],              # + data gate: spliced/unspliced layers

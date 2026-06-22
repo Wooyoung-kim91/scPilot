@@ -42,14 +42,14 @@ from scpilot import tools
 from scpilot.llm import prompts
 from scpilot.llm.provider import Provider, ToolCall
 
-# Tools the agent is allowed to drive autonomously (registry names). Long-running /
-# job-model tools (train_scvi, ingest, benchmark) and raw inspect are excluded from the
-# default autonomous set; integration tools are allowed but optional. This is a policy
-# list, not a hardcode of behaviour — the registry remains the single source of truth.
+# Tools the agent is allowed to drive autonomously (registry names). train_scvi/ingest and
+# raw inspect stay out of the default set; integration + benchmark are allowed (benchmark is the
+# Phase-C integration scorer). This is a policy list, not a hardcode of behaviour — the registry
+# remains the single source of truth.
 DEFAULT_TOOLSET = [
     "detect_state", "qc_metrics", "qc_filter", "preprocess", "cluster_sweep", "cluster",
     "markers", "annotation_review", "apply_annotation", "plots",
-    "integrate_scvi", "integrate_harmony",
+    "integrate_scvi", "integrate_harmony", "harmonize_annotations", "benchmark",
     "compartment_plan", "compartment_subset",
     "fine_annotation_review", "apply_fine_annotation",
 ]
@@ -96,7 +96,19 @@ _PARAM_HINTS: dict[str, dict] = {
         "confidence": {"type": "object", "description": "optional cluster_id -> 0..1 confidence"},
         "review_required": {"type": "object", "description": "optional cluster_id -> bool"},
         "tissue": {"type": "string", "description": "tissue/condition context"}},
-    "plots": {"kind": {"type": "string", "description": "umap | qc_violin | hvg | pca_variance | dotplot"}},
+    "plots": {"kind": {"type": "string",
+                       "description": "umap | qc_violin | scatter | qc_thresholds | resolution_sweep | hvg | "
+                                      "pca_variance | dotplot"}},
+    "harmonize_annotations": {
+        "keys": {"type": "array", "description": "per-method label columns to harmonize "
+                                                 "(e.g. [major_cell_type, major_cell_type_harmony, major_cell_type_scvi])"},
+        "out_key": {"type": "string", "description": "output harmonized label column (default celltype_harmonized)"},
+        "method": {"type": "string", "description": "auto | cellhint | consensus (auto: cellhint if installed else consensus)"}},
+    "benchmark": {
+        "label_key": {"type": "string", "description": "harmonized/consensus cell-type key (NOT an embedding's own clustering)"},
+        "batch_key": {"type": "string"},
+        "embeddings": {"type": "array", "description": "obsm keys to score, e.g. [X_pca, X_harmony, X_scVI]"},
+        "drop_labels": {"type": "array", "description": "non-cell-type/sentinel labels to exclude (caller-chosen)"}},
     "compartment_plan": {"groupby": {"type": "string", "description": "compartment key (major_cell_type)"},
                          "min_cells": {"type": "integer", "description": "branch floor — min cells"},
                          "min_samples": {"type": "integer", "description": "branch floor — min samples"}},

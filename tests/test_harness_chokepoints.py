@@ -520,6 +520,30 @@ def test_derive_dotplot_markers_family_contiguous():
     assert len(mac) == 2 and mac[1] == mac[0] + 1, order      # Macrophage* block is contiguous
 
 
+def test_harmonize_annotations_consensus_fallback(tmp_path):
+    # cellhint is not installed → harmonize_annotations must fall back to the embedding-independent
+    # majority vote (graceful), write the harmonized label, and report which path it used.
+    from scpilot import tools
+
+    s = Session.create(tmp_path / "sess")
+    a = _tiny_adata()
+    n = a.n_obs
+    base = ["T" if i % 2 == 0 else "B" for i in range(n)]
+    a.obs["major_cell_type"] = base
+    a.obs["major_cell_type_harmony"] = base                 # agrees
+    a.obs["major_cell_type_scvi"] = ["T"] * n               # disagrees on the B cells (minority)
+    s.set_adata(a)
+
+    res = tools.run("harmonize_annotations", s,
+                    keys=["major_cell_type", "major_cell_type_harmony", "major_cell_type_scvi"])
+    assert res.status == "success"
+    assert res.summary["method_used"] == "consensus_fallback"   # cellhint absent → fallback
+    assert res.summary["cellhint_available"] is False
+    out = s.adata.obs["celltype_harmonized"].astype(str).tolist()
+    assert out == base                                          # 2/3 majority resolves every cell
+    assert res.summary["n_ambiguous"] == 0
+
+
 def test_phase_b_annotation_evidence(tmp_path):
     # mean_in exposure + marker_sets recording + broad dotplot (recorded + derived paths)
     import json

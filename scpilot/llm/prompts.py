@@ -167,18 +167,21 @@ CANONICAL FLOW (skip steps already satisfied per detect_state; stop when the goa
        -> apply_annotation(groupby=<that leiden key>, key=major_cell_type_<model>, labels=...)
    Keep each method's labels in a DISTINCT key (major_cell_type / _harmony / _scvi) so they
    coexist and can be compared. Resolution is chosen per embedding from its own sweep (user value overrides).
-7. Benchmark the integration methods — but FIRST fix the label_key circularity (de-risk ①):
-   a. consensus_annotation(keys=[major_cell_type_merge, _harmony, _scvi, ...]) -> a per-cell
-      EMBEDDING-INDEPENDENT consensus label (majority vote; disagreements -> 'ambiguous').
-      NEVER benchmark an embedding with its OWN clustering-derived labels.
-   b. benchmark(label_key=<consensus>, batch_key=..., embeddings=[X_pca,X_harmony,X_scVI],
+7. Harmonize → benchmark → pick best reduction → re-establish Tier-1 (fix label_key circularity, de-risk ①):
+   a. harmonize_annotations(keys=[major_cell_type, major_cell_type_harmony, major_cell_type_scvi, ...]) ->
+      a per-cell EMBEDDING-INDEPENDENT harmonized label (cellhint label-vocabulary alignment when
+      installed, else majority-vote consensus fallback — same role). NEVER benchmark an embedding
+      with its OWN clustering-derived labels.
+   b. benchmark(label_key=<harmonized out_key>, batch_key=..., embeddings=[X_pca,X_harmony,X_scVI],
       drop_labels=<non-cell-type labels>). drop_labels = the tool sentinels (Unknown/Mixed/
       Low_quality/ambiguous, dropped by default) PLUS any dataset-specific NON-lineage labels
       you assigned (e.g. Stress, Erythrocyte, Cycling) — you choose these per dataset; they are
-      NOT hardcoded. Do NOT recompute reductions: benchmark row-subsets the existing embeddings
-      (dropped/ambiguous cells excluded) and scib evaluates them as-produced.
-   c. Pick the integration method from batch-correction AND bio-conservation together (not the
-      aggregate alone; watch overcorrection warnings).
+      NOT hardcoded. Returns plot_results_table + summary.best / ranking_by_total / overcorrection_flag.
+   c. Pick the best reduction from batch-correction AND bio-conservation together (use summary.best
+      but override if overcorrection_flag warns it wins batch-mixing while losing bio-conservation).
+   d. RE-ESTABLISH the final Tier-1 on the chosen reduction: cluster_sweep -> cluster(use_rep=<best>)
+      -> markers -> annotation_review -> apply_annotation(key=major_cell_type) so the canonical
+      major_cell_type is the best-reduction call. State the reduction choice (candidates=ranking).
 8. Malignancy (Tier 2) — only if cnv_available AND the goal needs it:
    a. annotate_genomic_positions FIRST (the merged var has only symbols). It fills
       var[chromosome,start,end] from a pinned GENCODE GTF; gate on protein_coding_coverage
