@@ -171,3 +171,192 @@ def test_replay_surfaces_skipped_structured_decisions(tmp_path):
     info = report["structured_decisions_not_reexecuted"]
     assert info["count"] == 2
     assert set(info["types"]) == {"annotation_strategy", "de_design"}
+
+
+# --------------------------------------------------------------------------- #
+# Outputs harness — per-step OutputRecord binds artifacts(+sha) + reasoning + provenance
+# --------------------------------------------------------------------------- #
+def test_outputs_jsonl_binds_artifacts_reasoning_provenance(tmp_path):
+    from typer.testing import CliRunner
+
+    from scpilot.cli import app
+
+    inp = tmp_path / "in.h5ad"
+    _tiny_adata().write_h5ad(inp)
+    wd = tmp_path / "sess"
+    res = CliRunner().invoke(app, ["step", "qc_metrics", str(inp), "-w", str(wd),
+                                   "-p", "run_scrublet=false",
+                                   "-p", "reasoning=QC threshold review", "--seed", "0"])
+    assert res.exit_code == 0, res.output
+    recs = [json.loads(l) for l in (wd / "outputs.jsonl").read_text().splitlines()]
+    assert recs, "outputs.jsonl should hold one record per step"
+    r = recs[-1]
+    assert r["tool"] == "qc_metrics"
+    assert r["reasoning"] == "QC threshold review"     # WHY bound to the step
+    assert r["recipe_hash"] and r["seed"] == 0          # provenance
+    # auto-plot artifact captured with an integrity sha256
+    assert r["artifacts"], "expected the qc auto-plot to be cataloged"
+    assert any((a.get("meta") or {}).get("sha256") for a in r["artifacts"])
+
+
+def test_report_links_artifacts_to_producing_step(tmp_path):
+    from scpilot import tools
+
+    s = Session.create(tmp_path / "sess")
+    s._ensure_dirs()
+    (s.artifacts_dir / "markers.csv").write_text("gene,score\nA,1.0\n")
+    (s.artifacts_dir / "umap.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+    res = S.success("markers", artifacts=[
+        S.Artifact(path=str(s.artifacts_dir / "markers.csv"), kind="csv"),
+        S.Artifact(path=str(s.artifacts_dir / "umap.png"), kind="png"),
+    ])
+    s.record_run(res, params={"n_genes": 25}, seed=0, reasoning="rank genes per cluster")
+
+    rep = tools.run("report", s)
+    assert rep.status == "success"
+    rj = json.loads((s.artifacts_dir / "report.json").read_text())
+    arts = rj["artifacts"]
+    # CSV table is included (not just PNGs) and carries its producing step + reasoning
+    csv = next(a for a in arts if a["kind"] == "csv")
+    assert csv["tool"] == "markers" and csv["reasoning"] == "rank genes per cluster"
+    assert csv["sha256"]                                  # integrity hash recorded
+    assert rep.summary["n_tables"] == 1 and rep.summary["n_figures"] == 1
+
+
+# --------------------------------------------------------------------------- #
+# Pipeline notebook — cell-by-cell execution reproduces the recorded result
+# --------------------------------------------------------------------------- #
+def test_generated_notebook_reproduces_cell_by_cell(tmp_path):
+    import subprocess
+    import sys
+
+    from scpilot import tools
+    from scpilot.repro import set_global_seed
+
+    # two latent groups so clustering finds real (reproducible) structure
+    rng = np.random.default_rng(0)
+    base = rng.poisson(0.5, (200, 120)).astype("float32")
+    base[:100, :30] += rng.poisson(4.0, (100, 30)).astype("float32")
+    base[100:, 30:60] += rng.poisson(4.0, (100, 30)).astype("float32")
+    a = ad.AnnData(sparse.csr_matrix(base))
+    a.var_names = [f"G{i}" for i in range(120)]
+    a.layers["counts"] = a.X.copy()
+    inp = tmp_path / "in.h5ad"
+    a.write_h5ad(inp)
+
+    s = Session.create(tmp_path / "sess", input_path=str(inp))
+    s.load_input()
+    set_global_seed(0)
+    for stage, params in [("preprocess", {"n_top_genes": 60, "n_pcs": 15}),
+                          ("cluster", {"resolution": 0.5})]:
+        res = tools.run(stage, s, **params)
+        assert res.status == "success", res.error
+        s.record_run(res, params=params, seed=0)
+    orig_n = int(s.adata.obs["leiden"].nunique())
+
+    nb = s.code_dir / "pipeline_notebook.py"
+    text = nb.read_text()
+    # every step cell re-pins its seed (top + 2 steps) → self-contained cells
+    assert text.count("set_global_seed(") >= 3
+
+    # run the generated notebook as a plain script (executes each cell top-to-bottom)
+    r = subprocess.run([sys.executable, str(nb)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-1500:]
+    nb_sess = Session.open(tmp_path / "sess" / "repro_notebook")
+    assert int(nb_sess.adata.obs["leiden"].nunique()) == orig_n   # identical result
+
+
+# --------------------------------------------------------------------------- #
+# QC dynamic params + enforced plots (MAD suggester, before/after, scatter, thresholds,
+# metadata UMAPs, HVG auto-batch)
+# --------------------------------------------------------------------------- #
+def _qc_adata(n_obs=120, n_vars=60):
+    rng = np.random.default_rng(0)
+    X = rng.poisson(1.0, (n_obs, n_vars)).astype("float32")
+    a = ad.AnnData(sparse.csr_matrix(X))
+    a.var_names = [f"G{i}" for i in range(n_vars - 3)] + ["MT-A", "MT-B", "MT-C"]
+    a.obs_names = [f"c{i}" for i in range(n_obs)]
+    a.layers["counts"] = a.X.copy()
+    a.obs["sample_id"] = rng.choice(["s1", "s2", "s3"], n_obs)
+    a.obs["condition"] = rng.choice(["tumor", "normal"], n_obs)
+    return a
+
+
+def test_qc_metrics_emits_mad_suggested_cutoffs(tmp_path):
+    from scpilot import tools
+
+    inp = tmp_path / "in.h5ad"
+    _qc_adata().write_h5ad(inp)
+    s = Session.create(tmp_path / "sess", input_path=str(inp))
+    s.load_input()
+    res = tools.run("qc_metrics", s, run_scrublet=False)
+    assert res.status == "success"
+    sc = res.summary["suggested_cutoffs"]
+    assert {"min_genes", "max_genes", "max_pct_mt"} <= set(sc["global"])    # MAD evidence
+    assert set(sc["per_sample"]) >= {"s1", "s2", "s3"}                      # per-batch
+    assert sc["global"]["min_genes"] >= 0
+
+
+def test_qc_autoplots_before_after_and_thresholds(tmp_path):
+    from typer.testing import CliRunner
+
+    from scpilot.cli import app
+
+    inp = tmp_path / "in.h5ad"
+    _qc_adata().write_h5ad(inp)
+    wd = tmp_path / "sess"
+    runner = CliRunner()
+    r1 = runner.invoke(app, ["step", "qc_metrics", str(inp), "-w", str(wd), "-p", "run_scrublet=false"])
+    assert r1.exit_code == 0, r1.output
+    r2 = runner.invoke(app, ["step", "qc_filter", "-w", str(wd), "-p", "min_genes=3", "-p", "max_pct_mt=80"])
+    assert r2.exit_code == 0, r2.output
+    names = {p.name for p in (wd / "artifacts").glob("*")}
+    # before/after as DISTINCT files (the old fixed-name collision is gone) + justification plot
+    assert any(n.startswith("qc_violin_pre") for n in names)
+    assert any(n.startswith("qc_violin_post") for n in names)
+    assert any(n.startswith("qc_scatter_pre") for n in names)
+    assert any(n.startswith("qc_scatter_post") for n in names)
+    assert any(n.startswith("qc_thresholds") for n in names)
+
+
+def test_cluster_autoplots_metadata_umaps(tmp_path):
+    from typer.testing import CliRunner
+
+    from scpilot.cli import app
+
+    inp = tmp_path / "in.h5ad"
+    _qc_adata(n_obs=200, n_vars=80).write_h5ad(inp)
+    wd = tmp_path / "sess"
+    runner = CliRunner()
+    assert runner.invoke(app, ["step", "preprocess", str(inp), "-w", str(wd),
+                               "-p", "n_top_genes=40", "-p", "n_pcs=15"]).exit_code == 0
+    assert runner.invoke(app, ["step", "cluster", "-w", str(wd), "-p", "resolution=0.5"]).exit_code == 0
+    umaps = {p.name for p in (wd / "artifacts").glob("umap*")}
+    assert any("leiden" in n for n in umaps)            # leiden UMAP
+    assert any("sample_id" in n for n in umaps)         # enforced metadata UMAP
+    assert any("condition" in n for n in umaps)
+
+
+def test_preprocess_auto_detects_hvg_batch_key(tmp_path):
+    from scpilot import tools
+
+    inp = tmp_path / "in.h5ad"
+    _qc_adata(n_obs=150, n_vars=80).write_h5ad(inp)
+    s = Session.create(tmp_path / "sess", input_path=str(inp))
+    s.load_input()
+    res = tools.run("preprocess", s, n_top_genes=40, n_pcs=15)   # no hvg_batch_key passed
+    assert res.status == "success"
+    assert res.summary["hvg_batch_key"] == "sample_id"           # auto-detected
+
+
+def test_plots_scatter_and_qc_thresholds_kinds(tmp_path):
+    from scpilot import tools
+
+    inp = tmp_path / "in.h5ad"
+    _qc_adata().write_h5ad(inp)
+    s = Session.create(tmp_path / "sess", input_path=str(inp))
+    s.load_input()
+    tools.run("qc_metrics", s, run_scrublet=False)
+    assert tools.run("plots", s, kind="scatter").artifacts
+    assert tools.run("plots", s, kind="qc_thresholds",
+                     cutoffs={"min_genes": 3, "max_pct_mt": 50}).artifacts

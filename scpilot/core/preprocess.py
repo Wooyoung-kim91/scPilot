@@ -53,11 +53,25 @@ def preprocess(session, *, target_sum: float = 1e4, n_top_genes: int = 2000,
     # normalize_total+log1p values are stored in `scale.data` (kept for markers/annotation)
     adata.layers["scale.data"] = adata.X.copy()
 
-    # --- HVG (seurat_v3, counts-based; batch-aware if a valid key is given) ---
+    # --- HVG (seurat_v3, counts-based; batch-aware) ---
     batch_key = hvg_batch_key
     if batch_key and batch_key not in adata.obs.columns:
         warnings.append(f"hvg_batch_key '{batch_key}' absent — HVG computed without batch")
         batch_key = None
+    if batch_key is None:
+        # auto-detect a sample-like batch column so HVG is batch-aware by default (the
+        # caller/LLM may still override via hvg_batch_key). Skip degenerate/huge cardinality.
+        for cand in ("sample_id", "sample", "batch", "donor", "patient"):
+            if cand in adata.obs.columns:
+                try:
+                    nu = int(adata.obs[cand].nunique(dropna=True))
+                except Exception:  # noqa: BLE001
+                    continue
+                if 2 <= nu <= 200:
+                    batch_key = cand
+                    warnings.append(f"hvg_batch_key auto-detected: '{cand}' (n={nu}); "
+                                    "pass hvg_batch_key to override")
+                    break
     n_top = min(n_top_genes, adata.n_vars)
     sc.pp.highly_variable_genes(adata, flavor="seurat_v3", n_top_genes=n_top,
                                 layer="counts", batch_key=batch_key)

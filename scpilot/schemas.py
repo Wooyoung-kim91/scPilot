@@ -289,6 +289,36 @@ class RunLogRecord:
         return _sanitize(dataclasses.asdict(self))
 
 
+@dataclass
+class OutputRecord:
+    """One step's OUTPUTS bound to its WHY — appended to ``outputs.jsonl``.
+
+    The single per-step record that binds ``[step → params → artifacts → reasoning →
+    provenance]`` so the report, the generated pipeline, and audit can answer "which
+    artifacts did this step produce, with what params, and why?". Kept SEPARATE from the
+    frozen ``RunLogRecord`` (the run log stays a pure replayable recipe); this index adds
+    output provenance without inflating that contract.
+
+    ``artifacts`` are ``Artifact``-shaped dicts whose ``meta`` carries ``sha256`` + ``bytes``
+    (integrity/audit, NOT replay equality — figure bytes are non-deterministic). ``reasoning``
+    is the caller/LLM's prose WHY for this step (optional).
+    """
+    tool: str
+    status: Status = "success"
+    stage: str | None = None
+    n: int | None = None                              # session run index when recorded
+    recipe_hash: str | None = None
+    seed: int | None = None
+    params: dict = field(default_factory=dict)
+    summary: dict = field(default_factory=dict)
+    artifacts: list = field(default_factory=list)     # [{path, kind, description, meta(+sha256,bytes)}]
+    reasoning: str | None = None
+    warnings: list = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return _sanitize(dataclasses.asdict(self))
+
+
 def validate_decision(d: dict) -> list[str]:
     """Return a list of problems (empty == valid) for a decision-event dict."""
     problems = [f"missing required key: {k}" for k in _DECISION_REQUIRED if k not in d]

@@ -67,6 +67,9 @@ _PARAM_HINTS: dict[str, dict] = {
     "preprocess": {
         "n_top_genes": {"type": "integer", "description": "number of HVGs"},
         "n_pcs": {"type": "integer", "description": "number of principal components"},
+        "hvg_batch_key": {"type": "string",
+                          "description": "obs column for batch-aware HVG (auto-detected from "
+                                         "sample_id/sample/batch if omitted)"},
     },
     "cluster": {
         "use_rep": {"type": "string", "description": "X_pca | X_harmony | X_scVI"},
@@ -215,14 +218,17 @@ def _execute_registry_tool(session, name: str, args: dict, seed: int,
     result = spec.fn(session, **args)
     stats.errors += 0 if result.status == "success" else 1
 
-    # run-log record via the shared chokepoint — IDENTICAL shape to the deterministic
-    # `scpilot step` / MCP paths (seed + recipe_hash + lib_versions populated the same way),
-    # so a mode-2 session replays with tools.make_replay_executor() and NO LLM.
+    # record via the shared chokepoint — IDENTICAL to the deterministic `step` / MCP paths
+    # (seed + recipe_hash + lib_versions), so a mode-2 session replays with NO LLM. Using
+    # record_tool_run (not record_run) means mode-2 ALSO gets per-step auto-plots, the
+    # reasoning narrative, and the outputs.jsonl binding — with the model's own prose as the
+    # WHY for this step (plan: per-output reasoning in every mode).
     in_cp = None
     cps = session.manifest.checkpoints
     if len(cps) >= 2 and result.checkpoint:
         in_cp = cps[-2].get("id")
-    session.record_run(result, params=args, seed=seed, input_checkpoint=in_cp, stage=name)
+    session.record_tool_run(result, params=args, seed=seed, input_checkpoint=in_cp,
+                            reasoning=(rationale.strip() or None))
 
     # decision event for consequential choices (frozen schema; powers audit + replay note)
     dtype = _DECISION_TYPE.get(name)

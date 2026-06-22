@@ -177,6 +177,29 @@ def test_report_tool_assembles_markdown(tmp_path):
     assert (s.artifacts_dir / "report.json").exists()
 
 
+def test_mode2_writes_reasoning_log_and_outputs(tmp_path):
+    # mode-2 now routes through record_tool_run → it must produce the reasoning narrative
+    # AND the per-step outputs index (artifacts + reasoning), like mode-1/3 (plan R1/R3).
+    s = _session(tmp_path)
+    script = [
+        _resp(_tc(1, "preprocess", {"n_top_genes": 80, "n_pcs": 20})),
+        _resp(_tc(2, "cluster", {"resolution": 0.5})),
+        LLMResponse(text="done", tool_calls=[], stop_reason="end_turn", usage={}),
+    ]
+    run_agent(s, FakeProvider(script), seed=0, max_iters=20)
+
+    # reasoning narrative written (was absent in mode-2 before)
+    assert s.reasoning_log_path.exists()
+    rlog = s.reasoning_log_path.read_text()
+    assert "preprocess" in rlog and "cluster" in rlog
+
+    # per-step outputs index written, with the model's prose bound as the WHY
+    orecs = [json.loads(l) for l in s.outputs_path.read_text().splitlines() if l.strip()]
+    tools_logged = {r["tool"] for r in orecs}
+    assert {"preprocess", "cluster"} <= tools_logged
+    assert any(r.get("reasoning") == "reasoning" for r in orecs)   # _resp() prose captured
+
+
 def test_agent_signals_max_iters_when_never_stops(tmp_path):
     # model keeps calling a tool forever → loop must stop and report it (not silently)
     s = _session(tmp_path)
