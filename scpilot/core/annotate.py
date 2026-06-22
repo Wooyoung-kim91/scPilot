@@ -1,7 +1,7 @@
-"""Annotation — Tier 1 broad (B8) + Tier 3 fine (B13).
+"""Annotation — Tier 1 broad (B8) + Tier 2 fine (B13).
 
 Tier 1 (``annotate_broad``) assigns ``obs['major_cell_type']`` — the broad
-compartment that becomes the scib benchmark ``label_key``. Tier 3 (bottom of file:
+compartment that becomes the scib benchmark ``label_key``. Tier 2 (bottom of file:
 ``fine_annotation_review`` → ``apply_fine_annotation``) refines WITHIN a compartment
 to ``obs['fine_cell_type']`` + ``obs['facs_style_label']`` (evidence→LLM→apply, same
 marker-DB-free split), recording authority/evidence in ``uns[...]['annotation_tree']``.
@@ -86,7 +86,7 @@ AMBIGUOUS_LABEL = "ambiguous"   # consensus_annotation sentinel: methods disagre
 ARTIFACT_LABELS = {UNKNOWN_LABEL, MIXED_LABEL, LOWQ_LABEL, AMBIGUOUS_LABEL}
 UNS_ANNO = "scpilot_annotation"
 
-# ---- Tier 3 (fine) constants (B13) ----
+# ---- Tier 2 (fine) constants (B13) ----
 UNS_TREE = "annotation_tree"            # nested under UNS_ANNO: per-subcluster authority + evidence
 FINE_UNRESOLVED = "unresolved"          # merge fallback label for under-powered subclusters
 # Confounder obs columns surfaced per subcluster — these are SCORE/QC columns produced upstream
@@ -883,9 +883,9 @@ def derive_dotplot_markers(adata, *, cluster_key, label_map, top_k=5,
 
 
 # =========================================================================== #
-# Tier 3 — fine annotation (B13): evidence → LLM → apply (marker-DB-free)
+# Tier 2 — fine annotation (B13): evidence → LLM → apply (marker-DB-free)
 # =========================================================================== #
-# Same two-step split as Tier-1/Tier-2: a deterministic tool packages per-SUBCLUSTER
+# Same two-step split as Tier-1 / malignancy: a deterministic tool packages per-SUBCLUSTER
 # evidence WITHIN a compartment (from compartment_subset → cluster → markers), the LLM
 # infers fine_cell_type + a FACS-style display label from the DE itself (no fixed panel),
 # and apply_fine_annotation records the calls with deterministic HARD RULES (tiny-cluster
@@ -904,7 +904,7 @@ def _fine_score_genes(adata, genes, name):
 
 
 @register("fine_annotation_review", mutating=False,
-          description="Tier-3 FINE annotation EVIDENCE (read-only, NO fixed marker panel). Run WITHIN a "
+          description="Tier-2 FINE annotation EVIDENCE (read-only, NO fixed marker panel). Run WITHIN a "
                       "compartment subset (compartment_subset → cluster → markers): per subcluster it packages the "
                       "top-N SIGNIFICANT ranked DE (logFC/padj/pct), size, sample distribution + single-patient "
                       "dominance, the dominant parent compartment (major_cell_type) and malignancy composition (if "
@@ -1096,7 +1096,7 @@ def fine_annotation_review(session, *, groupby: str = "leiden", compartment: str
 
 
 @register("apply_fine_annotation", mutating=True,
-          description="Write the LLM's Tier-3 FINE calls: obs['fine_cell_type'] + obs['facs_style_label'] (display, "
+          description="Write the LLM's Tier-2 FINE calls: obs['fine_cell_type'] + obs['facs_style_label'] (display, "
                       "e.g. 'CD8+ PD-1+ T cells') + optional obs['cell_state'], keyed on the subcluster map the LLM "
                       "inferred from fine_annotation_review. Cell TYPE and STATE stay in separate columns. "
                       "Deterministic HARD RULES: a subcluster below merge_min_cells is MERGED to a fallback label "
@@ -1211,7 +1211,7 @@ def apply_fine_annotation(session, *, groupby: str = "leiden", fine_labels: dict
         session.log_decision(S.DecisionEvent(
             decision_type="fine_llm_labels",
             choice={cl: fine_final[cl] for cl in clusters}, candidates=[],
-            rationale=f"DE-based marker-free Tier-3 fine labels (compartment={overall_comp})",
+            rationale=f"DE-based marker-free Tier-2 fine labels (compartment={overall_comp})",
             stage="apply_fine_annotation", params={"groupby": groupby, "fine_key": fine_key}).to_dict())
     except Exception:  # noqa: BLE001
         pass

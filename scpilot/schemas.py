@@ -231,7 +231,7 @@ DECISION_TYPES = (
     "clustering_resolution",    # leiden resolution
     "tier1_consensus_label",    # broad major_cell_type consensus (de-risk ①)
     "compartment_branch",       # which compartments to recurse into
-    "malignancy_call",          # Tier 2 malignant/non/uncertain
+    "malignancy_call",          # malignancy: malignant/non/uncertain
     "cnv_reference",            # reference cells chosen for inferCNV
     "cnv_fallback",             # CNV fallback path taken
     "trajectory_method",        # PAGA | slingshot | ... (gated)

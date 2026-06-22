@@ -1,4 +1,4 @@
-"""Tier 2 malignancy track — genomic-position annotation (B12-pre) + infercnv (B12).
+"""Malignancy (CNV) track — genomic-position annotation (B12-pre) + infercnv (B12).
 
 ``annotate_genomic_positions`` is the REQUIRED preflight for CNV: the merged PDAC
 ``var`` carries only gene symbols (no coordinates), so ``infercnvpy.tl.infercnv``
@@ -22,7 +22,7 @@ Design (PoC-validated 2026-06-10, GENCODE v44 basic GRCh38 × PDAC 40,237 symbol
 - **Invariant**: ``var`` columns are ADDED only (non-destructive); ``layers['counts']``
   and ``.X`` meaning are unchanged. GTF hash/build/coverage go into ``.uns['scpilot']``.
 
-Malignancy (the Tier-2 CALL) follows the same split as Tier-1 annotation
+Malignancy (the malignancy CALL) follows the same split as Tier-1 annotation
 (``annotation_review`` -> LLM -> ``apply_annotation``):
 
 - ``cnv_score`` produces the per-cell CNV burden (deterministic evidence).
@@ -237,7 +237,7 @@ def annotate_genomic_positions(session, *, gtf: str | None = None, genome_build:
 
 
 @register("cnv_score", mutating=True, long_running=True,
-          description="Tier 2 CNV evidence (plan B12): infercnvpy tl.infercnv -> cnv-space leiden -> per-cell "
+          description="CNV evidence (malignancy track) (plan B12): infercnvpy tl.infercnv -> cnv-space leiden -> per-cell "
                       "cnv_score. DETERMINISTIC EVIDENCE ONLY (no malignant/non-malignant call here — that is a "
                       "downstream multi-evidence judgment: CNV burden + tumor markers + reference + patient "
                       "expansion). reference_key/reference_cat set the baseline (e.g. condition=Normal, or a known "
@@ -363,7 +363,7 @@ def _score_genes(adata, genes, name):
 
 
 @register("malignancy_evidence", mutating=False,
-          description="Tier-2 malignancy EVIDENCE for the LLM (read-only, no call, no hardcoded panel/threshold). "
+          description="Malignancy EVIDENCE for the LLM (read-only, no call, no hardcoded panel/threshold). "
                       "Per group (cnv_leiden or a cell-type key) it packages: CNV burden RELATIVE to the in-data "
                       "non-malignant reference (reference_key/reference_cat) — group mean, ratio, and fraction of "
                       "cells above the reference 95th pct (data-driven, NOT an absolute cutoff); clonal-expansion "
@@ -505,7 +505,7 @@ def malignancy_evidence(session, *, groupby: str | None = None, reference_key: s
 
 
 @register("apply_malignancy", mutating=True,
-          description="Write the LLM's Tier-2 malignancy call into obs['malignancy'] over the FIXED vocabulary "
+          description="Write the LLM's malignancy call into obs['malignancy'] over the FIXED vocabulary "
                       "{malignant, non_malignant, uncertain, not_applicable} — the group->label map the LLM "
                       "inferred from malignancy_evidence. Deterministic given the map (replayable). Enforces the "
                       "HARD RULE: a 'malignant' call made without CNV evidence (no obs['cnv_score']) is forced to "

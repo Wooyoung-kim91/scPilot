@@ -138,7 +138,7 @@ def run() -> dict:
         "cluster_leiden": present["leidenalg"] and present["igraph"],
         "annotate_celltypist": present["celltypist"],
         "harmonize_cellhint": present["cellhint"],            # optional label-vocab alignment (else consensus)
-        # CNV (Tier 2): infercnvpy + at least one coordinate source (GTF via gtfparse, or biomart)
+        # CNV (malignancy track): infercnvpy + at least one coordinate source (GTF via gtfparse, or biomart)
         "cnv_available": present["infercnvpy"] and (present["gtfparse"] or present["pybiomart"]),
         "velocity_available": present["scvelo"],              # + data gate: spliced/unspliced layers
         "trajectory_cellrank": present["cellrank"],
@@ -173,7 +173,7 @@ def run() -> dict:
     if np_major is not None and np_major < 2:
         warnings.append(f"numpy {np_ver} < 2.x — env was verified on numpy 2.x; mismatch risk")
     if not capabilities["cnv_available"]:
-        warnings.append("cnv_available=false: need infercnvpy + (gtfparse or pybiomart) for Tier 2 CNV")
+        warnings.append("cnv_available=false: need infercnvpy + (gtfparse or pybiomart) for CNV (malignancy track)")
     if not torch_cuda:
         warnings.append("no CUDA GPU: scVI runs CPU-only (subsample + reduced epochs); set accelerator='auto' after GPU")
     if "fail" in smoke.get("normalize_log1p_hvg_seurat_v3_pca", ""):

@@ -182,7 +182,22 @@ CANONICAL FLOW (skip steps already satisfied per detect_state; stop when the goa
    d. RE-ESTABLISH the final Tier-1 on the chosen reduction: cluster_sweep -> cluster(use_rep=<best>)
       -> markers -> annotation_review -> apply_annotation(key=major_cell_type) so the canonical
       major_cell_type is the best-reduction call. State the reduction choice (candidates=ranking).
-8. Malignancy (Tier 2) — only if cnv_available AND the goal needs it:
+8. Subtype / fine annotation (Tier 2) — refine WITHIN each compartment (SAME method as Tier-1):
+   a. compartment_plan(groupby=major_cell_type, batch_key, min_cells, min_samples) -> read REAL
+      per-compartment counts/coverage + batch-mixing; the floor marks under-powered branches.
+      Record a compartment_branch decision (which compartments to recurse into; do not branch
+      blocked/under-powered ones unless justified).
+   b. For each chosen compartment: compartment_subset(compartment, mode='clustering',
+      use_rep=<chosen integration emb>) to subcluster on the batch-corrected embedding (or
+      mode='markers' to re-derive compartment-relevant HVGs). Then cluster_sweep(use_rep) ->
+      cluster(use_rep, resolution=<chosen>) -> markers(groupby=<subset leiden>) on the SUBSET.
+   c. fine_annotation_review(groupby=<subset leiden>) -> read each subcluster's de_table
+      (mean_in+pct+spec) + confounders; pick a >=3-gene marker-set and INFER fine_cell_type + a
+      FACS-style label (the PRIMARY subtype name) from the DE (see FINE_ANNOTATION_PROMPT; keep
+      type vs state separate). apply_fine_annotation(groupby, fine_labels, facs_labels, cell_state,
+      confidence, review_required, evidence_for) -> writes obs['fine_cell_type','facs_style_label']
+      + annotation_tree (tiny clusters merged + no-evidence calls flagged automatically).
+9. Malignancy / CNV (tumor only, not a tier) — AFTER subtype, only if cnv_available AND the goal needs it:
    a. annotate_genomic_positions FIRST (the merged var has only symbols). It fills
       var[chromosome,start,end] from a pinned GENCODE GTF; gate on protein_coding_coverage
       (>=0.8 ok). If the gate fails (build/symbol-version mismatch), fix the GTF before CNV.
@@ -196,20 +211,6 @@ CANONICAL FLOW (skip steps already satisfied per detect_state; stop when the goa
       expansion) — never a CNV-score threshold alone. If cnv_available is false, decide from
       markers+reference+expansion and flag review_required (apply_malignancy enforces this).
       See MALIGNANCY_PROMPT.
-9. Fine annotation (Tier 3) — refine WITHIN compartments, per the goal.
-   a. compartment_plan(groupby=major_cell_type, batch_key, min_cells, min_samples) -> read REAL
-      per-compartment counts/coverage + batch-mixing; the floor marks under-powered branches.
-      Record a compartment_branch decision (which compartments to recurse into; do not branch
-      blocked/under-powered ones unless justified).
-   b. For each chosen compartment: compartment_subset(compartment, mode='clustering',
-      use_rep=<chosen integration emb>) to subcluster on the batch-corrected embedding (or
-      mode='markers' to re-derive compartment-relevant HVGs). Then cluster(use_rep, resolution=
-      <user-set, else default 0.25>) -> markers(groupby=<subset leiden>) on the SUBSET.
-   c. fine_annotation_review(groupby=<subset leiden>) -> read each subcluster's DE + confounders;
-      INFER fine_cell_type + a FACS-style label from the DE (see FINE_ANNOTATION_PROMPT; keep
-      type vs state separate). apply_fine_annotation(groupby, fine_labels, facs_labels, cell_state,
-      confidence, review_required, evidence_for) -> writes obs['fine_cell_type','facs_style_label']
-      + annotation_tree (tiny clusters merged + no-evidence calls flagged automatically).
    Then DE per the goal and a final report.
 
 When the analysis goal is achieved (or no further safe step exists), STOP calling tools
@@ -229,12 +230,12 @@ confounders, confidence, and a review_required flag.
 Principle (from cancer_scrnaseq_annotation_strategy.md — the single source):
   cell type + malignancy + cell state + trajectory + uncertainty = final proposal.
 
-Tier flow: QC/artifact (Tier 0) -> broad type (Tier 1) -> malignant vs non-malignant
-(Tier 2) -> compartment subclustering (Tier 3) -> trajectory/state WITHIN a compartment
+Tier flow: QC/artifact (Tier 0) -> broad type (Tier 1) -> compartment subtype (Tier 2) ->
+malignancy / CNV (tumor only, not a tier) -> trajectory/state WITHIN a compartment
 (Tier 4) -> consistency review (Tier 5).
 
 HARD RULES (do not violate)
-- Tier 2 malignancy must NOT rely on epithelial markers alone: weigh CNV burden + tumor
+- Malignancy calls must NOT rely on epithelial markers alone: weigh CNV burden + tumor
   markers + normal-epithelial-reference similarity + patient-specific clonal expansion.
   malignancy in {malignant, non_malignant, uncertain, not_applicable}.
 - Keep cell type and cell state SEPARATE. Trajectory/state results go to obs['cell_state']
@@ -254,10 +255,10 @@ re-derive a divergent marker set here.
 """
 
 # ---------------------------------------------------------------------------
-# Malignancy (Tier 2) — judge from multi-axis evidence; NEVER a lone threshold.
+# Malignancy (CNV track) — judge from multi-axis evidence; NEVER a lone threshold.
 # ---------------------------------------------------------------------------
 MALIGNANCY_PROMPT = """\
-You make the Tier-2 malignant / non-malignant call. Like Tier-1 annotation this is a
+You make the malignant / non-malignant call. Like Tier-1 annotation this is a
 two-step split: a deterministic tool packages EVIDENCE, you JUDGE, an apply tool records it.
 
 Flow:
@@ -285,7 +286,7 @@ Supply per-group confidence in [0,1]; flag thin/single-sample groups for review.
 """
 
 # ---------------------------------------------------------------------------
-# Tier-3 fine annotation — infer subtypes WITHIN a compartment from the DE itself.
+# Tier-2 (subtype) fine annotation — infer subtypes WITHIN a compartment from the DE itself.
 # Consumes fine_annotation_review JSON; commits via apply_fine_annotation.
 # ---------------------------------------------------------------------------
 FINE_ANNOTATION_PROMPT = """\
@@ -299,7 +300,7 @@ You receive, per subcluster (from fine_annotation_review):
 - de_table: top-N markers with mean_in (mean log-norm EXPRESSION), logFC, padj, pct_in,
   pct_out, spec (=pct_in-pct_out), score — pick a >=3-gene set high in BOTH mean_in and spec
 - n_cells, compartment (dominant parent major_cell_type) + compartment_purity
-- malignancy_composition (if Tier-2 ran), sample_distribution + single_patient_dominated
+- malignancy_composition (if the malignancy/CNV track ran), sample_distribution + single_patient_dominated
 - confounders: cell-cycle / stress / interferon / activation / doublet scores + %MT
 
 HARD CONSTRAINTS (do not violate)

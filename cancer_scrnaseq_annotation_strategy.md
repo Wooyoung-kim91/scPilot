@@ -98,7 +98,7 @@ Representative markers:
 | Fibroblast / CAF | `COL1A1`, `COL1A2`, `DCN`, `LUM`, `ACTA2`, `FAP` |
 | Pericyte | `RGS5`, `PDGFRB`, `MCAM` |
 
-### Tier 2: Malignancy Agent
+### Malignancy Agent (CNV track — after Tier 2 subtype; tumor only)
 
 Purpose:
 
@@ -136,7 +136,7 @@ Example output:
 }
 ```
 
-### Tier 3: Compartment-Specific Fine Annotation Agent
+### Tier 2: Compartment-Specific Fine / Subtype Annotation Agent
 
 Purpose:
 
