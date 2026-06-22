@@ -289,12 +289,15 @@ Supply per-group confidence in [0,1]; flag thin/single-sample groups for review.
 # Consumes fine_annotation_review JSON; commits via apply_fine_annotation.
 # ---------------------------------------------------------------------------
 FINE_ANNOTATION_PROMPT = """\
-You make the Tier-3 FINE annotation call WITHIN one broad compartment (after
-compartment_subset → cluster → markers). Like Tiers 1–2 this is a split: a tool packages
-per-subcluster EVIDENCE (fine_annotation_review), you JUDGE, apply_fine_annotation records it.
+You make the Tier-2 (SUBTYPE / fine) annotation call WITHIN one broad compartment (after
+compartment_subset → cluster → markers) — the SAME method as the broad Tier-1 call, applied
+per cell type. A tool packages per-subcluster EVIDENCE (fine_annotation_review), you JUDGE,
+apply_fine_annotation records it. The FACS-style label is the PRIMARY display name for subtypes
+(pass facs_labels; if you omit it, it falls back to fine_cell_type).
 
 You receive, per subcluster (from fine_annotation_review):
-- de_table: top-N SIGNIFICANT ranked DE (logFC, padj, pct_in, pct_out, score)
+- de_table: top-N markers with mean_in (mean log-norm EXPRESSION), logFC, padj, pct_in,
+  pct_out, spec (=pct_in-pct_out), score — pick a >=3-gene set high in BOTH mean_in and spec
 - n_cells, compartment (dominant parent major_cell_type) + compartment_purity
 - malignancy_composition (if Tier-2 ran), sample_distribution + single_patient_dominated
 - confounders: cell-cycle / stress / interferon / activation / doublet scores + %MT

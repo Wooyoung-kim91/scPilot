@@ -123,7 +123,8 @@ _PARAM_HINTS: dict[str, dict] = {
     "apply_fine_annotation": {
         "groupby": {"type": "string", "description": "subcluster key the labels are keyed on"},
         "fine_labels": {"type": "object", "description": "subcluster_id -> fine_cell_type (inferred from DE)"},
-        "facs_labels": {"type": "object", "description": "subcluster_id -> FACS-style display label"},
+        "facs_labels": {"type": "object", "description": "subcluster_id -> FACS-style label — the PRIMARY subtype "
+                                                         "display name (set this; falls back to fine_cell_type if omitted)"},
         "cell_state": {"type": "object", "description": "optional subcluster_id -> functional state"},
         "confidence": {"type": "object"}, "review_required": {"type": "object"},
         "evidence_for": {"type": "object", "description": "subcluster_id -> [supporting evidence]"}},

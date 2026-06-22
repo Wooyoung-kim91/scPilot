@@ -114,20 +114,24 @@ def plan_autoplots(tool: str, summary: dict, *, obs: set, obsm: set,
                 specs.append({"kind": "dotplot", "groupby": key,
                               "cluster_key": summary["groupby"], "label_map": summary["labels"]})
     elif tool == "apply_fine_annotation":
-        key = summary.get("fine_key", "fine_cell_type")
+        # FACS-style label is the PRIMARY subtype display name (falls back to fine_cell_type)
+        fk = summary.get("facs_key", "facs_style_label")
+        key = fk if fk in obs else summary.get("fine_key", "fine_cell_type")
         if key in obs:
             specs.append({"kind": "umap", "color": key, "basis": _best_basis(obsm)})
-        # dotplot of per-subcluster marker evidence (DE was just computed on the subcluster
-        # key by `markers`, so derive from it); gives every compartment a marker dotplot too.
-        gb = summary.get("groupby")
-        if gb and gb in obs:
-            specs.append({"kind": "dotplot", "groupby": gb})
+        gb = summary.get("groupby")                          # subcluster leiden (carries the DE)
+        lm = summary.get("facs_label_map")
+        if key in obs and gb and gb in obs and lm:
+            # rows = FACS labels: map the subcluster DE through subcluster->FACS (family-contiguous)
+            specs.append({"kind": "dotplot", "groupby": key, "cluster_key": gb, "label_map": lm})
+        elif gb and gb in obs:
+            specs.append({"kind": "dotplot", "groupby": gb})   # fallback (rows = subcluster id)
     elif tool == "consensus_annotation":
         key = summary.get("out_key")
         if key and key in obs:
             specs.append({"kind": "umap", "color": key, "basis": _best_basis(obsm)})
     elif tool == "merge_fine_annotations":
-        key = summary.get("fine_key", "fine_cell_type")
+        key = "facs_style_label" if "facs_style_label" in obs else summary.get("fine_key", "fine_cell_type")
         if key in obs:
             specs.append({"kind": "umap", "color": key, "basis": _best_basis(obsm)})
     return specs

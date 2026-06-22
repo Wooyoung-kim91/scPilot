@@ -988,10 +988,18 @@ def fine_annotation_review(session, *, groupby: str = "leiden", compartment: str
             .sort_values("spec", ascending=False) if has_spec else sub
         n_specific = int(len(spec_sub))
         top = spec_sub.head(top_n)
-        de_table = [{de_cols[c]: (round(float(r[c]), 4) if c != "names" else str(r[c]))
-                     for c in present_cols} for _, r in top.iterrows()]
         mask = (obs_g == cl).values
         n_cells = int(mask.sum())
+        # mean expression (log-normalized X) per top gene in this subcluster — parity with broad
+        # annotation_review so subtype calls weigh expression + specificity the same way (Phase B).
+        _genes = [str(g) for g in top["names"] if str(g) in adata.var_names]
+        _mean = {}
+        if _genes and n_cells:
+            _vals = np.asarray(adata[:, _genes].X[mask].mean(axis=0)).ravel()
+            _mean = {_genes[k]: round(float(_vals[k]), 4) for k in range(len(_genes))}
+        de_table = [{**{de_cols[c]: (round(float(r[c]), 4) if c != "names" else str(r[c]))
+                        for c in present_cols}, "mean_in": _mean.get(str(r["names"]))}
+                    for _, r in top.iterrows()]
 
         ev: dict = {"subcluster": cl, "n_cells": n_cells, "n_significant_markers": int(len(sub)),
                     "n_specific_markers": n_specific, "de_table": de_table}
@@ -1045,11 +1053,13 @@ def fine_annotation_review(session, *, groupby: str = "leiden", compartment: str
         "specificity_filter": f"(pct_in - pct_out) >= {min_specificity} AND pct_out <= {max_pct_out}",
         "confounder_keys_used": conf_cols,
         "confounder_genes_used": scored_used,
-        "instruction": "de_table = markers that are SIGNIFICANT (padj) AND SPECIFIC (spec=pct_in-pct_out, "
-                       "most-specific first); 'few_specific_markers' flags a subcluster with no distinct "
+        "instruction": "Tier-2 (subtype) annotation. de_table shows mean_in (mean log-norm EXPRESSION), pct, "
+                       "and spec (=pct_in-pct_out); pick a >=3-gene marker-set combination per subcluster that is "
+                       "both highly expressed (high mean_in) AND highly specific (high spec, low pct_out), "
+                       "most-specific first. 'few_specific_markers' flags a subcluster with no distinct "
                        "identity (low-quality/ambient/doublet). Within this compartment, infer each subcluster's "
-                       "fine_cell_type FROM the ranked DE (no marker database) and a FACS-style display label "
-                       "(e.g. 'CD8+ PD-1+ T cells'). Keep "
+                       "fine_cell_type FROM the ranked DE (no marker database) and — as the PRIMARY display name — "
+                       "a FACS-style label (e.g. 'CD8+ PD-1+ T cells'; if omitted it falls back to fine_cell_type). Keep "
                        "cell TYPE separate from cell STATE. Weigh confounders (cell-cycle/stress/IFN/activation/"
                        "doublet, single-patient dominance) — a state program (cycling/stressed) is NOT a cell "
                        "type. Provide evidence_for / evidence_against / confounders per subcluster + confidence "
@@ -1170,21 +1180,21 @@ def apply_fine_annotation(session, *, groupby: str = "leiden", fine_labels: dict
             comp_cl = str(adata.obs[major_key].astype(str)[(obs_g == cl).values].value_counts().index[0])
 
         fine_final[cl] = final
-        facs_final[cl] = facs.get(cl, "")
+        facs_final[cl] = facs.get(cl) or final          # FACS is the PRIMARY display name; fall back to fine
         state_final[cl] = state.get(cl, "")
         conf_final[cl] = cf.get(cl, float("nan"))
         review_final[cl] = review
         tree[cl] = {
             "n_cells": n_cells, "major_cell_type": comp_cl,
             "fine_cell_type": final, "proposed_fine_cell_type": proposed,
-            "facs_style_label": facs.get(cl, ""), "cell_state": state.get(cl, ""),
+            "facs_style_label": facs_final[cl], "cell_state": state.get(cl, ""),
             "confidence": cf.get(cl), "review_required": review, "merged": merged,
             "evidence_for": ev_for, "evidence_against": eg.get(cl, []),
             "confounders": conf_map.get(cl, []), "review_reasons": reasons,
         }
 
     adata.obs[fine_key] = obs_g.map(lambda c: fine_final.get(c, unassigned)).astype("category")
-    adata.obs[facs_key] = obs_g.map(lambda c: facs_final.get(c, "")).astype("category")
+    adata.obs[facs_key] = obs_g.map(lambda c: facs_final.get(c) or fine_final.get(c, unassigned)).astype("category")
     adata.obs[f"{fine_key}_confidence"] = obs_g.map(lambda c: conf_final.get(c, float("nan"))).astype(float)
     adata.obs[f"{fine_key}_review_required"] = obs_g.map(lambda c: review_final.get(c, False)).astype(bool)
     if any(state_final.values()):
@@ -1216,6 +1226,7 @@ def apply_fine_annotation(session, *, groupby: str = "leiden", fine_labels: dict
         "n_insufficient_evidence": n_insufficient, "n_review_required_subclusters": n_review,
         "n_unassigned_cells": n_unassigned,
         "label_distribution": {str(k): int(v) for k, v in dist.items()},
+        "facs_label_map": facs_final,                  # subcluster -> FACS label (broad dotplot derive path)
     }
     warnings = []
     if n_merged:

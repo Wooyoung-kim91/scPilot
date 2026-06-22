@@ -520,6 +520,47 @@ def test_derive_dotplot_markers_family_contiguous():
     assert len(mac) == 2 and mac[1] == mac[0] + 1, order      # Macrophage* block is contiguous
 
 
+def test_phase_d_fine_facs_primary(tmp_path):
+    # fine (Tier-2 subtype): mean_in parity + FACS-style label is the PRIMARY, always-populated name
+    import json
+
+    from scpilot import tools
+    from scpilot.repro import set_global_seed
+
+    inp = tmp_path / "in.h5ad"
+    _two_group_adata(n_obs=220, n_vars=120).write_h5ad(inp)
+    set_global_seed(0)
+    s = Session.create(tmp_path / "sess", input_path=str(inp))
+    s.load_input()
+    assert tools.run("preprocess", s, n_top_genes=60, n_pcs=15).status == "success"
+    assert tools.run("cluster", s, resolution=0.5).status == "success"
+    s.adata.obs["major_cell_type"] = ["T cell"] * s.adata.n_obs                   # compartment context
+    assert tools.run("markers", s, groupby="leiden").status == "success"
+
+    rev = tools.run("fine_annotation_review", s, groupby="leiden")
+    assert rev.status == "success"
+    art = next(a.path for a in rev.artifacts if a.path.endswith("fine_annotation_evidence.json"))
+    data = json.loads(open(art).read())
+    de0 = data["subclusters"][0]["de_table"]
+    assert de0 and "mean_in" in de0[0]                       # (1) expression exposed (parity with broad)
+
+    subs = [str(p["subcluster"]) for p in data["subclusters"]]
+    fine_labels = {c: f"T_sub{c}" for c in subs}
+    facs_labels = {subs[0]: "CD8+ T cells"}                  # only ONE FACS label given
+    ap = tools.run("apply_fine_annotation", s, groupby="leiden",
+                   fine_labels=fine_labels, facs_labels=facs_labels)
+    assert ap.status == "success"
+    facs_col = s.adata.obs["facs_style_label"].astype(str)
+    assert (facs_col.str.len() > 0).all()                    # (2) FACS primary: never empty (fine fallback)
+    assert "CD8+ T cells" in set(facs_col)                   # the given FACS label applied
+    assert "facs_label_map" in ap.summary
+
+    # (3) FACS dotplot — rows = FACS labels (subcluster DE mapped through subcluster->FACS)
+    d = tools.run("plots", s, kind="dotplot", groupby="facs_style_label",
+                  cluster_key="leiden", label_map=ap.summary["facs_label_map"])
+    assert d.status == "success" and d.artifacts
+
+
 def test_harmonize_annotations_consensus_fallback(tmp_path):
     # cellhint is not installed → harmonize_annotations must fall back to the embedding-independent
     # majority vote (graceful), write the harmonized label, and report which path it used.
