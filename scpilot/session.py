@@ -383,13 +383,27 @@ class Session:
 
     # ---------- checkpoints ----------
     def checkpoint(self, stage: str, *, adata=None, x_state: str | None = None,
-                   params: dict | None = None, compression: str = "lzf") -> Checkpoint:
-        """Atomically write a post-stage .h5ad checkpoint and register it in the manifest."""
+                   params: dict | None = None, compression: str = "lzf",
+                   enforce_invariants: bool = True,
+                   require_counts: bool | None = None) -> Checkpoint:
+        """Atomically write a post-stage .h5ad checkpoint and register it in the manifest.
+
+        Invariants are enforced HERE (the single mutating-write boundary) before the
+        h5ad is persisted, so every mutating tool — current or future — is guarded
+        without each having to remember to call ``assert_invariants`` (plan B1). The
+        ``require_counts`` default is "require iff a counts fingerprint is already
+        established" — so the first checkpoint that *creates* counts (ingest/load) is
+        not tripped. ``enforce_invariants=False`` is an escape hatch for rare cases.
+        """
         a = adata if adata is not None else self.adata
         if x_state:
             self.manifest.x_state = x_state
         self.stamp_provenance(a, stage, params=params, x_state=x_state)
         self._ensure_dirs()
+        if enforce_invariants:
+            rc = require_counts if require_counts is not None \
+                else (self.manifest.counts_fingerprint is not None)
+            self.assert_invariants(a, require_counts=rc)
         idx = len(self.manifest.checkpoints)
         cid = f"{idx:02d}_{stage}"
         path = self.checkpoints_dir / f"{cid}.h5ad"
@@ -502,6 +516,66 @@ class Session:
         self._append_jsonl(self.run_log_path, rec)
         self.manifest.n_runs += 1
         self.save()
+
+    def record_run(self, result, *, params: dict | None = None, seed: int | None = None,
+                   input_checkpoint: str | None = None, lib_versions: dict | None = None,
+                   stage: str | None = None, compute_recipe_hash: bool = True) -> None:
+        """Build a FULLY-populated RunLogRecord from a ToolResult and append it.
+
+        The single run-logging chokepoint shared by all four drivers (CLI ``step`` +
+        ``run``-report, the MCP handler, the mode-2 agent) so their records can no
+        longer drift (plan C1). Always fills ``seed``, ``lib_versions`` and
+        ``recipe_hash`` — fields that previously varied per driver (plan A1/A2).
+        """
+        from scpilot import repro
+        from scpilot import schemas as S
+        from scpilot.vendor.harness import _env_versions
+
+        libs = lib_versions if lib_versions is not None else _env_versions()
+        rh = None
+        if compute_recipe_hash:
+            try:
+                fp = repro.dataset_fingerprint(self._adata) if self._adata is not None else None
+                rh = repro.recipe_hash(params=params or {}, lib_versions=libs,
+                                       input_checkpoint_id=input_checkpoint, fingerprint=fp)
+            except Exception:  # noqa: BLE001 — a hashing hiccup must never break logging
+                rh = None
+        self.log_run(S.RunLogRecord(
+            tool=result.tool, status=result.status, stage=stage or result.tool,
+            params=params or {}, summary=result.summary, seed=seed,
+            input_checkpoint=input_checkpoint, output_checkpoint=result.checkpoint,
+            determinism_grade=result.determinism_grade, recipe_hash=rh,
+            lib_versions=libs, duration_s=result.duration_s, error_code=result.error_code,
+        ).to_dict())
+
+    def record_tool_run(self, result, *, params: dict | None = None, seed: int | None = None,
+                        input_checkpoint: str | None = None, lib_versions: dict | None = None,
+                        reasoning: str | None = None, attach_plots: bool = True) -> None:
+        """Full per-step record for the human-facing drivers (CLI ``step`` + MCP handler):
+        attach a stage-appropriate auto-plot, append the run-log record, and write the
+        Markdown reasoning entry — all in one place so ``step`` and MCP stay identical.
+
+        The mode-2 agent does NOT use this (it returns the result to the LLM rather than
+        rendering plots/reasoning) and calls ``record_run`` directly.
+        """
+        if attach_plots and result.status == "success":
+            try:
+                from scpilot.core.autoplot import auto_plots
+                extra = auto_plots(self, result.tool, result.summary)
+                if extra:
+                    result.artifacts = list(result.artifacts or []) + extra
+            except Exception:  # noqa: BLE001 — a missing plot must never break the step
+                pass
+        self.record_run(result, params=params, seed=seed,
+                        input_checkpoint=input_checkpoint, lib_versions=lib_versions)
+        try:
+            plot_paths = [a.path for a in (result.artifacts or [])
+                          if getattr(a, "kind", None) == "png"]
+            self.log_reasoning(tool=result.tool, params=params, summary=result.summary,
+                               reasoning=reasoning, status=result.status,
+                               checkpoint=result.checkpoint, plots=plot_paths)
+        except Exception:  # noqa: BLE001 — logging must never break the result
+            pass
 
     def log_decision(self, record: dict, *, validate: bool = True) -> None:
         """Append one LLM decision event to decisions.jsonl (schema frozen in A7).

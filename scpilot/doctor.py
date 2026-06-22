@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.metadata as _md
+import importlib.util
 import platform
 import shutil
 import sys
@@ -36,6 +37,36 @@ _OPTIONAL = [
 ]
 # import name -> distribution name (for version lookup) when they differ.
 _DIST = {"scvi": "scvi-tools", "skmisc": "scikit-misc", "igraph": "igraph"}
+
+# Per-tool HARD dependency modules (import names). A tool with a missing entry here
+# runs its capability gate (plan D1): a missing package becomes a recoverable
+# ``capability_unavailable`` ToolResult instead of a raw ImportError mid-execution.
+CAPABILITY_REQUIRES = {
+    "integrate_scvi": ["scvi", "torch"],
+    "train_scvi": ["scvi", "torch"],
+    "integrate_harmony": ["harmonypy"],
+    "annotate_genomic_positions": ["infercnvpy"],
+    "cnv_score": ["infercnvpy"],
+    "benchmark": ["scib_metrics"],
+}
+
+
+def _findable(modname: str) -> bool:
+    """True if ``modname`` is importable — cheap, no side effects (no real import)."""
+    try:
+        return importlib.util.find_spec(modname) is not None
+    except Exception:  # noqa: BLE001 — a broken parent package counts as not findable
+        return False
+
+
+def check_capability(tool: str) -> tuple[bool, list[str]]:
+    """Lightweight presence probe for a tool's hard deps (no full ``run()``).
+
+    Returns ``(ok, missing_modules)``; a tool with no entry in ``CAPABILITY_REQUIRES``
+    is always ``(True, [])``.
+    """
+    missing = [m for m in CAPABILITY_REQUIRES.get(tool, []) if not _findable(m)]
+    return (not missing, missing)
 
 
 def _probe(modname: str) -> dict:

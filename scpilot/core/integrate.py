@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 
 from scpilot import schemas as S
-from scpilot.tools import register
+from scpilot.tools import register, require_capability
 
 # Pretrained scVI model for PDAC (batch_key=GSM), vendored into the run dir.
 # Override via param. (Falls back to the benchmark source if not yet copied.)
@@ -44,6 +44,8 @@ def _model_batch_categories(model_pt: Path) -> list[str]:
                       "Primary integration for PDAC (scVI > Harmony in benchmark) (plan B9).")
 def integrate_scvi(session, *, model_dir: str = DEFAULT_SCVI_MODEL, out_key: str = "X_scVI",
                    batch_key: str = "GSM", **params) -> S.ToolResult:
+    if (err := require_capability("integrate_scvi")) is not None:
+        return err
     import torch
     import scvi
 
@@ -108,6 +110,8 @@ def train_scvi(session, *, batch_key: str = "GSM", n_latent: int = 30, n_layers:
                max_epochs: int | None = None, out_key: str = "X_scVI", model_out: str | None = None,
                num_workers: int | None = None, batch_size: int | None = None,
                seed: int = 0, **params) -> S.ToolResult:
+    if (err := require_capability("train_scvi")) is not None:
+        return err
     import time as _t
     from pathlib import Path as _P
 
@@ -162,6 +166,8 @@ def train_scvi(session, *, batch_key: str = "GSM", n_latent: int = 30, n_layers:
                       "(plan B9). Baseline/candidate; scVI is primary on this dataset.")
 def integrate_harmony(session, *, batch_key: str = "GSM", use_rep: str = "X_pca",
                       out_key: str = "X_harmony", seed: int = 0, **params) -> S.ToolResult:
+    if (err := require_capability("integrate_harmony")) is not None:
+        return err
     import numpy as np
     import harmonypy
 

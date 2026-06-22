@@ -47,6 +47,34 @@ def test_compare_summaries_grade_tolerance():
     assert repro.compare_summaries(ref, new_big, grade="B")["match"] is False
 
 
+def test_compare_summaries_recurses_into_nested_dicts():
+    """A4: nested dict values get the grade tolerance, not an all-or-nothing pass."""
+    ref = {"label_distribution": {"T": 100, "B": 50}, "n_obs": 1000}
+    # within 5% on every nested number -> match at grade B
+    near = {"label_distribution": {"T": 102, "B": 51}, "n_obs": 1000}
+    assert repro.compare_summaries(ref, near, grade="B")["match"] is True
+    # one nested value drifts far -> mismatch, with the nested path named in diffs
+    far = {"label_distribution": {"T": 100, "B": 80}, "n_obs": 1000}
+    res = repro.compare_summaries(ref, far, grade="B")
+    assert res["match"] is False
+    assert any("label_distribution.B" in d for d in res["diffs"])
+    # a nested key disappearing is caught
+    missing = {"label_distribution": {"T": 100}, "n_obs": 1000}
+    assert repro.compare_summaries(ref, missing, grade="B")["match"] is False
+
+
+def test_compare_summaries_lists_elementwise():
+    """A4: equal-length lists are compared elementwise (was length-only before)."""
+    ref = {"pcs_var": [0.40, 0.20, 0.10]}
+    near = {"pcs_var": [0.41, 0.205, 0.099]}          # all within 5%
+    assert repro.compare_summaries(ref, near, grade="B")["match"] is True
+    drift = {"pcs_var": [0.40, 0.20, 0.30]}           # 3rd element +200%
+    res = repro.compare_summaries(ref, drift, grade="B")
+    assert res["match"] is False and any("pcs_var[2]" in d for d in res["diffs"])
+    # length change still caught
+    assert repro.compare_summaries(ref, {"pcs_var": [0.40, 0.20]}, grade="B")["match"] is False
+
+
 def test_decision_validation():
     good = S.DecisionEvent(
         decision_type="integration_method", choice="harmony",
@@ -118,7 +146,27 @@ def test_replay_registry_executor_end_to_end(tmp_path):
     repro.set_global_seed(0)
     replay_sess = Session.create(tmp_path / "replay", input_path=str(p))
     report = repro.replay_session(str(tmp_path / "sess"),
-                                  executor=tools.make_replay_executor(replay_sess))
+                                  executor=tools.make_replay_executor(replay_sess),
+                                  verify_session=replay_sess)
     assert report["mode"] == "executed"
     assert report["all_match"] is True, report["steps"]
     assert [st["tool"] for st in report["steps"]] == ["preprocess", "cluster"]
+    # A3: every re-executed step re-checked invariants, and raw counts reproduced identically
+    assert all(st.get("invariants_ok") for st in report["steps"])
+    assert report["counts_fingerprint_match"] is True
+
+
+def test_replay_surfaces_invariant_violation(tmp_path):
+    """A3: an invariant failure during re-execution is surfaced (not hidden by matching summaries)."""
+    s = Session.create(tmp_path / "sess")
+    s.log_run(S.RunLogRecord(tool="preprocess", status="success", params={},
+                             summary={"n_genes": 80}, determinism_grade="B").to_dict())
+
+    def bad_executor(record):
+        raise AssertionError("invariant violated: counts values changed (content hash drift)")
+
+    report = repro.replay_session(str(tmp_path / "sess"), executor=bad_executor)
+    assert report["all_match"] is False
+    step = report["steps"][0]
+    assert step["invariants_ok"] is False
+    assert "AssertionError" in step["error"]

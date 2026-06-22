@@ -216,7 +216,7 @@ def qc_filter(session, *, min_genes: int = 200, max_pct_mt: float = 20.0,
                       for s in before}
 
     adata._inplace_subset_obs(keep.values)
-    session.assert_invariants(adata, require_counts=("counts" in adata.layers))
+    # invariants are now enforced centrally in session.checkpoint() (plan B1) — no per-tool call.
 
     summary = {
         "n_cells_before": int(n0), "n_cells_after": int(adata.n_obs),

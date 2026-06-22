@@ -215,19 +215,14 @@ def _execute_registry_tool(session, name: str, args: dict, seed: int,
     result = spec.fn(session, **args)
     stats.errors += 0 if result.status == "success" else 1
 
-    # run-log record — IDENTICAL shape to the deterministic `scpilot step` path, so a
-    # mode-2 session replays with tools.make_replay_executor() and NO LLM.
+    # run-log record via the shared chokepoint — IDENTICAL shape to the deterministic
+    # `scpilot step` / MCP paths (seed + recipe_hash + lib_versions populated the same way),
+    # so a mode-2 session replays with tools.make_replay_executor() and NO LLM.
     in_cp = None
     cps = session.manifest.checkpoints
     if len(cps) >= 2 and result.checkpoint:
         in_cp = cps[-2].get("id")
-    session.log_run(S.RunLogRecord(
-        tool=name, status=result.status, stage=name, params=args,
-        summary=result.summary, seed=seed,
-        input_checkpoint=in_cp, output_checkpoint=result.checkpoint,
-        determinism_grade=result.determinism_grade, error_code=result.error_code,
-        duration_s=result.duration_s,
-    ).to_dict())
+    session.record_run(result, params=args, seed=seed, input_checkpoint=in_cp, stage=name)
 
     # decision event for consequential choices (frozen schema; powers audit + replay note)
     dtype = _DECISION_TYPE.get(name)

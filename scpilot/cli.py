@@ -78,7 +78,6 @@ def step(
     import json
     from pathlib import Path
 
-    from scpilot import schemas as S
     from scpilot import tools
     from scpilot.repro import set_global_seed
     from scpilot.session import DEFAULT_RUN_DIR, Session
@@ -91,7 +90,7 @@ def step(
 
     params = _parse_params(param or [])
     reasoning = params.pop("reasoning", None)   # narration for reasoning_log.md, not a tool param
-    seed_rec = set_global_seed(seed)
+    set_global_seed(seed)
     wd = workdir or DEFAULT_RUN_DIR
     if inp is None and not (Path(wd) / Session.MANIFEST).exists():
         typer.secho(f"no session at {wd} and no INPUT given — provide INPUT on the entry step",
@@ -100,28 +99,10 @@ def step(
     session = Session.create(wd, input_path=inp)   # inp None on resume → opens existing session
 
     result = spec.fn(session, **params)
-    # result-plot rule: attach a stage-appropriate figure so every step returns a plot
-    if result.status == "success":
-        try:
-            from scpilot.core.autoplot import auto_plots
-            extra = auto_plots(session, stage, result.summary)
-            if extra:
-                result.artifacts = list(result.artifacts or []) + extra
-        except Exception:  # noqa: BLE001 — a missing plot must never break the step
-            pass
-    session.log_run(S.RunLogRecord(
-        tool=stage, status=result.status, params=params, summary=result.summary, seed=seed,
-        determinism_grade=result.determinism_grade,
-        output_checkpoint=result.checkpoint, error_code=result.error_code,
-        duration_s=result.duration_s, lib_versions={"seed_record": seed_rec},
-    ).to_dict())
-    try:
-        plot_paths = [a.path for a in (result.artifacts or []) if getattr(a, "kind", None) == "png"]
-        session.log_reasoning(tool=stage, params=params, summary=result.summary,
-                              reasoning=reasoning, status=result.status,
-                              checkpoint=result.checkpoint, plots=plot_paths)
-    except Exception:  # noqa: BLE001 — logging must never break the result
-        pass
+    # result-plot rule + run-log + reasoning, all via the shared chokepoint (plan C1):
+    # one helper guarantees `step`, the MCP handler and the agent log identical records
+    # (seed + recipe_hash + lib_versions populated the same way).
+    session.record_tool_run(result, params=params, seed=seed, reasoning=reasoning)
 
     typer.echo(json.dumps(result.to_dict(), indent=2))
     raise typer.Exit(code=0 if result.status == "success" else 1)
@@ -179,7 +160,6 @@ def run(
     import json
     from pathlib import Path
 
-    from scpilot import schemas as S
     from scpilot import tools
     from scpilot.llm.agent import run_agent
     from scpilot.llm import prompts
@@ -238,14 +218,10 @@ def run(
 
     rep_params = {"interpretation": interp or result.final_text}
     rep = tools.run("report", session, **rep_params)
-    # log the report run so `scpilot replay` reproduces it too (the interpretation prose is
-    # recorded here → replay re-runs report with the SAME text, no LLM re-query needed).
-    session.log_run(S.RunLogRecord(
-        tool="report", status=rep.status, stage="report", params=rep_params,
-        summary=rep.summary, seed=seed, output_checkpoint=rep.checkpoint,
-        determinism_grade=rep.determinism_grade, error_code=rep.error_code,
-        duration_s=rep.duration_s,
-    ).to_dict())
+    # log the report run via the shared chokepoint so `scpilot replay` reproduces it too (the
+    # interpretation prose is recorded in params → replay re-runs report with the SAME text,
+    # no LLM re-query needed).
+    session.record_run(rep, params=rep_params, seed=seed, stage="report")
 
     if result.stopped_reason == "max_iters":
         typer.secho(f"[scpilot run] WARNING: agent hit max_iters ({max_iters}) — analysis may be "
@@ -289,6 +265,7 @@ def replay(
     from scpilot import tools
 
     executor = None
+    replay_sess = None
     if not dry_run:
         orig = Session.open(session)
         inp = orig.manifest.input.get("path")
@@ -303,7 +280,8 @@ def replay(
         replay_sess = Session.create(replay_dir, input_path=inp)
         executor = tools.make_replay_executor(replay_sess)
 
-    report = replay_session(session, executor=executor)
+    # verify_session lets replay cross-check the reproduced raw-counts fingerprint (plan A3)
+    report = replay_session(session, executor=executor, verify_session=replay_sess)
     typer.echo(json.dumps(report, indent=2))
     raise typer.Exit(code=0 if (dry_run or report.get("all_match")) else 1)
 

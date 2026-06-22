@@ -86,6 +86,27 @@ def run(name: str, session, **params) -> S.ToolResult:
     return get(name).fn(session, **params)
 
 
+def require_capability(tool: str) -> "S.ToolResult | None":
+    """Capability gate (plan D1): return a structured ``capability_unavailable`` error
+    if ``tool``'s hard dependencies are missing, else ``None``.
+
+    Tools call this FIRST so a missing optional package (scVI/Harmony/inferCNV/scib)
+    becomes a recoverable ToolResult — the LLM can pick another path — instead of a raw
+    ImportError surfacing as an opaque ``internal`` error.
+    """
+    from scpilot import doctor
+
+    ok, missing = doctor.check_capability(tool)
+    if ok:
+        return None
+    return S.error(
+        tool, "capability_unavailable",
+        f"required package(s) not installed: {missing}. Run `scpilot doctor` to confirm, "
+        f"install them, or choose a tool whose capability is available.",
+        recoverable=True,
+    )
+
+
 def make_replay_executor(session) -> Callable[[dict], dict]:
     """Build a stateful ``executor(run_log_record) -> new_summary`` for ``repro.replay_session``.
 

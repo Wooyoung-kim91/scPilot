@@ -59,41 +59,27 @@ def build_server():
     mcp = FastMCP("scpilot")
 
     def _make_handler(name: str):
-        def handler(input: str, workdir: str = "", params: dict | None = None) -> dict:
+        def handler(input: str, workdir: str = "", params: dict | None = None,
+                    seed: int = 0) -> dict:
             from scpilot import schemas as S
+            from scpilot.repro import set_global_seed
             from scpilot.session import DEFAULT_RUN_DIR
-            lg.info("tool=%s input=%s", name, input)
+            lg.info("tool=%s input=%s seed=%s", name, input, seed)
             params = dict(params or {})
             # optional LLM narration for reasoning_log.md (not a tool param)
             reasoning = params.pop("reasoning", None)
             try:
+                # pin RNGs per call so mode-1 (MCP) is reproducible like the CLI (plan A1).
+                set_global_seed(seed)
                 wd = workdir or DEFAULT_RUN_DIR
                 session = Session.create(wd, input_path=input)
                 result = tools.run(name, session, **params)
-                # result-plot rule: render a stage-appropriate figure for THIS step and
-                # attach it, so every step returns a plot (not just numbers).
-                if result.status == "success":
-                    try:
-                        from scpilot.core.autoplot import auto_plots
-                        extra = auto_plots(session, name, result.summary)
-                        if extra:
-                            result.artifacts = list(result.artifacts or []) + extra
-                    except Exception:  # noqa: BLE001
-                        lg.exception("auto-plot failed for %s", name)
-                # PARITY WITH CLI `step`: the MCP path must also populate run_log.jsonl
-                # + reasoning_log.md, else mode-1 (MCP) runs leave no replay/run record.
+                # result-plot rule + run_log.jsonl + reasoning_log.md via the shared chokepoint
+                # (plan C1): IDENTICAL to the CLI `step` path, so mode-1 runs are fully
+                # replayable and the records cannot drift between drivers.
                 try:
-                    session.log_run(S.RunLogRecord(
-                        tool=name, status=result.status, params=params, summary=result.summary,
-                        determinism_grade=result.determinism_grade,
-                        output_checkpoint=result.checkpoint, error_code=result.error_code,
-                        duration_s=result.duration_s,
-                    ).to_dict())
-                    plot_paths = [a.path for a in (result.artifacts or [])
-                                  if getattr(a, "kind", None) == "png"]
-                    session.log_reasoning(tool=name, params=params, summary=result.summary,
-                                          reasoning=reasoning, status=result.status,
-                                          checkpoint=result.checkpoint, plots=plot_paths)
+                    session.record_tool_run(result, params=params, seed=seed,
+                                            reasoning=reasoning)
                 except Exception:  # noqa: BLE001 — logging must never break the tool result
                     lg.exception("run/reasoning logging failed for %s", name)
                 return result.to_dict()
@@ -112,7 +98,9 @@ def build_server():
             "    workdir: optional session directory (defaults next to input).\n"
             "    params: optional tool parameters (dict). May include a 'reasoning' "
             "string (the WHY for this step) — it is stripped from tool params and "
-            "recorded in reasoning_log.md, not passed to the tool."
+            "recorded in reasoning_log.md, not passed to the tool.\n"
+            "    seed: global RNG seed pinned before the call (default 0) — recorded "
+            "in run_log.jsonl so the run is reproducible/replayable."
         )
         mcp.tool(name=f"{spec.name}_tool")(handler)
 

@@ -47,7 +47,7 @@ import urllib.request
 from pathlib import Path
 
 from scpilot import schemas as S
-from scpilot.tools import register
+from scpilot.tools import register, require_capability
 
 logging.getLogger("infercnvpy").setLevel(logging.ERROR)
 
@@ -130,6 +130,8 @@ def _classify_unmapped(name: str) -> str:
 def annotate_genomic_positions(session, *, gtf: str | None = None, genome_build: str = "GRCh38",
                                pc_coverage_warn: float = 0.8, pc_coverage_fail: float = 0.6,
                                **params) -> S.ToolResult:
+    if (err := require_capability("annotate_genomic_positions")) is not None:
+        return err
     import infercnvpy as cnv
     import numpy as np
     import pandas as pd
@@ -244,6 +246,8 @@ def annotate_genomic_positions(session, *, gtf: str | None = None, genome_build:
 def cnv_score(session, *, reference_key: str | None = None, reference_cat: list | None = None,
               layer: str | None = None, groupby: str | None = None, window_size: int = 100,
               step: int = 10, leiden_resolution: float = 1.0, seed: int = 0, **params) -> S.ToolResult:
+    if (err := require_capability("cnv_score")) is not None:
+        return err
     import infercnvpy as cnv
     import numpy as np
     import pandas as pd

@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 
 from scpilot import schemas as S
-from scpilot.tools import register
+from scpilot.tools import register, require_capability
 
 _AGG_COLS = ["Batch correction", "Bio conservation", "Total"]
 
@@ -38,6 +38,8 @@ def benchmark(session, *, label_key: str = "major_cell_type", batch_key: str = "
               embeddings: list | None = None, drop_labels: list | None = None,
               min_label_cells: int = 10, subsample: int | None = 60000, seed: int = 0,
               **params) -> S.ToolResult:
+    if (err := require_capability("benchmark")) is not None:
+        return err
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
