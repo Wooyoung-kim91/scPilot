@@ -153,7 +153,7 @@ Recommended compartment-specific analyses:
 | Epithelial / malignant | Tumor cells, cycling tumor cells, EMT-like tumor cells, hypoxic tumor cells, IFN-high tumor cells |
 | B/Plasma | B cell, memory B cell, plasma cell |
 
-### Tier 4: Trajectory and Cell State Agent
+### Tier 3: Trajectory and Cell State Agent
 
 Purpose:
 
@@ -199,7 +199,7 @@ Example output:
 }
 ```
 
-### Tier 5: Consistency and Review Agent
+### Tier 4: Consistency and Review Agent
 
 Purpose:
 

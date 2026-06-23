@@ -188,12 +188,13 @@ CANONICAL FLOW (skip steps already satisfied per detect_state; stop when the goa
       Record a compartment_branch decision (which compartments to recurse into; do not branch
       blocked/under-powered ones unless justified).
    b. For each chosen compartment: compartment_subset(compartment, mode='clustering',
-      use_rep=<chosen integration emb>) to subcluster on the batch-corrected embedding (or
-      mode='markers' to re-derive compartment-relevant HVGs). Then cluster_sweep(use_rep) ->
-      cluster(use_rep, resolution=<chosen>) -> markers(groupby=<subset leiden>) on the SUBSET.
+      use_rep=<the BEST integration reduction selected in step 7>) so subtype subclustering runs on
+      the SAME best embedding as the final broad call (or mode='markers' to re-derive
+      compartment-relevant HVGs). Then cluster_sweep(use_rep) -> cluster(use_rep, resolution=<chosen>)
+      -> markers(groupby=<subset leiden>) on the SUBSET.
    c. fine_annotation_review(groupby=<subset leiden>) -> read each subcluster's de_table
       (mean_in+pct+spec) + confounders; pick a >=3-gene marker-set and INFER fine_cell_type + a
-      FACS-style label (the PRIMARY subtype name) from the DE (see FINE_ANNOTATION_PROMPT; keep
+      FACS-style label (the PRIMARY subtype name — same broad method) from the DE (see FINE_ANNOTATION_PROMPT; keep
       type vs state separate). apply_fine_annotation(groupby, fine_labels, facs_labels, cell_state,
       confidence, review_required, evidence_for) -> writes obs['fine_cell_type','facs_style_label']
       + annotation_tree (tiny clusters merged + no-evidence calls flagged automatically).
@@ -234,7 +235,7 @@ Principle (from cancer_scrnaseq_annotation_strategy.md — the single source):
 
 Tier flow: QC/artifact (Tier 0) -> broad type (Tier 1) -> compartment subtype (Tier 2) ->
 malignancy / CNV (tumor only, not a tier) -> trajectory/state WITHIN a compartment
-(Tier 4) -> consistency review (Tier 5).
+(Tier 3) -> consistency review (Tier 4).
 
 HARD RULES (do not violate)
 - Malignancy calls must NOT rely on epithelial markers alone: weigh CNV burden + tumor
