@@ -27,11 +27,42 @@ def _read_jsonl(path: Path) -> list[dict]:
     return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
 
 
-def _collect_png_artifacts(session) -> list[str]:
+def _kv(params: dict, n: int = 4) -> str:
+    """Compact scalar-param string for an artifact's provenance line."""
+    items = [(k, v) for k, v in (params or {}).items()
+             if isinstance(v, (int, float, str, bool)) and k != "reasoning"]
+    return ", ".join(f"{k}={v}" for k, v in items[:n])
+
+
+def _artifact_catalog(session) -> list[dict]:
+    """Flatten outputs.jsonl into per-artifact rows carrying their PROVENANCE.
+
+    Each row binds an artifact to the step that produced it (tool/params), the WHY
+    (reasoning), the recipe hash, and the file sha256 — so the report can show, per
+    figure/table, where it came from and why (plan A3). Falls back to a bare directory
+    scan only for legacy sessions with no outputs.jsonl.
+    """
+    rows: list[dict] = []
+    for rec in _read_jsonl(session.outputs_path):
+        for a in rec.get("artifacts", []) or []:
+            rows.append({
+                "tool": rec.get("tool"), "stage": rec.get("stage"),
+                "params": rec.get("params", {}), "reasoning": rec.get("reasoning"),
+                "recipe_hash": rec.get("recipe_hash"),
+                "path": a.get("path"), "kind": a.get("kind", "other"),
+                "description": a.get("description", ""),
+                "sha256": (a.get("meta") or {}).get("sha256"),
+            })
+    if rows:
+        return rows
+    # legacy fallback: no outputs index → bare PNG scan, no provenance
     art_dir = session.artifacts_dir
-    if not art_dir.exists():
-        return []
-    return sorted(str(p) for p in art_dir.rglob("*.png"))
+    if art_dir.exists():
+        for p in sorted(art_dir.rglob("*.png")):
+            rows.append({"tool": None, "stage": None, "params": {}, "reasoning": None,
+                         "recipe_hash": None, "path": str(p), "kind": "png",
+                         "description": "", "sha256": None})
+    return rows
 
 
 @register("report", mutating=False,
@@ -44,7 +75,9 @@ def report(session, *, interpretation: str | None = None, title: str = "scpilot 
     t0 = time.time()
     runs = _read_jsonl(session.run_log_path)
     decisions = _read_jsonl(session.decisions_path)
-    pngs = _collect_png_artifacts(session)
+    catalog = _artifact_catalog(session)
+    figures = [c for c in catalog if c["kind"] in ("png", "svg")]
+    tables = [c for c in catalog if c["kind"] == "csv"]
     man = session.manifest
 
     # ---- assemble the structured manifest ----
@@ -61,9 +94,17 @@ def report(session, *, interpretation: str | None = None, title: str = "scpilot 
         "decisions": [{"decision_type": d.get("decision_type"), "choice": d.get("choice"),
                        "rationale": d.get("rationale"), "stage": d.get("stage")}
                       for d in decisions],
-        "figures": pngs,
+        # provenance-bearing artifact catalog (figures + tables + others) — each row links the
+        # file to its producing tool/params/reasoning/sha (plan A3). `figures` kept for compat.
+        "artifacts": catalog,
+        "figures": [c["path"] for c in figures],
         "checkpoints": [cp.get("id") for cp in man.checkpoints],
+        "log_consistency": session.log_consistency(),   # run_log ↔ outputs.jsonl coupling (C-2)
     }
+    # final consolidated annotation distribution (Phase F), if finalize_annotation ran
+    _fin = next((r for r in runs if r.get("tool") == "finalize_annotation"), None)
+    if _fin:
+        report_json["final_annotation"] = (_fin.get("summary", {}) or {}).get("label_distribution", {})
 
     # ---- render Markdown ----
     md: list[str] = [f"# {title}", ""]
@@ -90,23 +131,40 @@ def report(session, *, interpretation: str | None = None, title: str = "scpilot 
             md.append(f"- **{d.get('decision_type')}**: {d.get('rationale', '')}")
         md.append("")
 
-    if pngs:
+    def _prov_line(c: dict) -> str:
+        bits = []
+        if c.get("tool"):
+            kv = _kv(c.get("params", {}))
+            bits.append(f"from `{c['tool']}`" + (f" ({kv})" if kv else ""))
+        if c.get("reasoning"):
+            bits.append(f"why: {c['reasoning']}")
+        return "  \n  _" + " — ".join(bits) + "_" if bits else ""
+
+    if figures:
         md += ["## Figures", ""]
-        for p in pngs:
-            name = Path(p).name
+        for c in figures:
+            name = Path(c["path"]).name
             md.append(f"### {name}")
-            md.append(f"![{name}]({p})")
+            md.append(f"![{name}]({c['path']})" + _prov_line(c))
             md.append("")
 
+    if tables:
+        md += ["## Tables", ""]
+        for c in tables:
+            name = Path(c["path"]).name
+            md.append(f"- `{name}` — `{c['path']}`" + _prov_line(c))
+        md.append("")
+
     session.artifacts_dir.mkdir(parents=True, exist_ok=True)
-    md_path = session.artifacts_dir / "report.md"
-    json_path = session.artifacts_dir / "report.json"
+    md_path = session.artifact_path("report.md")        # no-overwrite on re-run (P1-2)
+    json_path = session.artifact_path("report.json")
     md_path.write_text("\n".join(md))
     json_path.write_text(json.dumps(report_json, indent=2, default=str))
 
     summary = {
         "n_runs": len(runs), "n_decisions": len(decisions),
-        "n_figures": len(pngs), "stage_reached": man.stage,
+        "n_figures": len(figures), "n_tables": len(tables),
+        "n_artifacts": len(catalog), "stage_reached": man.stage,
         "has_interpretation": bool(interpretation),
     }
     artifacts = [

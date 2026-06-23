@@ -42,16 +42,16 @@ from scpilot import tools
 from scpilot.llm import prompts
 from scpilot.llm.provider import Provider, ToolCall
 
-# Tools the agent is allowed to drive autonomously (registry names). Long-running /
-# job-model tools (train_scvi, ingest, benchmark) and raw inspect are excluded from the
-# default autonomous set; integration tools are allowed but optional. This is a policy
-# list, not a hardcode of behaviour — the registry remains the single source of truth.
+# Tools the agent is allowed to drive autonomously (registry names). train_scvi/ingest and
+# raw inspect stay out of the default set; integration + benchmark are allowed (benchmark is the
+# Phase-C integration scorer). This is a policy list, not a hardcode of behaviour — the registry
+# remains the single source of truth.
 DEFAULT_TOOLSET = [
-    "detect_state", "qc_metrics", "qc_filter", "preprocess", "cluster",
+    "detect_state", "qc_metrics", "qc_filter", "preprocess", "cluster_sweep", "cluster",
     "markers", "annotation_review", "apply_annotation", "plots",
-    "integrate_scvi", "integrate_harmony",
+    "integrate_scvi", "integrate_harmony", "harmonize_annotations", "benchmark",
     "compartment_plan", "compartment_subset",
-    "fine_annotation_review", "apply_fine_annotation",
+    "fine_annotation_review", "apply_fine_annotation", "finalize_annotation",
 ]
 
 # Per-tool parameter hints surfaced to the model (kept minimal; the registry's ToolSpec
@@ -67,10 +67,20 @@ _PARAM_HINTS: dict[str, dict] = {
     "preprocess": {
         "n_top_genes": {"type": "integer", "description": "number of HVGs"},
         "n_pcs": {"type": "integer", "description": "number of principal components"},
+        "hvg_batch_key": {"type": "string",
+                          "description": "obs column for batch-aware HVG (auto-detected from "
+                                         "sample_id/sample/batch if omitted)"},
+    },
+    "cluster_sweep": {
+        "use_rep": {"type": "string", "description": "embedding to sweep (X_pca | X_harmony | X_scVI)"},
+        "res_min": {"type": "number", "description": "sweep start (default 0.1)"},
+        "res_max": {"type": "number", "description": "sweep end (default 0.5)"},
+        "res_step": {"type": "number", "description": "sweep step (default 0.1)"},
+        "jump_ratio": {"type": "number", "description": "n_clusters jump factor flagged as the knee (default 1.5)"},
     },
     "cluster": {
         "use_rep": {"type": "string", "description": "X_pca | X_harmony | X_scVI"},
-        "resolution": {"type": "number", "description": "leiden resolution"},
+        "resolution": {"type": "number", "description": "leiden resolution (use cluster_sweep's suggested value)"},
         "n_neighbors": {"type": "integer"},
     },
     "markers": {"n_genes": {"type": "integer"}},
@@ -80,10 +90,25 @@ _PARAM_HINTS: dict[str, dict] = {
     "apply_annotation": {
         "groupby": {"type": "string", "description": "cluster key the labels are keyed on (leiden)"},
         "labels": {"type": "object", "description": "cluster_id -> broad cell type (inferred from DE, NO panel)"},
+        "marker_sets": {"type": "object",
+                        "description": "cell_type -> [>=3 genes] chosen combination (high mean_in + high spec); "
+                                       "the annotation evidence + broad dotplot panels"},
         "confidence": {"type": "object", "description": "optional cluster_id -> 0..1 confidence"},
         "review_required": {"type": "object", "description": "optional cluster_id -> bool"},
         "tissue": {"type": "string", "description": "tissue/condition context"}},
-    "plots": {"kind": {"type": "string", "description": "umap | qc_violin | hvg | pca_variance | dotplot"}},
+    "plots": {"kind": {"type": "string",
+                       "description": "umap | qc_violin | scatter | qc_thresholds | resolution_sweep | hvg | "
+                                      "pca_variance | dotplot"}},
+    "harmonize_annotations": {
+        "keys": {"type": "array", "description": "per-method label columns to harmonize "
+                                                 "(e.g. [major_cell_type, major_cell_type_harmony, major_cell_type_scvi])"},
+        "out_key": {"type": "string", "description": "output harmonized label column (default celltype_harmonized)"},
+        "method": {"type": "string", "description": "auto | cellhint | consensus (auto: cellhint if installed else consensus)"}},
+    "benchmark": {
+        "label_key": {"type": "string", "description": "harmonized/consensus cell-type key (NOT an embedding's own clustering)"},
+        "batch_key": {"type": "string"},
+        "embeddings": {"type": "array", "description": "obsm keys to score, e.g. [X_pca, X_harmony, X_scVI]"},
+        "drop_labels": {"type": "array", "description": "non-cell-type/sentinel labels to exclude (caller-chosen)"}},
     "compartment_plan": {"groupby": {"type": "string", "description": "compartment key (major_cell_type)"},
                          "min_cells": {"type": "integer", "description": "branch floor — min cells"},
                          "min_samples": {"type": "integer", "description": "branch floor — min samples"}},
@@ -98,10 +123,15 @@ _PARAM_HINTS: dict[str, dict] = {
     "apply_fine_annotation": {
         "groupby": {"type": "string", "description": "subcluster key the labels are keyed on"},
         "fine_labels": {"type": "object", "description": "subcluster_id -> fine_cell_type (inferred from DE)"},
-        "facs_labels": {"type": "object", "description": "subcluster_id -> FACS-style display label"},
+        "facs_labels": {"type": "object", "description": "subcluster_id -> FACS-style label — the PRIMARY subtype "
+                                                         "display name (set this; falls back to fine_cell_type if omitted)"},
         "cell_state": {"type": "object", "description": "optional subcluster_id -> functional state"},
         "confidence": {"type": "object"}, "review_required": {"type": "object"},
         "evidence_for": {"type": "object", "description": "subcluster_id -> [supporting evidence]"}},
+    "finalize_annotation": {
+        "out_key": {"type": "string", "description": "final consolidated label column (default final_annotation)"},
+        "malignant_prefix": {"type": "string", "description": "prefix for malignant cells (default 'Malignant')"},
+        "labels": {"type": "object", "description": "optional base->final display-name refinement"}},
 }
 
 # Decision-event type per tool (which step the agent's choice maps to in the frozen schema).
@@ -215,14 +245,17 @@ def _execute_registry_tool(session, name: str, args: dict, seed: int,
     result = spec.fn(session, **args)
     stats.errors += 0 if result.status == "success" else 1
 
-    # run-log record via the shared chokepoint — IDENTICAL shape to the deterministic
-    # `scpilot step` / MCP paths (seed + recipe_hash + lib_versions populated the same way),
-    # so a mode-2 session replays with tools.make_replay_executor() and NO LLM.
+    # record via the shared chokepoint — IDENTICAL to the deterministic `step` / MCP paths
+    # (seed + recipe_hash + lib_versions), so a mode-2 session replays with NO LLM. Using
+    # record_tool_run (not record_run) means mode-2 ALSO gets per-step auto-plots, the
+    # reasoning narrative, and the outputs.jsonl binding — with the model's own prose as the
+    # WHY for this step (plan: per-output reasoning in every mode).
     in_cp = None
     cps = session.manifest.checkpoints
     if len(cps) >= 2 and result.checkpoint:
         in_cp = cps[-2].get("id")
-    session.record_run(result, params=args, seed=seed, input_checkpoint=in_cp, stage=name)
+    session.record_tool_run(result, params=args, seed=seed, input_checkpoint=in_cp,
+                            reasoning=(rationale.strip() or None))
 
     # decision event for consequential choices (frozen schema; powers audit + replay note)
     dtype = _DECISION_TYPE.get(name)

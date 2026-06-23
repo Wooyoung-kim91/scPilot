@@ -1,6 +1,6 @@
 """Compartment planning + subset reprocessing — scpilot plan B11.
 
-The bridge from Tier-1 broad labels (``obs['major_cell_type']``) to Tier-3 fine
+The bridge from Tier-1 broad labels (``obs['major_cell_type']``) to Tier-2 fine
 annotation: which broad compartments are worth recursing into, and a reprocessed
 subset to recurse on. Two tools, following the project's evidence→decision→apply
 split (no hardcoded thresholds drive the call — the gate is a *floor*, the LLM
@@ -70,7 +70,7 @@ def _norm_entropy(counts, n_global: int) -> float:
 # Tool 1 — compartment plan (read-only evidence + branch FLOOR)
 # --------------------------------------------------------------------------- #
 @register("compartment_plan", mutating=False,
-          description="Tier-1→Tier-3 bridge EVIDENCE (read-only, no hardcoded call): per broad compartment "
+          description="Tier-1→Tier-2 bridge EVIDENCE (read-only, no hardcoded call): per broad compartment "
                       "(obs['major_cell_type'] by default) reports REAL cell counts, sample/batch coverage, "
                       "single-patient dominance, and a batch-mixing diagnostic (normalized batch entropy: ~1 "
                       "well-mixed, ~0 single-batch). A min_cells/min_samples FLOOR blocks under-powered branches "
@@ -164,13 +164,13 @@ def compartment_plan(session, *, groupby: str | None = None, batch_key: str | No
 
     art_dir = session.artifacts_dir
     art_dir.mkdir(parents=True, exist_ok=True)
-    json_path = art_dir / "compartment_plan.json"
+    json_path = session.artifact_path("compartment_plan.json")   # no-overwrite (P1-2)
     json_path.write_text(json.dumps({
         "groupby": gkey, "batch_key": bkey, "sample_key": sample_key if has_sample else None,
         "floor": {"min_cells": min_cells, "min_samples": min_samples},
         "n_batches_global": n_batches_global, "n_samples_global": n_samples_global,
         "branchable": branchable, "blocked": blocked,
-        "instruction": "Choose which compartments to recurse into for Tier-3 fine annotation. The FLOOR "
+        "instruction": "Choose which compartments to recurse into for Tier-2 fine annotation. The FLOOR "
                        "(min_cells/min_samples) only marks branch_recommended=false for under-powered "
                        "compartments — you still decide. Prefer well-mixed compartments (batch_entropy_norm "
                        "near 1); treat single_patient_dominated / low_batch_mixing as confounds to note, not "
@@ -215,7 +215,7 @@ def _safe(label: str) -> str:
 
 
 @register("compartment_subset", mutating=True,
-          description="Extract ONE compartment's cells (obs[groupby]==compartment) and reprocess for Tier-3 "
+          description="Extract ONE compartment's cells (obs[groupby]==compartment) and reprocess for Tier-2 "
                       "fine annotation. mode='markers' re-normalizes from counts → log1p → HVG(seurat_v3) → PCA "
                       "(compartment-relevant feature space for within-compartment DE). mode='clustering' is "
                       "integration-aware: keeps the use_rep embedding (e.g. X_scVI) subset untouched so batch "
@@ -317,7 +317,7 @@ def compartment_subset(session, *, compartment: str | None = None, groupby: str 
 
 
 # --------------------------------------------------------------------------- #
-# Tool 3 — assemble Tier-3 fine labels back onto the parent (B11 closing step)
+# Tool 3 — assemble Tier-2 fine labels back onto the parent (B11 closing step)
 # --------------------------------------------------------------------------- #
 def _latest_fine_checkpoint(comp_dir, fine_key: str):
     """Return the highest-numbered checkpoint .h5ad under comp_dir/checkpoints whose
@@ -336,7 +336,7 @@ def _latest_fine_checkpoint(comp_dir, fine_key: str):
 
 
 @register("merge_fine_annotations", mutating=True,
-          description="Assemble Tier-3 FINE labels from per-compartment subset sessions back onto the PARENT "
+          description="Assemble Tier-2 FINE labels from per-compartment subset sessions back onto the PARENT "
                       "dataset by cell barcode (obs_names) — the harness-tracked closing step of the compartment "
                       "loop (replaces an out-of-session merge script). Pass compartments_root (globs each "
                       "<root>/<compartment>/checkpoints for its latest fine checkpoint) or explicit "

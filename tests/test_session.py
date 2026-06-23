@@ -101,25 +101,30 @@ def test_counts_fingerprint_and_invariant(tmp_path):
         s.assert_invariants(b)
 
 
-def test_checkpoint_writes_full_pipeline_and_source_snapshot(tmp_path):
+def test_pipeline_generated_from_run_log_covers_all_steps(tmp_path):
+    # pipeline.py is now (re)generated in record_run from the RUN LOG (every step), not from
+    # checkpoints (mutating-only) — so non-mutating steps are no longer silently omitted (plan P1).
+    from scpilot import schemas as S
+
     inp = tmp_path / "input.h5ad"
     _tiny_adata().write_h5ad(inp)
     s = Session.create(tmp_path / "sess", input_path=str(inp))
     s.load_input()
-    s.checkpoint("qc_metrics", params={"run_scrublet": False})
-    s.checkpoint("preprocess", params={"n_pcs": 15, "seed": 0})
+    # one mutating (preprocess) + one NON-mutating (report) step, via the shared recorder
+    s.record_run(S.success("preprocess", params={"n_pcs": 15}), params={"n_pcs": 15}, seed=0)
+    s.record_run(S.success("report", params={}), params={}, seed=0)
+
     code = tmp_path / "sess" / "code"
-    # full-pipeline script (whole flow, NOT per-step), runnable, + pinned source snapshot
     pipe = code / "pipeline.py"
     assert pipe.exists()
     assert not list(code.glob("*.repro.py"))           # no per-step thin scripts
     snaps = [p for p in code.iterdir() if p.name.startswith("scpilot-")]
     assert snaps and (snaps[0] / "scpilot" / "session.py").exists()  # full package snapshotted
     text = pipe.read_text()
-    # both steps present in flow order, with params, + inlined tool source for inspection
-    assert text.index('tools.run("qc_metrics"') < text.index('tools.run("preprocess"')
+    # both steps present in flow order, incl. the NON-mutating `report`, with inlined source
+    assert text.index('tools.run("preprocess"') < text.index('tools.run("report"')
     assert "n_pcs" in text
-    assert "TOOL IMPLEMENTATIONS" in text and "def qc_metrics" in text and "def preprocess" in text
+    assert "TOOL IMPLEMENTATIONS" in text and "def preprocess" in text and "def report" in text
 
 
 def test_invariant_catches_counts_value_drift(tmp_path):

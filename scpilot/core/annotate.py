@@ -1,7 +1,7 @@
-"""Annotation — Tier 1 broad (B8) + Tier 3 fine (B13).
+"""Annotation — Tier 1 broad (B8) + Tier 2 fine (B13).
 
 Tier 1 (``annotate_broad``) assigns ``obs['major_cell_type']`` — the broad
-compartment that becomes the scib benchmark ``label_key``. Tier 3 (bottom of file:
+compartment that becomes the scib benchmark ``label_key``. Tier 2 (bottom of file:
 ``fine_annotation_review`` → ``apply_fine_annotation``) refines WITHIN a compartment
 to ``obs['fine_cell_type']`` + ``obs['facs_style_label']`` (evidence→LLM→apply, same
 marker-DB-free split), recording authority/evidence in ``uns[...]['annotation_tree']``.
@@ -86,7 +86,7 @@ AMBIGUOUS_LABEL = "ambiguous"   # consensus_annotation sentinel: methods disagre
 ARTIFACT_LABELS = {UNKNOWN_LABEL, MIXED_LABEL, LOWQ_LABEL, AMBIGUOUS_LABEL}
 UNS_ANNO = "scpilot_annotation"
 
-# ---- Tier 3 (fine) constants (B13) ----
+# ---- Tier 2 (fine) constants (B13) ----
 UNS_TREE = "annotation_tree"            # nested under UNS_ANNO: per-subcluster authority + evidence
 FINE_UNRESOLVED = "unresolved"          # merge fallback label for under-powered subclusters
 # Confounder obs columns surfaced per subcluster — these are SCORE/QC columns produced upstream
@@ -408,10 +408,18 @@ def annotation_review(session, *, groupby: str = "leiden", top_n: int = 50, padj
             .sort_values("spec", ascending=False) if has_spec else sub
         n_specific = int(len(spec_sub))
         top = spec_sub.head(top_n)                     # top-N SPECIFIC markers
-        de_table = [{de_cols[c]: (round(float(r[c]), 4) if c != "names" else str(r[c]))
-                     for c in present_cols} for _, r in top.iterrows()]
         mask = (obs_g == cl).values
         n_cells = int(mask.sum())
+        # mean expression (log-normalized X) per top gene IN this cluster — the "expression" the
+        # LLM weighs together with pct (high mean_in + high spec = a confident identity marker).
+        _genes = [str(g) for g in top["names"] if str(g) in adata.var_names]
+        _mean = {}
+        if _genes and n_cells:
+            _vals = np.asarray(adata[:, _genes].X[mask].mean(axis=0)).ravel()
+            _mean = {_genes[k]: round(float(_vals[k]), 4) for k in range(len(_genes))}
+        de_table = [{**{de_cols[c]: (round(float(r[c]), 4) if c != "names" else str(r[c]))
+                        for c in present_cols}, "mean_in": _mean.get(str(r["names"]))}
+                    for _, r in top.iterrows()]
 
         sample_dist, single_source = {}, False
         if has_sample:
@@ -459,7 +467,7 @@ def annotation_review(session, *, groupby: str = "leiden", top_n: int = 50, padj
 
     art_dir = session.artifacts_dir
     art_dir.mkdir(parents=True, exist_ok=True)
-    json_path = art_dir / "annotation_review.json"
+    json_path = session.artifact_path("annotation_review.json")   # no-overwrite on re-run (P1-2)
     json_path.write_text(json.dumps(
         {"groupby": groupby, "top_n": top_n, "tissue_context": tissue,
          "significance_filter": f"pvals_adj < {padj_max}",
@@ -469,11 +477,13 @@ def annotation_review(session, *, groupby: str = "leiden", top_n: int = 50, padj
          "marker_db_used": False, "candidate_labels_provided": False,
          "instruction": f"de_table = top-{top_n} markers per cluster that are SIGNIFICANT (padj<{padj_max}) "
                         f"AND SPECIFIC (spec = pct_in - pct_out >= {min_specificity}), most-specific first. "
-                        "Each gene shows spec so you can weigh enrichment vs broad expression. Infer each "
-                        "cluster's broad cell type from its de_table (no marker DB); use tissue_context as a "
-                        "soft prior; clusters flagged 'few_specific_markers' lack a distinct identity (likely "
-                        "low-quality/ambient/doublet) — treat with caution. Then call apply_annotation with the "
-                        "cluster->label map.",
+                        "Each gene shows mean_in (mean log-normalized EXPRESSION in-cluster), pct_in/pct_out "
+                        "and spec. For each cluster choose a MARKER-SET COMBINATION of >=3 genes that are both "
+                        "HIGHLY EXPRESSED (high mean_in) and HIGHLY SPECIFIC (high spec, low pct_out), infer the "
+                        "cell type from that set (no marker DB; tissue_context is a soft prior), and record the "
+                        "chosen set via apply_annotation(marker_sets={cell_type:[genes]}) alongside the "
+                        "cluster->label map. Clusters flagged 'few_specific_markers' lack a >=3 confident set — "
+                        "treat as low-quality/ambient/doublet and set review_required.",
          "clusters": payloads}, indent=2, default=str))
 
     import pandas as pd
@@ -509,6 +519,7 @@ def annotation_review(session, *, groupby: str = "leiden", top_n: int = 50, padj
 def apply_annotation(session, *, groupby: str = "leiden", labels: dict | None = None,
                      key: str = "major_cell_type", confidence: dict | None = None,
                      review_required: dict | None = None, cell_state: dict | None = None,
+                     marker_sets: dict | None = None,
                      tissue: str | None = None, method: str = "DE_LLM_marker_free",
                      unassigned: str = "Unassigned", **params) -> S.ToolResult:
     t0 = time.time()
@@ -537,10 +548,13 @@ def apply_annotation(session, *, groupby: str = "leiden", labels: dict | None = 
         cs = {str(k): str(v) for k, v in cell_state.items()}
         adata.obs["cell_state"] = obs_g.map(lambda c: cs.get(c, "")).astype("category")
 
+    # the LLM's chosen >=3-gene marker-set COMBINATION per cell type (high expr + high spec) —
+    # the annotation EVIDENCE; recorded as a first-class artifact and used as the dotplot panels.
+    msets = {str(k): [str(g) for g in v] for k, v in (marker_sets or {}).items()}
     adata.uns.setdefault(UNS_ANNO, {})
     adata.uns[UNS_ANNO]["tier1_llm"] = {
         "method": method, "groupby": groupby, "label_key": key, "tissue_context": tissue,
-        "labels": lab, "marker_db_used": False,
+        "labels": lab, "marker_sets": msets, "marker_db_used": False,
     }
     dist = adata.obs[key].value_counts().to_dict()
     n_unassigned = int((adata.obs[key].astype(str) == unassigned).sum())
@@ -548,7 +562,8 @@ def apply_annotation(session, *, groupby: str = "leiden", labels: dict | None = 
         session.log_decision(S.DecisionEvent(
             decision_type="tier1_llm_labels", choice=lab, candidates=[],
             rationale=f"DE-based marker-free Tier-1 labels (tissue={tissue})",
-            stage="apply_annotation", params={"groupby": groupby, "key": key}).to_dict())
+            stage="apply_annotation",
+            params={"groupby": groupby, "key": key, "marker_sets": msets}).to_dict())
     except Exception:  # noqa: BLE001
         pass
 
@@ -557,6 +572,8 @@ def apply_annotation(session, *, groupby: str = "leiden", labels: dict | None = 
         "marker_db_used": False, "n_clusters_labeled": len(lab),
         "unlabeled_clusters": missing, "n_unassigned_cells": n_unassigned,
         "label_distribution": {str(k): int(v) for k, v in dist.items()},
+        "marker_sets": msets,                          # LLM's >=3-gene combos (dotplot panels)
+        "labels": lab,                                 # cluster->cell type (broad dotplot derive path)
     }
     warnings = [] if not missing else [f"{len(missing)} cluster(s) not in labels → '{unassigned}': {missing}"]
     cp = session.checkpoint("apply_annotation", x_state=session.manifest.x_state,
@@ -564,6 +581,33 @@ def apply_annotation(session, *, groupby: str = "leiden", labels: dict | None = 
     return S.success("apply_annotation", summary=summary, warnings=warnings, checkpoint=cp.path,
                      determinism_grade="A", duration_s=round(time.time() - t0, 3),
                      suggested_next_tools=["plots", "consensus_annotation", "integrate_scvi", "benchmark"])
+
+
+def _majority_vote(adata, keys, *, min_agreement, ambiguous_label):
+    """Per-cell majority vote across obs annotation columns ``keys``. Returns (out, agree, pairwise):
+    ``out[i]`` = the unique-winner label held by a fraction > ``min_agreement`` of the columns
+    (else ``ambiguous_label``); ``agree[i]`` = winner fraction; ``pairwise`` = per-pair concordance.
+    Shared by consensus_annotation and harmonize_annotations' fallback (single source, no drift)."""
+    import numpy as np
+    import pandas as pd
+
+    n_keys = len(keys)
+    cats = pd.unique(np.concatenate([adata.obs[k].astype(str).values for k in keys]))
+    codes = np.column_stack([
+        pd.Categorical(adata.obs[k].astype(str).values, categories=cats).codes for k in keys])
+    out = np.empty(adata.n_obs, dtype=object)
+    agree = np.zeros(adata.n_obs, dtype=float)
+    for i in range(adata.n_obs):
+        counts = np.bincount(codes[i], minlength=len(cats))
+        mx = counts.max()
+        winners = np.flatnonzero(counts == mx)
+        agree[i] = mx / n_keys
+        out[i] = cats[winners[0]] if (winners.size == 1 and mx / n_keys > min_agreement) else ambiguous_label
+    pairwise = {}
+    for a in range(n_keys):
+        for b in range(a + 1, n_keys):
+            pairwise[f"{keys[a]}__vs__{keys[b]}"] = round(float((codes[:, a] == codes[:, b]).mean()), 3)
+    return out, agree, pairwise
 
 
 @register("consensus_annotation", mutating=True,
@@ -597,29 +641,10 @@ def consensus_annotation(session, *, keys: list | None = None, out_key: str = "c
                        suggested_next_tools=["apply_annotation"])
 
     n_keys = len(keys)
-    cats = pd.unique(np.concatenate([adata.obs[k].astype(str).values for k in keys]))
-    code = {c: i for i, c in enumerate(cats)}
-    codes = np.column_stack([
-        pd.Categorical(adata.obs[k].astype(str).values, categories=cats).codes for k in keys])  # (n, n_keys)
-
-    out = np.empty(adata.n_obs, dtype=object)
-    agree = np.zeros(adata.n_obs, dtype=float)
-    for i in range(adata.n_obs):
-        counts = np.bincount(codes[i], minlength=len(cats))
-        mx = counts.max()
-        winners = np.flatnonzero(counts == mx)
-        agree[i] = mx / n_keys
-        out[i] = cats[winners[0]] if (winners.size == 1 and mx / n_keys > min_agreement) else ambiguous_label
-
+    out, agree, pairwise = _majority_vote(adata, keys, min_agreement=min_agreement,
+                                          ambiguous_label=ambiguous_label)
     adata.obs[out_key] = pd.Categorical(out)
     adata.obs[f"{out_key}_agreement"] = agree.astype("float32")
-
-    # pairwise agreement between the input annotations (how concordant the methods are)
-    pairwise = {}
-    for a in range(n_keys):
-        for b in range(a + 1, n_keys):
-            frac = float((codes[:, a] == codes[:, b]).mean())
-            pairwise[f"{keys[a]}__vs__{keys[b]}"] = round(frac, 3)
 
     dist = adata.obs[out_key].value_counts().to_dict()
     n_amb = int((adata.obs[out_key].astype(str) == ambiguous_label).sum())
@@ -652,6 +677,95 @@ def consensus_annotation(session, *, keys: list | None = None, out_key: str = "c
                      suggested_next_tools=["benchmark", "plots"])
 
 
+def _harmonize_with_cellhint(adata, keys, out_key):
+    """cellhint label-vocabulary harmonization (Phase C, capability-gated).
+
+    NOT yet wired: cellhint's canonical model harmonizes cell types across *datasets* (different
+    cells), whereas here we reconcile several annotation columns on the SAME cells — the exact
+    cellhint API for that needs verification against an installed cellhint. Until then this raises
+    so harmonize_annotations falls back to the embedding-independent majority vote. (Tracked in
+    annotation-pipeline-roadmap: "cellhint 실경로 설치 검증".)"""
+    raise NotImplementedError("cellhint harmonization path not yet wired (needs cellhint install + API check)")
+
+
+@register("harmonize_annotations", mutating=True,
+          description="Harmonize per-reduction cell-type labels (e.g. major_cell_type / _harmony / _scvi) into one "
+                      "unified obs[out_key] for an UNBIASED scIB benchmark label_key. method='auto' uses cellhint "
+                      "(label-vocabulary alignment) WHEN INSTALLED, else falls back to an embedding-independent "
+                      "majority vote (always available). NO hardcoded vocabulary; keys are caller-supplied. Run "
+                      "after the per-method apply_annotation calls, before benchmark.")
+def harmonize_annotations(session, *, keys: list | None = None, out_key: str = "celltype_harmonized",
+                          method: str = "auto", min_agreement: float = 0.5,
+                          ambiguous_label: str = AMBIGUOUS_LABEL, **params) -> S.ToolResult:
+    import pandas as pd
+
+    from scpilot.doctor import _findable
+
+    t0 = time.time()
+    adata = session.adata
+    keys = list(keys or [])
+    if len(keys) < 2:
+        return S.error("harmonize_annotations", "missing_input",
+                       "pass >=2 annotation columns in 'keys' (e.g. per-method labels)",
+                       recoverable=True, suggested_next_tools=["apply_annotation"])
+    missing = [k for k in keys if k not in adata.obs.columns]
+    if missing:
+        return S.error("harmonize_annotations", "missing_input",
+                       f"annotation column(s) absent in obs: {missing}", recoverable=True,
+                       suggested_next_tools=["apply_annotation"])
+
+    warnings: list[str] = []
+    cellhint_present = _findable("cellhint")
+    method_used = None
+    if method in ("auto", "cellhint") and cellhint_present:
+        try:
+            _harmonize_with_cellhint(adata, keys, out_key)
+            method_used = "cellhint"
+        except Exception as exc:  # noqa: BLE001 — degrade to consensus, never fail the step
+            warnings.append(f"cellhint path unavailable ({type(exc).__name__}) → consensus majority-vote fallback")
+    elif method == "cellhint" and not cellhint_present:
+        warnings.append("method='cellhint' but cellhint not installed → consensus majority-vote fallback")
+
+    pairwise: dict = {}
+    if method_used is None:                          # embedding-independent majority-vote fallback
+        out, agree, pairwise = _majority_vote(adata, keys, min_agreement=min_agreement,
+                                              ambiguous_label=ambiguous_label)
+        adata.obs[out_key] = pd.Categorical(out)
+        adata.obs[f"{out_key}_agreement"] = agree.astype("float32")
+        method_used = "consensus_fallback"
+
+    dist = adata.obs[out_key].value_counts().to_dict()
+    n_amb = int((adata.obs[out_key].astype(str) == ambiguous_label).sum())
+    adata.uns.setdefault(UNS_ANNO, {})
+    adata.uns[UNS_ANNO]["harmonized"] = {
+        "out_key": out_key, "source_keys": keys, "method_used": method_used,
+        "min_agreement": min_agreement, "n_ambiguous": n_amb, "pairwise_agreement": pairwise,
+    }
+    try:
+        session.log_decision(S.DecisionEvent(
+            decision_type="annotation_harmonization",
+            choice={"out_key": out_key, "method_used": method_used, "keys": keys},
+            candidates=[], rationale=f"harmonize {keys} via {method_used}",
+            stage="harmonize_annotations", params={"out_key": out_key, "method": method}).to_dict())
+    except Exception:  # noqa: BLE001
+        pass
+
+    summary = {
+        "out_key": out_key, "source_keys": keys, "method": method, "method_used": method_used,
+        "cellhint_available": bool(cellhint_present),
+        "n_ambiguous": n_amb, "ambiguous_frac": round(n_amb / adata.n_obs, 3),
+        "pairwise_agreement": pairwise,
+        "label_distribution": {str(k): int(v) for k, v in dist.items()},
+        "note": "Harmonized label → use as benchmark label_key (embedding-independent). Pass "
+                f"'{ambiguous_label}' + non-cell-type labels to benchmark drop_labels (caller-chosen).",
+    }
+    cp = session.checkpoint("harmonize_annotations", x_state=session.manifest.x_state,
+                            params={"out_key": out_key, "method": method, "keys": keys})
+    return S.success("harmonize_annotations", summary=summary, warnings=warnings, checkpoint=cp.path,
+                     determinism_grade="A", duration_s=round(time.time() - t0, 3),
+                     suggested_next_tools=["benchmark"])
+
+
 # --------------------------------------------------------------------------- #
 # dotplot marker derivation — the markers ARE the Tier-1 annotation evidence
 # --------------------------------------------------------------------------- #
@@ -669,7 +783,7 @@ COMPARTMENT_ORDER = [
 
 def derive_dotplot_markers(adata, *, cluster_key, label_map, top_k=5,
                            min_pct=0.25, min_lfc=1.0, padj_max=0.05, min_specificity=0.1,
-                           max_pct_out=0.5, order=None):
+                           max_pct_out=0.5, order=None, family_map=None):
     """Per-cell-type dotplot markers that ARE the Tier-1 annotation EVIDENCE — the same DE-selected
     significant markers the LLM read to make the call, shown per assigned cell type. No external
     marker DB, no lineage prior: the marker SELECTION itself is the evidence (that is the point).
@@ -684,7 +798,11 @@ def derive_dotplot_markers(adata, *, cluster_key, label_map, top_k=5,
     DE didn't select — the figure shows the evidence, not a curated panel.
 
     ``order`` (e.g. ``COMPARTMENT_ORDER``) only fixes the panel/row LAYOUT (display), never the
-    marker content; without it, cell types are laid out by abundance.
+    marker content. Without ``order`` the layout is FAMILY-CONTIGUOUS: cell types of the same
+    family stay adjacent (so subtypes — e.g. every ``Macrophage *`` — form one block instead of
+    scattering by abundance), families ordered by total abundance, within-family by abundance.
+    Family is derived generically from ``family_map`` if given, else the label's leading token
+    (organism-agnostic, never hardcoded). ``order`` still wins when provided.
 
     Returns ``{cell_type: [genes]}`` ready to pass as ``plots(kind='dotplot', marker_groups=...)``.
     """
@@ -741,7 +859,20 @@ def derive_dotplot_markers(adata, *, cluster_key, label_map, top_k=5,
         pos = {ct: i for i, ct in enumerate(order)}
         ct_iter = sorted(owned, key=lambda c: pos.get(c, len(order)))     # LAYOUT only
     else:
-        ct_iter = sorted(owned, key=lambda c: -ctsize[c])
+        # FAMILY-CONTIGUOUS default: same-family cell types stay together (subtypes don't
+        # scatter by abundance). Family = family_map[ct] if given, else the label's leading
+        # token (generic, organism-agnostic — NOT a hardcoded type list). Families are ordered
+        # by total abundance, within a family by abundance; including the family string in the
+        # sort key guarantees same-family rows are contiguous.
+        def _family(ct):
+            if family_map and ct in family_map:
+                return str(family_map[ct])
+            toks = str(ct).split()
+            return toks[0] if toks else str(ct)
+        fam_size: dict = defaultdict(int)
+        for c in owned:
+            fam_size[_family(c)] += ctsize[c]
+        ct_iter = sorted(owned, key=lambda c: (-fam_size[_family(c)], _family(c), -ctsize[c]))
 
     panels = {}
     for ct in ct_iter:
@@ -752,9 +883,9 @@ def derive_dotplot_markers(adata, *, cluster_key, label_map, top_k=5,
 
 
 # =========================================================================== #
-# Tier 3 — fine annotation (B13): evidence → LLM → apply (marker-DB-free)
+# Tier 2 — fine annotation (B13): evidence → LLM → apply (marker-DB-free)
 # =========================================================================== #
-# Same two-step split as Tier-1/Tier-2: a deterministic tool packages per-SUBCLUSTER
+# Same two-step split as Tier-1 / malignancy: a deterministic tool packages per-SUBCLUSTER
 # evidence WITHIN a compartment (from compartment_subset → cluster → markers), the LLM
 # infers fine_cell_type + a FACS-style display label from the DE itself (no fixed panel),
 # and apply_fine_annotation records the calls with deterministic HARD RULES (tiny-cluster
@@ -773,7 +904,7 @@ def _fine_score_genes(adata, genes, name):
 
 
 @register("fine_annotation_review", mutating=False,
-          description="Tier-3 FINE annotation EVIDENCE (read-only, NO fixed marker panel). Run WITHIN a "
+          description="Tier-2 FINE annotation EVIDENCE (read-only, NO fixed marker panel). Run WITHIN a "
                       "compartment subset (compartment_subset → cluster → markers): per subcluster it packages the "
                       "top-N SIGNIFICANT ranked DE (logFC/padj/pct), size, sample distribution + single-patient "
                       "dominance, the dominant parent compartment (major_cell_type) and malignancy composition (if "
@@ -857,10 +988,18 @@ def fine_annotation_review(session, *, groupby: str = "leiden", compartment: str
             .sort_values("spec", ascending=False) if has_spec else sub
         n_specific = int(len(spec_sub))
         top = spec_sub.head(top_n)
-        de_table = [{de_cols[c]: (round(float(r[c]), 4) if c != "names" else str(r[c]))
-                     for c in present_cols} for _, r in top.iterrows()]
         mask = (obs_g == cl).values
         n_cells = int(mask.sum())
+        # mean expression (log-normalized X) per top gene in this subcluster — parity with broad
+        # annotation_review so subtype calls weigh expression + specificity the same way (Phase B).
+        _genes = [str(g) for g in top["names"] if str(g) in adata.var_names]
+        _mean = {}
+        if _genes and n_cells:
+            _vals = np.asarray(adata[:, _genes].X[mask].mean(axis=0)).ravel()
+            _mean = {_genes[k]: round(float(_vals[k]), 4) for k in range(len(_genes))}
+        de_table = [{**{de_cols[c]: (round(float(r[c]), 4) if c != "names" else str(r[c]))
+                        for c in present_cols}, "mean_in": _mean.get(str(r["names"]))}
+                    for _, r in top.iterrows()]
 
         ev: dict = {"subcluster": cl, "n_cells": n_cells, "n_significant_markers": int(len(sub)),
                     "n_specific_markers": n_specific, "de_table": de_table}
@@ -907,18 +1046,20 @@ def fine_annotation_review(session, *, groupby: str = "leiden", compartment: str
     df = pd.DataFrame(rows)
     art_dir = session.artifacts_dir
     art_dir.mkdir(parents=True, exist_ok=True)
-    json_path = art_dir / "fine_annotation_evidence.json"
+    json_path = session.artifact_path("fine_annotation_evidence.json")   # no-overwrite (P1-2)
     json_path.write_text(json.dumps({
         "groupby": groupby, "compartment": overall_comp,
         "padj_max": padj_max,
         "specificity_filter": f"(pct_in - pct_out) >= {min_specificity} AND pct_out <= {max_pct_out}",
         "confounder_keys_used": conf_cols,
         "confounder_genes_used": scored_used,
-        "instruction": "de_table = markers that are SIGNIFICANT (padj) AND SPECIFIC (spec=pct_in-pct_out, "
-                       "most-specific first); 'few_specific_markers' flags a subcluster with no distinct "
+        "instruction": "Tier-2 (subtype) annotation. de_table shows mean_in (mean log-norm EXPRESSION), pct, "
+                       "and spec (=pct_in-pct_out); pick a >=3-gene marker-set combination per subcluster that is "
+                       "both highly expressed (high mean_in) AND highly specific (high spec, low pct_out), "
+                       "most-specific first. 'few_specific_markers' flags a subcluster with no distinct "
                        "identity (low-quality/ambient/doublet). Within this compartment, infer each subcluster's "
-                       "fine_cell_type FROM the ranked DE (no marker database) and a FACS-style display label "
-                       "(e.g. 'CD8+ PD-1+ T cells'). Keep "
+                       "fine_cell_type FROM the ranked DE (no marker database) and — as the PRIMARY display name — "
+                       "a FACS-style label (e.g. 'CD8+ PD-1+ T cells'; if omitted it falls back to fine_cell_type). Keep "
                        "cell TYPE separate from cell STATE. Weigh confounders (cell-cycle/stress/IFN/activation/"
                        "doublet, single-patient dominance) — a state program (cycling/stressed) is NOT a cell "
                        "type. Provide evidence_for / evidence_against / confounders per subcluster + confidence "
@@ -955,7 +1096,7 @@ def fine_annotation_review(session, *, groupby: str = "leiden", compartment: str
 
 
 @register("apply_fine_annotation", mutating=True,
-          description="Write the LLM's Tier-3 FINE calls: obs['fine_cell_type'] + obs['facs_style_label'] (display, "
+          description="Write the LLM's Tier-2 FINE calls: obs['fine_cell_type'] + obs['facs_style_label'] (display, "
                       "e.g. 'CD8+ PD-1+ T cells') + optional obs['cell_state'], keyed on the subcluster map the LLM "
                       "inferred from fine_annotation_review. Cell TYPE and STATE stay in separate columns. "
                       "Deterministic HARD RULES: a subcluster below merge_min_cells is MERGED to a fallback label "
@@ -1039,21 +1180,21 @@ def apply_fine_annotation(session, *, groupby: str = "leiden", fine_labels: dict
             comp_cl = str(adata.obs[major_key].astype(str)[(obs_g == cl).values].value_counts().index[0])
 
         fine_final[cl] = final
-        facs_final[cl] = facs.get(cl, "")
+        facs_final[cl] = facs.get(cl) or final          # FACS is the PRIMARY display name; fall back to fine
         state_final[cl] = state.get(cl, "")
         conf_final[cl] = cf.get(cl, float("nan"))
         review_final[cl] = review
         tree[cl] = {
             "n_cells": n_cells, "major_cell_type": comp_cl,
             "fine_cell_type": final, "proposed_fine_cell_type": proposed,
-            "facs_style_label": facs.get(cl, ""), "cell_state": state.get(cl, ""),
+            "facs_style_label": facs_final[cl], "cell_state": state.get(cl, ""),
             "confidence": cf.get(cl), "review_required": review, "merged": merged,
             "evidence_for": ev_for, "evidence_against": eg.get(cl, []),
             "confounders": conf_map.get(cl, []), "review_reasons": reasons,
         }
 
     adata.obs[fine_key] = obs_g.map(lambda c: fine_final.get(c, unassigned)).astype("category")
-    adata.obs[facs_key] = obs_g.map(lambda c: facs_final.get(c, "")).astype("category")
+    adata.obs[facs_key] = obs_g.map(lambda c: facs_final.get(c) or fine_final.get(c, unassigned)).astype("category")
     adata.obs[f"{fine_key}_confidence"] = obs_g.map(lambda c: conf_final.get(c, float("nan"))).astype(float)
     adata.obs[f"{fine_key}_review_required"] = obs_g.map(lambda c: review_final.get(c, False)).astype(bool)
     if any(state_final.values()):
@@ -1070,7 +1211,7 @@ def apply_fine_annotation(session, *, groupby: str = "leiden", fine_labels: dict
         session.log_decision(S.DecisionEvent(
             decision_type="fine_llm_labels",
             choice={cl: fine_final[cl] for cl in clusters}, candidates=[],
-            rationale=f"DE-based marker-free Tier-3 fine labels (compartment={overall_comp})",
+            rationale=f"DE-based marker-free Tier-2 fine labels (compartment={overall_comp})",
             stage="apply_fine_annotation", params={"groupby": groupby, "fine_key": fine_key}).to_dict())
     except Exception:  # noqa: BLE001
         pass
@@ -1085,6 +1226,7 @@ def apply_fine_annotation(session, *, groupby: str = "leiden", fine_labels: dict
         "n_insufficient_evidence": n_insufficient, "n_review_required_subclusters": n_review,
         "n_unassigned_cells": n_unassigned,
         "label_distribution": {str(k): int(v) for k, v in dist.items()},
+        "facs_label_map": facs_final,                  # subcluster -> FACS label (broad dotplot derive path)
     }
     warnings = []
     if n_merged:
@@ -1096,3 +1238,81 @@ def apply_fine_annotation(session, *, groupby: str = "leiden", fine_labels: dict
     return S.success("apply_fine_annotation", summary=summary, warnings=warnings, checkpoint=cp.path,
                      determinism_grade="A", duration_s=round(time.time() - t0, 3),
                      suggested_next_tools=["plots", "trajectory", "report"])
+
+
+# --------------------------------------------------------------------------- #
+# Phase F — final consolidated annotation (FACS-like)
+# --------------------------------------------------------------------------- #
+@register("finalize_annotation", mutating=True,
+          description="Consolidate every per-cell label into ONE final FACS-like annotation in obs[out_key]: "
+                      "base = facs_style_label > fine_cell_type > major_cell_type (most specific available), "
+                      "qualified by malignancy (malignancy=='malignant', else cnv_status=='tumor' -> "
+                      "'<malignant_prefix> <base>'). Deterministic/replayable; optional `labels` refines display "
+                      "names. NO hardcoded cell-type vocabulary (labels come from the prior LLM calls). Run last.")
+def finalize_annotation(session, *, facs_key: str = "facs_style_label", fine_key: str = "fine_cell_type",
+                        major_key: str = "major_cell_type", malignancy_key: str = "malignancy",
+                        cnv_status_key: str = "cnv_status", out_key: str = "final_annotation",
+                        malignant_prefix: str = "Malignant", labels: dict | None = None,
+                        **params) -> S.ToolResult:
+    import pandas as pd
+
+    t0 = time.time()
+    adata = session.adata
+    have = [k for k in (facs_key, fine_key, major_key) if k in adata.obs.columns]
+    if not have:
+        return S.error("finalize_annotation", "invalid_state",
+                       f"no annotation columns to consolidate (need one of {facs_key}/{fine_key}/{major_key}) — "
+                       "run apply_annotation first", recoverable=True, suggested_next_tools=["apply_annotation"])
+
+    n = adata.n_obs
+    blank = pd.Series([""] * n, index=adata.obs.index)
+
+    def _clean(key):
+        if key not in adata.obs.columns:
+            return blank
+        s = adata.obs[key].fillna("").astype(str)
+        return s.mask(s.str.strip().str.lower().isin(["", "nan", "unassigned"]), "")
+
+    facs, fine, major = _clean(facs_key), _clean(fine_key), _clean(major_key)
+    # most-specific-available base: FACS subtype > fine > broad
+    base = facs.where(facs != "", fine.where(fine != "", major.where(major != "", "Unassigned")))
+
+    # malignancy qualifier — from the call (else cnv_status); FACS-like 'Malignant <base>'
+    if malignancy_key in adata.obs.columns:
+        is_mal = adata.obs[malignancy_key].astype(str) == "malignant"
+    elif cnv_status_key in adata.obs.columns:
+        is_mal = adata.obs[cnv_status_key].astype(str) == "tumor"
+    else:
+        is_mal = pd.Series(False, index=adata.obs.index)
+    final = base.where(~is_mal, malignant_prefix + " " + base)
+
+    if labels:                                   # optional display-name refinement
+        lm = {str(k): str(v) for k, v in labels.items()}
+        final = final.astype(str).map(lambda v: lm.get(v, v))
+
+    adata.obs[out_key] = pd.Categorical(final.astype(str))
+    dist = {str(k): int(v) for k, v in adata.obs[out_key].value_counts().items()}
+    n_malignant = int(is_mal.sum())
+    adata.uns.setdefault(UNS_ANNO, {})
+    adata.uns[UNS_ANNO]["final"] = {
+        "out_key": out_key, "source_keys": have, "malignant_prefix": malignant_prefix,
+        "n_malignant": n_malignant, "n_final_labels": len(dist),
+    }
+    try:
+        session.log_decision(S.DecisionEvent(
+            decision_type="annotation_finalized", choice={"out_key": out_key, "source_keys": have},
+            candidates=[], rationale="consolidate FACS>fine>major + malignancy qualifier (FACS-like)",
+            stage="finalize_annotation", params={"out_key": out_key}).to_dict())
+    except Exception:  # noqa: BLE001
+        pass
+
+    summary = {
+        "out_key": out_key, "source_keys": have, "n_final_labels": len(dist),
+        "n_malignant": n_malignant, "malignant_prefix": malignant_prefix,
+        "label_distribution": dist,
+    }
+    cp = session.checkpoint("finalize_annotation", x_state=session.manifest.x_state,
+                            params={"out_key": out_key, "malignant_prefix": malignant_prefix})
+    return S.success("finalize_annotation", summary=summary, checkpoint=cp.path,
+                     determinism_grade="A", duration_s=round(time.time() - t0, 3),
+                     suggested_next_tools=["plots", "report"])

@@ -98,7 +98,7 @@ Representative markers:
 | Fibroblast / CAF | `COL1A1`, `COL1A2`, `DCN`, `LUM`, `ACTA2`, `FAP` |
 | Pericyte | `RGS5`, `PDGFRB`, `MCAM` |
 
-### Tier 2: Malignancy Agent
+### Malignancy Agent (CNV track — after Tier 2 subtype; tumor only)
 
 Purpose:
 
@@ -136,7 +136,7 @@ Example output:
 }
 ```
 
-### Tier 3: Compartment-Specific Fine Annotation Agent
+### Tier 2: Compartment-Specific Fine / Subtype Annotation Agent
 
 Purpose:
 
@@ -153,7 +153,7 @@ Recommended compartment-specific analyses:
 | Epithelial / malignant | Tumor cells, cycling tumor cells, EMT-like tumor cells, hypoxic tumor cells, IFN-high tumor cells |
 | B/Plasma | B cell, memory B cell, plasma cell |
 
-### Tier 4: Trajectory and Cell State Agent
+### Tier 3: Trajectory and Cell State Agent
 
 Purpose:
 
@@ -199,7 +199,7 @@ Example output:
 }
 ```
 
-### Tier 5: Consistency and Review Agent
+### Tier 4: Consistency and Review Agent
 
 Purpose:
 

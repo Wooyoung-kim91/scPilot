@@ -37,6 +37,37 @@ def _dist(series) -> dict:
             "q75": float(qs[4]), "q95": float(qs[5]), "max": float(qs[6]), "mean": float(a.mean())}
 
 
+def _med_mad(a) -> tuple[float, float]:
+    """(median, scaled MAD) — MAD×1.4826 ≈ σ for normal data (no scipy dependency)."""
+    import numpy as np
+    a = np.asarray(a, dtype=float)
+    a = a[np.isfinite(a)]
+    if a.size == 0:
+        return 0.0, 0.0
+    med = float(np.median(a))
+    return med, float(np.median(np.abs(a - med)) * 1.4826)
+
+
+def _suggest_cutoffs(obs, *, n_mads: float) -> dict:
+    """MAD-based suggested QC cutoffs (sc-best-practices): lower bounds on counts/genes
+    (computed on log1p then mapped back to count space) + an upper %MT bound, plus optional
+    doublet-side upper bounds. This is EVIDENCE the LLM judges/overrides per tissue — it is
+    NOT auto-applied (mirrors preprocess's suggested_n_pcs_elbow; see no-hardcoding principle).
+    """
+    import numpy as np
+    out: dict = {}
+    for metric, lo_key, hi_key in (("n_genes_by_counts", "min_genes", "max_genes"),
+                                   ("total_counts", "min_counts", "max_counts")):
+        if metric in obs:
+            med, mad = _med_mad(np.log1p(np.asarray(obs[metric], dtype=float)))
+            out[lo_key] = int(max(0, round(np.expm1(med - n_mads * mad))))
+            out[hi_key] = int(max(0, round(np.expm1(med + n_mads * mad))))
+    if "pct_counts_mt" in obs:
+        med, mad = _med_mad(obs["pct_counts_mt"])
+        out["max_pct_mt"] = round(float(med + n_mads * mad), 2)
+    return out
+
+
 def _per_sample_scrublet(adata, sample_key: str, *, seed: int = 0):
     """Run scrublet per sample on the counts layer; return (scores, preds, skipped).
 
@@ -73,7 +104,8 @@ def _per_sample_scrublet(adata, sample_key: str, *, seed: int = 0):
           description="Compute QC metrics (%MT/%ribo), per-sample scrublet doublets, mixed-lineage flag, "
                       "and a batch-aware distribution summary for cutoff selection (plan B3).")
 def qc_metrics(session, *, sample_key: str = "sample_id", mito_prefix: str = "MT-",
-               run_scrublet: bool = True, seed: int = 0, **params) -> S.ToolResult:
+               run_scrublet: bool = True, n_mads: float = 5.0, seed: int = 0,
+               **params) -> S.ToolResult:
     import numpy as np
     import pandas as pd
     import scanpy as sc
@@ -148,12 +180,22 @@ def qc_metrics(session, *, sample_key: str = "sample_id", mito_prefix: str = "MT
             per_sample_rows.append(row)
     per_sample_df = pd.DataFrame(per_sample_rows)
 
+    # MAD-based suggested cutoffs (evidence for the LLM to judge — NOT auto-applied)
+    suggested = {"global": _suggest_cutoffs(adata.obs, n_mads=n_mads)}
+    if have_sample:
+        suggested["per_sample"] = {
+            str(sid): _suggest_cutoffs(sub, n_mads=n_mads)
+            for sid, sub in adata.obs.groupby(sample_key, observed=True)
+        }
+
     summary = {
         "n_cells": int(adata.n_obs), "n_genes": int(adata.n_vars),
         "sample_key": sample_key if have_sample else None,
         "n_samples": int(per_sample_df.shape[0]) if have_sample else None,
         "qc_metrics": metrics,
         "global_distributions": global_dist,
+        "suggested_cutoffs": suggested,
+        "n_mads": n_mads,
         "doublet_rate_overall": doublet_rate,
         "mixed_lineage_frac": mixed_frac,
         "scrublet_skipped_samples": scrublet_skipped,
@@ -164,7 +206,7 @@ def qc_metrics(session, *, sample_key: str = "sample_id", mito_prefix: str = "MT
 
     cp = session.checkpoint("qc_metrics", x_state=session.manifest.x_state,
                             params={"sample_key": sample_key, "mito_prefix": mito_prefix,
-                                    "run_scrublet": run_scrublet, "seed": seed})
+                                    "run_scrublet": run_scrublet, "n_mads": n_mads, "seed": seed})
     return S.success("qc_metrics", summary=summary, tables=tables, warnings=warnings,
                      checkpoint=cp.path, determinism_grade="B" if run_scrublet else "A",
                      duration_s=round(time.time() - t0, 3),

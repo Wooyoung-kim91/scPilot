@@ -680,6 +680,50 @@ def save_scatter(adata, cfg, base_path, x, y, color=None, logger=None):
     return fit_and_save(build, cfg, base_path, logger=logger)
 
 
+def save_qc_thresholds(adata, cfg, base_path, keys, cutoffs, logger=None):
+    """QC metric distributions with the CHOSEN cutoffs overlaid as vertical lines — the
+    justification figure for the selected QC parameters. ``cutoffs`` maps a metric name to
+    a {min, max} dict; only present (non-None) bounds are drawn. Harness lays out a 1×N grid
+    (constrained layout); data rendering is plain matplotlib histograms."""
+    keys = list(keys)
+
+    def build(size, font, draft=False):
+        ad = _draft_view(adata, draft)
+        fig = _new_fig(size)
+        axes = fig.subplots(1, len(keys), squeeze=False)[0]
+        for ax, m in zip(axes, keys):
+            vals = np.asarray(ad.obs[m], dtype=float)
+            vals = vals[np.isfinite(vals)]
+            if vals.size:
+                ax.hist(vals, bins=50)
+            ax.set_title(m, fontsize=font)
+            ax.set_yticks([])
+            for bound in (cutoffs.get(m) or {}).values():
+                if bound is not None:
+                    ax.axvline(float(bound), color="crimson", lw=1.0)
+        return fig
+    return fit_and_save(build, cfg, base_path, grid=(1, len(keys)), logger=logger)
+
+
+def save_resolution_sweep(cfg, base_path, sweep, suggested=None, logger=None):
+    """n_clusters vs leiden resolution line with the CHOSEN resolution marked — the
+    justification figure for the dynamic-resolution knee. ``sweep`` = ordered list of
+    {resolution, n_clusters}; ``suggested`` (optional) draws a vertical marker."""
+    xs = [float(d["resolution"]) for d in sweep]
+    ys = [int(d["n_clusters"]) for d in sweep]
+
+    def build(size, font, draft=False):
+        fig = _new_fig(size)
+        ax = fig.subplots()
+        ax.plot(xs, ys, marker="o")
+        ax.set_xlabel("leiden resolution")
+        ax.set_ylabel("n_clusters")
+        if suggested is not None:
+            ax.axvline(float(suggested), color="crimson", lw=1.0)
+        return fig
+    return fit_and_save(build, cfg, base_path, logger=logger)
+
+
 def save_highly_variable_genes(adata, cfg, base_path, logger=None):
     """sc.pl.highly_variable_genes(adata) — harness sizes it."""
     def build(size, font, draft=False):

@@ -78,7 +78,7 @@ def inspect_h5ad(path: str, *, max_categories: int = _MAX_CATEGORIES) -> S.ToolR
                 vc = ser.value_counts(dropna=False).head(_MAX_VALUE_ROWS)
                 categoricals[str(col)] = {str(k): int(v) for k, v in vc.items()}
 
-        # genomic-coordinate readiness (for CNV / Tier 2 gate, plan B12-pre)
+        # genomic-coordinate readiness (for CNV / malignancy gate, plan B12-pre)
         var_cols = [str(c) for c in adata.var.columns]
         has_coords = all(c in var_cols for c in ("chromosome", "start", "end"))
 

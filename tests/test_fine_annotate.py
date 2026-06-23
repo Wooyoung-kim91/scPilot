@@ -1,4 +1,4 @@
-"""Unit tests for B13 Tier-3 fine annotation — fine_annotation_review (evidence) +
+"""Unit tests for B13 Tier-2 fine annotation — fine_annotation_review (evidence) +
 apply_fine_annotation (LLM call + deterministic HARD RULES: tiny-cluster merge,
 insufficient-evidence → review). Marker-DB-free, same evidence→apply split as Tier-1/2."""
 

@@ -160,11 +160,18 @@ def _show(stage, res):
 '''
 
 
-def _notebook_cell(cid: str, stage: str, params: dict) -> str:
-    """One markdown + one code cell for a pipeline step (percent format)."""
+def _notebook_cell(cid: str, stage: str, params: dict, seed: int = 0) -> str:
+    """One markdown + one code cell for a pipeline step (percent format).
+
+    Each cell RE-PINS the step's recorded seed before the tool call so the cell is
+    self-contained: running top-to-bottom — or re-running a single cell — reproduces the
+    SAME result as the recorded run, independent of accumulated kernel RNG state
+    (cell-by-cell determinism requirement).
+    """
     return (
         f'\n# %% [markdown]\n# ## {cid} · {stage}\n# params: `{params!r}`\n\n'
-        f'# %%\n_res = tools.run("{stage}", sess, **{params!r})\n_show("{stage}", _res)\n'
+        f'# %%\nset_global_seed({seed})\n'
+        f'_res = tools.run("{stage}", sess, **{params!r})\n_show("{stage}", _res)\n'
     )
 
 
@@ -200,6 +207,25 @@ def counts_fingerprint(adata) -> dict | None:
     return fp
 
 
+def _artifact_sha(path: str, *, cap_bytes: int = 100 * 1024 * 1024) -> str | None:
+    """sha256 of an output artifact for integrity/audit (None if missing or > ``cap_bytes``).
+
+    Capped so we never hash a multi-GB h5ad; figures/tables/JSON are small. This is a
+    provenance fingerprint, NOT a replay-equality check (PNG bytes are non-deterministic).
+    """
+    p = Path(path)
+    try:
+        if not p.is_file() or p.stat().st_size > cap_bytes:
+            return None
+        h = hashlib.sha256()
+        with open(p, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()[:16]
+    except Exception:  # noqa: BLE001 — hashing must never break logging
+        return None
+
+
 @dataclass
 class Checkpoint:
     id: str
@@ -225,6 +251,8 @@ class Manifest:
     checkpoints: list = field(default_factory=list)     # list[dict] (Checkpoint asdict)
     pipeline_script: str | None = None                  # code/pipeline.py (full flow)
     n_runs: int = 0
+    n_outputs: int = 0                                   # outputs.jsonl records written (should track n_runs)
+    log_inconsistencies: int = 0                         # times the outputs record failed to write after run_log
 
 
 class Session:
@@ -261,6 +289,10 @@ class Session:
     @property
     def decisions_path(self) -> Path:
         return self.out / "decisions.jsonl"
+
+    @property
+    def outputs_path(self) -> Path:
+        return self.out / "outputs.jsonl"
 
     @property
     def reasoning_log_path(self) -> Path:
@@ -413,13 +445,9 @@ class Session:
                         fingerprint=_fingerprint(path), x_state=self.manifest.x_state,
                         params=params or {})
         self.manifest.checkpoints.append(cp.__dict__)
-        # (re)write the FULL pipeline script (entire flow, all steps, + inlined tool source)
-        # + the cell-by-cell Jupyter notebook (MCP-free, plots inline) for human replay
-        self.manifest.pipeline_script = self._write_pipeline()
-        try:
-            self._write_notebook()
-        except Exception:  # noqa: BLE001 — notebook emission must never break a checkpoint
-            pass
+        # NOTE: the FULL pipeline script + notebook are (re)generated in record_run() from the
+        # run log — covering EVERY step incl. non-mutating ones (plan P1) — not here, where we
+        # would only see mutating/checkpointing tools.
         self.manifest.stage = stage
         if self.manifest.counts_fingerprint is None:
             self.manifest.counts_fingerprint = counts_fingerprint(a)
@@ -444,8 +472,30 @@ class Session:
                             ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         return snap_name
 
+    def _read_runs(self) -> list[dict]:
+        """Successful tool runs IN ORDER from the append-only run log.
+
+        Pipeline/notebook generation is driven by the run log (every step — mutating
+        AND non-mutating like annotation_review/benchmark/report), NOT by checkpoints
+        (mutating-only), so the generated repro artifacts cover the WHOLE analysis (plan P1).
+        """
+        p = self.run_log_path
+        if not p.exists():
+            return []
+        runs: list[dict] = []
+        for line in p.read_text().splitlines():
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:  # noqa: BLE001
+                continue
+            if rec.get("status") == "success":
+                runs.append(rec)
+        return runs
+
     def _write_pipeline(self) -> str:
-        """(Re)write code/pipeline.py — the FULL flow (all steps so far) as one runnable
+        """(Re)write code/pipeline.py — the FULL flow (every logged step) as one runnable
         script, with each tool's actual source inlined for inspection."""
         import inspect
 
@@ -460,11 +510,13 @@ class Session:
 
         flow_lines, src_blocks, seen = [], [], set()
         seed = 0
-        for cp in self.manifest.checkpoints:
-            stage, params = cp["stage"], cp.get("params", {}) or {}
-            if "seed" in params:
+        for i, r in enumerate(self._read_runs()):
+            stage, params = r.get("tool"), r.get("params", {}) or {}
+            if r.get("seed") is not None:
+                seed = int(r["seed"])
+            elif "seed" in params:
                 seed = int(params["seed"])
-            flow_lines.append(f'    tools.run("{stage}", sess, **{params!r})  # {cp["id"]}')
+            flow_lines.append(f'    tools.run("{stage}", sess, **{params!r})  # {i:02d}_{stage}')
             if stage not in seen:
                 seen.add(stage)
                 try:
@@ -494,13 +546,18 @@ class Session:
         prov_md = "\n".join(
             f"# - {k}: {prov.get(k)}" for k in ("scpilot_version", "source_hash", "git_commit", "timestamp"))
         inp = self.manifest.input.get("path", "")
-        seed = 0
+        runs = self._read_runs()
         cells = []
-        for cp in self.manifest.checkpoints:
-            params = cp.get("params", {}) or {}
-            if "seed" in params:
-                seed = int(params["seed"])
-            cells.append(_notebook_cell(cp["id"], cp["stage"], params))
+        for i, r in enumerate(runs):
+            stage, params = r.get("tool"), r.get("params", {}) or {}
+            step_seed = r.get("seed")
+            if step_seed is None:
+                step_seed = int(params["seed"]) if "seed" in params else 0
+            # each cell re-pins ITS recorded seed → cell-by-cell reproduction (not the
+            # last step's seed for the whole notebook)
+            cells.append(_notebook_cell(f"{i:02d}_{stage}", stage, params, int(step_seed)))
+        # top-of-notebook seed = first step's seed (initial/load state); each cell reseeds itself
+        seed = int(runs[0].get("seed") or 0) if runs else 0
         text = _NOTEBOOK_TEMPLATE.format(
             prov_md=prov_md, input_cp=inp, snapshot_rel=snapshot_rel, seed=seed,
             cells="".join(cells) if cells else "")
@@ -517,15 +574,38 @@ class Session:
         self.manifest.n_runs += 1
         self.save()
 
+    @staticmethod
+    def _artifact_records(artifacts) -> list[dict]:
+        """Serialize result artifacts to dicts with a sha256 (integrity/audit) in meta."""
+        out: list[dict] = []
+        for a in (artifacts or []):
+            if isinstance(a, dict):
+                d = {"path": a.get("path"), "kind": a.get("kind", "other"),
+                     "description": a.get("description", ""), "meta": dict(a.get("meta") or {})}
+            else:
+                d = {"path": getattr(a, "path", None), "kind": getattr(a, "kind", "other"),
+                     "description": getattr(a, "description", ""), "meta": dict(getattr(a, "meta", {}) or {})}
+            if d["path"]:
+                sha = _artifact_sha(d["path"])
+                if sha:
+                    d["meta"]["sha256"] = sha
+            out.append(d)
+        return out
+
     def record_run(self, result, *, params: dict | None = None, seed: int | None = None,
                    input_checkpoint: str | None = None, lib_versions: dict | None = None,
-                   stage: str | None = None, compute_recipe_hash: bool = True) -> None:
-        """Build a FULLY-populated RunLogRecord from a ToolResult and append it.
+                   stage: str | None = None, reasoning: str | None = None,
+                   compute_recipe_hash: bool = True) -> None:
+        """Build a FULLY-populated RunLogRecord from a ToolResult and append it, then bind
+        the step's OUTPUTS + reasoning to ``outputs.jsonl`` and regenerate the repro pipeline.
 
         The single run-logging chokepoint shared by all four drivers (CLI ``step`` +
         ``run``-report, the MCP handler, the mode-2 agent) so their records can no
-        longer drift (plan C1). Always fills ``seed``, ``lib_versions`` and
-        ``recipe_hash`` — fields that previously varied per driver (plan A1/A2).
+        longer drift (plan C1). Always fills ``seed``, ``lib_versions`` and ``recipe_hash``
+        (plan A1/A2). Additionally writes one ``OutputRecord`` per step binding
+        ``[step → params → artifacts(+sha256) → reasoning → provenance]`` (the artifacts/
+        reasoning harness) and rewrites ``code/pipeline.py`` + the notebook from the run log
+        so EVERY step (incl. non-mutating + report) is covered (plan P1).
         """
         from scpilot import repro
         from scpilot import schemas as S
@@ -548,6 +628,39 @@ class Session:
             lib_versions=libs, duration_s=result.duration_s, error_code=result.error_code,
         ).to_dict())
 
+        # outputs index: bind this step's artifacts + reasoning + provenance, COUPLED to the
+        # run log by the run index n. A failure here must not break the result, but it is NOT
+        # swallowed silently — it is counted (manifest.log_inconsistencies) and logged, so a
+        # run_log↔outputs divergence is DETECTABLE via log_consistency() rather than hidden (C-2).
+        try:
+            out_rec = {"ts": _now(), "session_id": self.manifest.session_id,
+                       **S.OutputRecord(
+                           tool=result.tool, status=result.status, stage=stage or result.tool,
+                           n=self.manifest.n_runs, recipe_hash=rh, seed=seed, params=params or {},
+                           summary=result.summary, artifacts=self._artifact_records(result.artifacts),
+                           reasoning=reasoning, warnings=list(result.warnings or []),
+                       ).to_dict()}
+            self._append_jsonl(self.outputs_path, out_rec)
+            self.manifest.n_outputs += 1
+        except Exception as exc:  # noqa: BLE001 — surface (count + log), never silently swallow
+            self.manifest.log_inconsistencies += 1
+            import logging
+            logging.getLogger("scpilot.session").error(
+                "outputs.jsonl write FAILED for '%s' — run_log↔outputs diverged (n_runs=%d): %s",
+                result.tool, self.manifest.n_runs, exc)
+        try:
+            self.save()                      # persist the n_outputs / inconsistency counters
+        except Exception:  # noqa: BLE001
+            pass
+
+        # regenerate the FULL repro pipeline + notebook from the run log (covers every step)
+        try:
+            self.manifest.pipeline_script = self._write_pipeline()
+            self._write_notebook()
+            self.save()
+        except Exception:  # noqa: BLE001 — repro-artifact emission must never break the result
+            pass
+
     def record_tool_run(self, result, *, params: dict | None = None, seed: int | None = None,
                         input_checkpoint: str | None = None, lib_versions: dict | None = None,
                         reasoning: str | None = None, attach_plots: bool = True) -> None:
@@ -555,8 +668,10 @@ class Session:
         attach a stage-appropriate auto-plot, append the run-log record, and write the
         Markdown reasoning entry — all in one place so ``step`` and MCP stay identical.
 
-        The mode-2 agent does NOT use this (it returns the result to the LLM rather than
-        rendering plots/reasoning) and calls ``record_run`` directly.
+        All three orchestrated drivers (CLI ``step``, MCP handler, mode-2 agent) use this so
+        auto-plots, the run-log + outputs records, and the reasoning narrative are produced
+        identically in every mode. ``reasoning`` (the WHY) is bound to the OutputRecord AND
+        written to the Markdown narrative.
         """
         if attach_plots and result.status == "success":
             try:
@@ -566,8 +681,9 @@ class Session:
                     result.artifacts = list(result.artifacts or []) + extra
             except Exception:  # noqa: BLE001 — a missing plot must never break the step
                 pass
-        self.record_run(result, params=params, seed=seed,
-                        input_checkpoint=input_checkpoint, lib_versions=lib_versions)
+        # record_run binds artifacts(+sha) + reasoning to outputs.jsonl and regenerates the pipeline
+        self.record_run(result, params=params, seed=seed, input_checkpoint=input_checkpoint,
+                        lib_versions=lib_versions, reasoning=reasoning)
         try:
             plot_paths = [a.path for a in (result.artifacts or [])
                           if getattr(a, "kind", None) == "png"]
@@ -576,6 +692,31 @@ class Session:
                                checkpoint=result.checkpoint, plots=plot_paths)
         except Exception:  # noqa: BLE001 — logging must never break the result
             pass
+
+    def log_consistency(self) -> dict:
+        """run_log ↔ outputs.jsonl coupling check (C-2): every logged run should have one
+        outputs record. Returns counts + a ``consistent`` flag; a mismatch means an outputs
+        write failed after the run-log append (recorded in ``log_inconsistencies``)."""
+        m = self.manifest
+        consistent = m.log_inconsistencies == 0 and m.n_outputs == m.n_runs
+        return {"n_runs": m.n_runs, "n_outputs": m.n_outputs,
+                "log_inconsistencies": m.log_inconsistencies, "consistent": bool(consistent)}
+
+    def artifact_path(self, name: str) -> Path:
+        """A non-colliding path under ``artifacts_dir`` for an output file (P1-2).
+
+        Returns ``artifacts_dir/name`` when free; if a prior run already wrote that name,
+        inserts the current run index so the earlier evidence file is NOT silently overwritten
+        (the returned path is what the tool writes + reports, so outputs.jsonl/report point at it).
+        """
+        self._ensure_dirs()
+        p = self.artifacts_dir / name
+        if not p.exists():
+            return p
+        stem, dot, ext = name.rpartition(".")
+        base = stem if dot else name
+        suffix = f".{ext}" if dot else ""
+        return self.artifacts_dir / f"{base}.{self.manifest.n_runs:02d}{suffix}"
 
     def log_decision(self, record: dict, *, validate: bool = True) -> None:
         """Append one LLM decision event to decisions.jsonl (schema frozen in A7).

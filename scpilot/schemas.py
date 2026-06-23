@@ -231,7 +231,7 @@ DECISION_TYPES = (
     "clustering_resolution",    # leiden resolution
     "tier1_consensus_label",    # broad major_cell_type consensus (de-risk ①)
     "compartment_branch",       # which compartments to recurse into
-    "malignancy_call",          # Tier 2 malignant/non/uncertain
+    "malignancy_call",          # malignancy: malignant/non/uncertain
     "cnv_reference",            # reference cells chosen for inferCNV
     "cnv_fallback",             # CNV fallback path taken
     "trajectory_method",        # PAGA | slingshot | ... (gated)
@@ -284,6 +284,36 @@ class RunLogRecord:
     lib_versions: dict = field(default_factory=dict)
     duration_s: float | None = None
     error_code: str | None = None
+
+    def to_dict(self) -> dict:
+        return _sanitize(dataclasses.asdict(self))
+
+
+@dataclass
+class OutputRecord:
+    """One step's OUTPUTS bound to its WHY — appended to ``outputs.jsonl``.
+
+    The single per-step record that binds ``[step → params → artifacts → reasoning →
+    provenance]`` so the report, the generated pipeline, and audit can answer "which
+    artifacts did this step produce, with what params, and why?". Kept SEPARATE from the
+    frozen ``RunLogRecord`` (the run log stays a pure replayable recipe); this index adds
+    output provenance without inflating that contract.
+
+    ``artifacts`` are ``Artifact``-shaped dicts whose ``meta`` carries ``sha256`` + ``bytes``
+    (integrity/audit, NOT replay equality — figure bytes are non-deterministic). ``reasoning``
+    is the caller/LLM's prose WHY for this step (optional).
+    """
+    tool: str
+    status: Status = "success"
+    stage: str | None = None
+    n: int | None = None                              # session run index when recorded
+    recipe_hash: str | None = None
+    seed: int | None = None
+    params: dict = field(default_factory=dict)
+    summary: dict = field(default_factory=dict)
+    artifacts: list = field(default_factory=list)     # [{path, kind, description, meta(+sha256,bytes)}]
+    reasoning: str | None = None
+    warnings: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return _sanitize(dataclasses.asdict(self))

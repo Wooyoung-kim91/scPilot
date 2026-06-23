@@ -31,7 +31,8 @@ TISSUE-CONTEXT-AWARE (use the stated tissue as a soft biological prior — see b
 
 You receive, per cluster (from the `annotation_review` tool):
 - candidate_annotation + candidate_confidence (marker-anchored first opinion)
-- de_table: the full top-N ranked DE genes with logFC, padj, pct_in, pct_out, score
+- de_table: the top-N ranked DE genes with mean_in (mean log-norm EXPRESSION in-cluster),
+  logFC, padj, pct_in, pct_out, spec (=pct_in-pct_out), score
 - cluster_size, sample_distribution, qc_metrics (n_genes, total_counts, pct_mt, doublet)
 - deterministic_flags (marker_conflict, doublet_dominated, ptprc_consistent, single_source)
 - review_status: a deterministic baseline you may override with reasoning
@@ -42,6 +43,10 @@ HARD CONSTRAINTS
   programs from the ranked DE evidence itself, reasoning at the gene-program level.
 - Use both directions: a gene high in pct_out (broadly expressed) is weak evidence.
 - Treat the candidate_annotation as a hypothesis to test, not an answer to confirm.
+- MARKER-SET COMBINATION: for each cluster pick a set of >=3 genes that are BOTH highly
+  expressed (high mean_in) AND highly specific (high spec, low pct_out) — that combination IS
+  the identity evidence. Record it via apply_annotation(marker_sets={cell_type: [genes]}); if no
+  >=3-gene confident set exists, set review_required for that cluster.
 
 REASONING FLOW
 1. Program discovery: from the full de_table, name the dominant transcriptional
@@ -127,11 +132,12 @@ GOLDEN RULES
   HVG/PC counts, integration method, annotation strategy, DE design), state the candidates
   you considered, your choice, and a one-line rationale in your prose BEFORE the tool call.
   The harness records this as a decision event.
-- CLUSTERING RESOLUTION DEFAULTS TO 0.25 at every clustering stage. Use the resolution(s) the
-  user provided (see "Clustering resolution" in context); when 'all' is given, apply it to every
-  embedding. Do NOT invent your own value — if you want to deviate from the given/default
-  resolution, state your reason and the candidate value, then proceed with the user-set one
-  unless told otherwise.
+- CLUSTERING RESOLUTION IS CHOSEN DYNAMICALLY. For each embedding call `cluster_sweep` FIRST
+  (sweeps 0.1–0.5); read the n_clusters-vs-resolution curve and pick the `suggested_resolution`
+  at the knee (the value JUST BEFORE n_clusters jumps) — state candidates (the sweep) + your
+  choice + rationale, then call `cluster(use_rep, resolution=<chosen>)`. If the user provided an
+  explicit resolution (see "Clustering resolution" in context), that OVERRIDES the sweep; absent
+  both, cluster falls back to 0.25.
 - If a tool returns status="error", read error_code: `invalid_state` -> run the
   prerequisite tool first; `capability_unavailable`/`dependency_missing` -> skip that
   optional branch and continue; `data_gate_failed` -> do not retry that path.
@@ -142,8 +148,8 @@ CANONICAL FLOW (skip steps already satisfied per detect_state; stop when the goa
    rate). qc_filter -> choose cutoffs that are permissive enough to keep real biology
    (avoid global cutoffs that erase sample/tissue-specific populations).
 3. preprocess -> from variance_ratio + suggested_n_pcs_elbow choose n_top_genes and n_pcs.
-4. cluster (baseline, use_rep=X_pca) -> uses resolution 0.25 by default (or the user-set value).
-   markers -> per-cluster ranked DE (Wilcoxon, with pts).
+4. cluster_sweep (use_rep=X_pca) -> pick resolution at the knee; then cluster (baseline,
+   use_rep=X_pca, resolution=<chosen>). markers -> per-cluster ranked DE (Wilcoxon, with pts).
 5. Tier-1 annotation is MARKER-DB-FREE — do NOT use a fixed marker panel (annotate_broad is
    legacy/opt-in only): call annotation_review -> read each cluster's de_table and INFER its
    broad cell type from the DE itself (see the annotation-review prompt; apply the tissue
@@ -154,25 +160,45 @@ CANONICAL FLOW (skip steps already satisfied per detect_state; stop when the goa
    (or train_scvi). Then, FOR EACH embedding separately — baseline X_pca AND every
    integration (X_harmony, X_scVI) — repeat the SAME annotation pipeline on that
    embedding's own clustering:
-     cluster(use_rep=<emb>, resolution=<user-set for this embedding, else default 0.25>)
+     cluster_sweep(use_rep=<emb>) -> choose resolution at the knee
+       -> cluster(use_rep=<emb>, resolution=<chosen>)
        -> markers(groupby=<that leiden key>)
        -> annotation_review(groupby=<that leiden key>, tissue=...)
        -> apply_annotation(groupby=<that leiden key>, key=major_cell_type_<model>, labels=...)
    Keep each method's labels in a DISTINCT key (major_cell_type / _harmony / _scvi) so they
-   coexist and can be compared. Each embedding uses resolution 0.25 by default (or the user-set value).
-7. Benchmark the integration methods — but FIRST fix the label_key circularity (de-risk ①):
-   a. consensus_annotation(keys=[major_cell_type_merge, _harmony, _scvi, ...]) -> a per-cell
-      EMBEDDING-INDEPENDENT consensus label (majority vote; disagreements -> 'ambiguous').
-      NEVER benchmark an embedding with its OWN clustering-derived labels.
-   b. benchmark(label_key=<consensus>, batch_key=..., embeddings=[X_pca,X_harmony,X_scVI],
+   coexist and can be compared. Resolution is chosen per embedding from its own sweep (user value overrides).
+7. Harmonize → benchmark → pick best reduction → re-establish Tier-1 (fix label_key circularity, de-risk ①):
+   a. harmonize_annotations(keys=[major_cell_type, major_cell_type_harmony, major_cell_type_scvi, ...]) ->
+      a per-cell EMBEDDING-INDEPENDENT harmonized label (cellhint label-vocabulary alignment when
+      installed, else majority-vote consensus fallback — same role). NEVER benchmark an embedding
+      with its OWN clustering-derived labels.
+   b. benchmark(label_key=<harmonized out_key>, batch_key=..., embeddings=[X_pca,X_harmony,X_scVI],
       drop_labels=<non-cell-type labels>). drop_labels = the tool sentinels (Unknown/Mixed/
       Low_quality/ambiguous, dropped by default) PLUS any dataset-specific NON-lineage labels
       you assigned (e.g. Stress, Erythrocyte, Cycling) — you choose these per dataset; they are
-      NOT hardcoded. Do NOT recompute reductions: benchmark row-subsets the existing embeddings
-      (dropped/ambiguous cells excluded) and scib evaluates them as-produced.
-   c. Pick the integration method from batch-correction AND bio-conservation together (not the
-      aggregate alone; watch overcorrection warnings).
-8. Malignancy (Tier 2) — only if cnv_available AND the goal needs it:
+      NOT hardcoded. Returns plot_results_table + summary.best / ranking_by_total / overcorrection_flag.
+   c. Pick the best reduction from batch-correction AND bio-conservation together (use summary.best
+      but override if overcorrection_flag warns it wins batch-mixing while losing bio-conservation).
+   d. RE-ESTABLISH the final Tier-1 on the chosen reduction: cluster_sweep -> cluster(use_rep=<best>)
+      -> markers -> annotation_review -> apply_annotation(key=major_cell_type) so the canonical
+      major_cell_type is the best-reduction call. State the reduction choice (candidates=ranking).
+8. Subtype / fine annotation (Tier 2) — refine WITHIN each compartment (SAME method as Tier-1):
+   a. compartment_plan(groupby=major_cell_type, batch_key, min_cells, min_samples) -> read REAL
+      per-compartment counts/coverage + batch-mixing; the floor marks under-powered branches.
+      Record a compartment_branch decision (which compartments to recurse into; do not branch
+      blocked/under-powered ones unless justified).
+   b. For each chosen compartment: compartment_subset(compartment, mode='clustering',
+      use_rep=<the BEST integration reduction selected in step 7>) so subtype subclustering runs on
+      the SAME best embedding as the final broad call (or mode='markers' to re-derive
+      compartment-relevant HVGs). Then cluster_sweep(use_rep) -> cluster(use_rep, resolution=<chosen>)
+      -> markers(groupby=<subset leiden>) on the SUBSET.
+   c. fine_annotation_review(groupby=<subset leiden>) -> read each subcluster's de_table
+      (mean_in+pct+spec) + confounders; pick a >=3-gene marker-set and INFER fine_cell_type + a
+      FACS-style label (the PRIMARY subtype name — same broad method) from the DE (see FINE_ANNOTATION_PROMPT; keep
+      type vs state separate). apply_fine_annotation(groupby, fine_labels, facs_labels, cell_state,
+      confidence, review_required, evidence_for) -> writes obs['fine_cell_type','facs_style_label']
+      + annotation_tree (tiny clusters merged + no-evidence calls flagged automatically).
+9. Malignancy / CNV (tumor only, not a tier) — AFTER subtype, only if cnv_available AND the goal needs it:
    a. annotate_genomic_positions FIRST (the merged var has only symbols). It fills
       var[chromosome,start,end] from a pinned GENCODE GTF; gate on protein_coding_coverage
       (>=0.8 ok). If the gate fails (build/symbol-version mismatch), fix the GTF before CNV.
@@ -186,21 +212,9 @@ CANONICAL FLOW (skip steps already satisfied per detect_state; stop when the goa
       expansion) — never a CNV-score threshold alone. If cnv_available is false, decide from
       markers+reference+expansion and flag review_required (apply_malignancy enforces this).
       See MALIGNANCY_PROMPT.
-9. Fine annotation (Tier 3) — refine WITHIN compartments, per the goal.
-   a. compartment_plan(groupby=major_cell_type, batch_key, min_cells, min_samples) -> read REAL
-      per-compartment counts/coverage + batch-mixing; the floor marks under-powered branches.
-      Record a compartment_branch decision (which compartments to recurse into; do not branch
-      blocked/under-powered ones unless justified).
-   b. For each chosen compartment: compartment_subset(compartment, mode='clustering',
-      use_rep=<chosen integration emb>) to subcluster on the batch-corrected embedding (or
-      mode='markers' to re-derive compartment-relevant HVGs). Then cluster(use_rep, resolution=
-      <user-set, else default 0.25>) -> markers(groupby=<subset leiden>) on the SUBSET.
-   c. fine_annotation_review(groupby=<subset leiden>) -> read each subcluster's DE + confounders;
-      INFER fine_cell_type + a FACS-style label from the DE (see FINE_ANNOTATION_PROMPT; keep
-      type vs state separate). apply_fine_annotation(groupby, fine_labels, facs_labels, cell_state,
-      confidence, review_required, evidence_for) -> writes obs['fine_cell_type','facs_style_label']
-      + annotation_tree (tiny clusters merged + no-evidence calls flagged automatically).
-   Then DE per the goal and a final report.
+10. finalize_annotation -> consolidate every label into obs['final_annotation'] (FACS-like): base =
+    facs_style_label > fine_cell_type > major_cell_type (most specific), qualified by malignancy
+    ('Malignant <base>' for malignant cells). Then DE per the goal and a final report.
 
 When the analysis goal is achieved (or no further safe step exists), STOP calling tools
 and write a short final summary of what was done and the key results.
@@ -219,12 +233,12 @@ confounders, confidence, and a review_required flag.
 Principle (from cancer_scrnaseq_annotation_strategy.md — the single source):
   cell type + malignancy + cell state + trajectory + uncertainty = final proposal.
 
-Tier flow: QC/artifact (Tier 0) -> broad type (Tier 1) -> malignant vs non-malignant
-(Tier 2) -> compartment subclustering (Tier 3) -> trajectory/state WITHIN a compartment
-(Tier 4) -> consistency review (Tier 5).
+Tier flow: QC/artifact (Tier 0) -> broad type (Tier 1) -> compartment subtype (Tier 2) ->
+malignancy / CNV (tumor only, not a tier) -> trajectory/state WITHIN a compartment
+(Tier 3) -> consistency review (Tier 4).
 
 HARD RULES (do not violate)
-- Tier 2 malignancy must NOT rely on epithelial markers alone: weigh CNV burden + tumor
+- Malignancy calls must NOT rely on epithelial markers alone: weigh CNV burden + tumor
   markers + normal-epithelial-reference similarity + patient-specific clonal expansion.
   malignancy in {malignant, non_malignant, uncertain, not_applicable}.
 - Keep cell type and cell state SEPARATE. Trajectory/state results go to obs['cell_state']
@@ -244,10 +258,10 @@ re-derive a divergent marker set here.
 """
 
 # ---------------------------------------------------------------------------
-# Malignancy (Tier 2) — judge from multi-axis evidence; NEVER a lone threshold.
+# Malignancy (CNV track) — judge from multi-axis evidence; NEVER a lone threshold.
 # ---------------------------------------------------------------------------
 MALIGNANCY_PROMPT = """\
-You make the Tier-2 malignant / non-malignant call. Like Tier-1 annotation this is a
+You make the malignant / non-malignant call. Like Tier-1 annotation this is a
 two-step split: a deterministic tool packages EVIDENCE, you JUDGE, an apply tool records it.
 
 Flow:
@@ -275,18 +289,21 @@ Supply per-group confidence in [0,1]; flag thin/single-sample groups for review.
 """
 
 # ---------------------------------------------------------------------------
-# Tier-3 fine annotation — infer subtypes WITHIN a compartment from the DE itself.
+# Tier-2 (subtype) fine annotation — infer subtypes WITHIN a compartment from the DE itself.
 # Consumes fine_annotation_review JSON; commits via apply_fine_annotation.
 # ---------------------------------------------------------------------------
 FINE_ANNOTATION_PROMPT = """\
-You make the Tier-3 FINE annotation call WITHIN one broad compartment (after
-compartment_subset → cluster → markers). Like Tiers 1–2 this is a split: a tool packages
-per-subcluster EVIDENCE (fine_annotation_review), you JUDGE, apply_fine_annotation records it.
+You make the Tier-2 (SUBTYPE / fine) annotation call WITHIN one broad compartment (after
+compartment_subset → cluster → markers) — the SAME method as the broad Tier-1 call, applied
+per cell type. A tool packages per-subcluster EVIDENCE (fine_annotation_review), you JUDGE,
+apply_fine_annotation records it. The FACS-style label is the PRIMARY display name for subtypes
+(pass facs_labels; if you omit it, it falls back to fine_cell_type).
 
 You receive, per subcluster (from fine_annotation_review):
-- de_table: top-N SIGNIFICANT ranked DE (logFC, padj, pct_in, pct_out, score)
+- de_table: top-N markers with mean_in (mean log-norm EXPRESSION), logFC, padj, pct_in,
+  pct_out, spec (=pct_in-pct_out), score — pick a >=3-gene set high in BOTH mean_in and spec
 - n_cells, compartment (dominant parent major_cell_type) + compartment_purity
-- malignancy_composition (if Tier-2 ran), sample_distribution + single_patient_dominated
+- malignancy_composition (if the malignancy/CNV track ran), sample_distribution + single_patient_dominated
 - confounders: cell-cycle / stress / interferon / activation / doublet scores + %MT
 
 HARD CONSTRAINTS (do not violate)
