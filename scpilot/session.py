@@ -29,6 +29,7 @@ import os
 import pprint
 import shutil
 import uuid
+import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -62,6 +63,13 @@ def scpilot_source_hash() -> str:
     return h.hexdigest()[:16]
 
 
+def _one_line(s: str) -> str:
+    """Collapse a string to a single line so it can't break out of a generated comment
+    (newline/CR → space). Used for the human-readable ``Input:`` comment in repro code;
+    executable interpolations use ``repr()`` instead."""
+    return " ".join(str(s).splitlines()).strip()
+
+
 _PIPELINE_TEMPLATE = '''#!/usr/bin/env python
 """Full scpilot pipeline — AUTO-GENERATED; reproduces the ENTIRE analysis from the input.
 
@@ -73,7 +81,7 @@ importable source is also pinned under {snapshot_rel}/.
 Provenance:
 {prov}
 
-Input: {input_cp}
+Input: {input_comment}
 """
 import sys
 from pathlib import Path
@@ -85,7 +93,7 @@ from scpilot import tools
 from scpilot.repro import set_global_seed
 from scpilot.session import Session
 
-INPUT = r"{input_cp}"
+INPUT = {input_lit}
 SEED = {seed}
 
 
@@ -123,7 +131,7 @@ _NOTEBOOK_TEMPLATE = '''# %% [markdown]
 # Provenance:
 # {prov_md}
 #
-# Input: `{input_cp}`
+# Input: `{input_comment}`
 
 # %%
 import json, sys
@@ -148,7 +156,7 @@ from scpilot.session import Session
 from scpilot.core.autoplot import auto_plots
 
 set_global_seed({seed})
-sess = Session.create(str(_RUN_DIR / "repro_notebook"), input_path=r"{input_cp}", exist_ok=True)
+sess = Session.create(str(_RUN_DIR / "repro_notebook"), input_path={input_lit}, exist_ok=True)
 sess.load_input()
 
 def _show(stage, res):
@@ -483,15 +491,23 @@ class Session:
         if not p.exists():
             return []
         runs: list[dict] = []
-        for line in p.read_text().splitlines():
+        bad = 0
+        for lineno, line in enumerate(p.read_text().splitlines(), 1):
             if not line.strip():
                 continue
             try:
                 rec = json.loads(line)
             except Exception:  # noqa: BLE001
+                # F7: do NOT silently drop a corrupt record — a truncated/garbled line means the
+                # generated pipeline would be missing a step. Surface it loudly + count it as a
+                # log inconsistency so `log_consistency()` / the report flag the gap.
+                bad += 1
+                warnings.warn(f"run_log.jsonl: skipping malformed JSON at line {lineno} of {p}")
                 continue
             if rec.get("status") == "success":
                 runs.append(rec)
+        if bad:
+            self.manifest.log_inconsistencies += bad
         return runs
 
     def _write_pipeline(self) -> str:
@@ -527,7 +543,8 @@ class Session:
                 src_blocks.append(f"# --- {stage} " + "-" * (60 - len(stage)) + "\n" + commented)
 
         text = _PIPELINE_TEMPLATE.format(
-            prov=prov_comment, input_cp=inp, snapshot_rel=snapshot_rel, seed=seed,
+            prov=prov_comment, input_lit=repr(inp), input_comment=_one_line(inp),
+            snapshot_rel=snapshot_rel, seed=seed,
             flow="\n".join(flow_lines) if flow_lines else "    pass",
             sources="\n\n".join(src_blocks),
         )
@@ -559,7 +576,8 @@ class Session:
         # top-of-notebook seed = first step's seed (initial/load state); each cell reseeds itself
         seed = int(runs[0].get("seed") or 0) if runs else 0
         text = _NOTEBOOK_TEMPLATE.format(
-            prov_md=prov_md, input_cp=inp, snapshot_rel=snapshot_rel, seed=seed,
+            prov_md=prov_md, input_lit=repr(inp), input_comment=_one_line(inp),
+            snapshot_rel=snapshot_rel, seed=seed,
             cells="".join(cells) if cells else "")
         path = self.code_dir / "pipeline_notebook.py"
         with atomic_path(path) as tmp:
@@ -708,6 +726,11 @@ class Session:
         Returns ``artifacts_dir/name`` when free; if a prior run already wrote that name,
         inserts the current run index so the earlier evidence file is NOT silently overwritten
         (the returned path is what the tool writes + reports, so outputs.jsonl/report point at it).
+
+        F8: this is a check-then-write allocation, safe under scpilot's single-writer session model
+        (one process owns a session at a time — CLI step / MCP handler / agent each run serially).
+        It is NOT safe for concurrent writers sharing one session directory; that mode is
+        unsupported. The run-index suffix already disambiguates re-runs within a session.
         """
         self._ensure_dirs()
         p = self.artifacts_dir / name
@@ -766,9 +789,17 @@ class Session:
 
     @staticmethod
     def _append_jsonl(path: Path, record: dict) -> None:
+        """Append one record as a single line. F7: the whole line is written in ONE ``write()``
+        under O_APPEND (POSIX serializes the append offset, so concurrent writers don't interleave),
+        then flushed + fsync'd so a crash can't leave a half-written record that later breaks
+        JSONL parsing / code generation."""
+        import os as _os
         path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(record, default=str) + "\n"
         with open(path, "a") as fh:
-            fh.write(json.dumps(record, default=str) + "\n")
+            fh.write(line)
+            fh.flush()
+            _os.fsync(fh.fileno())
 
     def __repr__(self) -> str:
         return (f"Session(id={self.manifest.session_id}, out={self.out}, "

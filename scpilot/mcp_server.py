@@ -13,8 +13,32 @@ Hard rules (stdio MCP):
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import warnings
+
+
+def _select_specs(specs, lg):
+    """F5: optionally restrict which registry tools the MCP server exposes.
+
+    The server exposes EVERY registered tool by default (the primary integration is a trusted
+    local host such as Claude Code). For tighter deployments, two env vars gate the surface by
+    tool name (without the ``_tool`` suffix):
+      - ``SCPILOT_MCP_ENABLE_TOOLS`` — comma-separated allowlist (only these are exposed).
+      - ``SCPILOT_MCP_DISABLE_TOOLS`` — comma-separated denylist (these are removed).
+    Allowlist is applied first, then denylist. Unknown names are ignored (logged)."""
+    def _names(var):
+        return {n.strip() for n in os.environ.get(var, "").split(",") if n.strip()}
+
+    enable, disable = _names("SCPILOT_MCP_ENABLE_TOOLS"), _names("SCPILOT_MCP_DISABLE_TOOLS")
+    selected = list(specs)
+    if enable:
+        selected = [s for s in selected if s.name in enable]
+        lg.info("MCP allowlist active (SCPILOT_MCP_ENABLE_TOOLS): %s", ", ".join(sorted(enable)))
+    if disable:
+        selected = [s for s in selected if s.name not in disable]
+        lg.info("MCP denylist active (SCPILOT_MCP_DISABLE_TOOLS): %s", ", ".join(sorted(disable)))
+    return selected
 
 
 def _configure_io() -> logging.Logger:
@@ -56,6 +80,7 @@ def build_server():
     specs = tools.all_specs()  # triggers registration of all core tool modules
 
     lg = _configure_io()
+    specs = _select_specs(specs, lg)   # F5: optional env-gated allow/deny filter
     mcp = FastMCP("scpilot")
 
     def _make_handler(name: str):

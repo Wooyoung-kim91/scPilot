@@ -15,10 +15,28 @@ them as ``Artifact``s with width/height(in)/dpi metadata.
 
 from __future__ import annotations
 
+import re
 import time
+from pathlib import Path
 
 from scpilot import schemas as S
 from scpilot.tools import register
+
+# F3: figure basenames are built from LLM/user-controlled values (color, basis, tag, groupby);
+# the vendor save layer creates parent dirs, so an unsanitized "../../etc/x" would escape the
+# session. `_art` strips every char outside [0-9A-Za-z_.-], drops leading/trailing separators
+# (so a bare ".." can't survive), and asserts the resolved path stays under artifacts_dir.
+_SAFE_NAME = re.compile(r"[^0-9A-Za-z_.-]+")
+
+
+def _art(art_dir, name: str) -> Path:
+    safe = _SAFE_NAME.sub("_", str(name)).strip("._") or "plot"
+    p = Path(art_dir) / safe
+    base = Path(art_dir).resolve()
+    rp = p.resolve()
+    if rp != base and base not in rp.parents:
+        raise ValueError(f"unsafe artifact name: {name!r}")
+    return p
 
 # scpilot plotting policy → fed to the vendored plotting_cfg / fit_and_save.
 _PLOTTING = {
@@ -96,7 +114,7 @@ def plots(session, *, kind: str = "umap", color: str | None = None,
             if ck not in adata.obs:
                 return S.error("plots", "missing_input", f"color key '{ck}' not in obs", recoverable=True)
             suf = "" if basis == "X_umap" else "_" + basis.removeprefix("X_umap_").removeprefix("X_")
-            fit = P.save_umap(adata, cfg, art_dir / f"umap{suf}_{ck}", color=ck, basis=basis)
+            fit = P.save_umap(adata, cfg, _art(art_dir, f"umap{suf}_{ck}"), color=ck, basis=basis)
             label = f"{basis} colored by {ck}"
 
         elif kind == "qc_violin":
@@ -106,7 +124,7 @@ def plots(session, *, kind: str = "umap", color: str | None = None,
             if not ks:
                 return S.error("plots", "invalid_state", "no QC metrics — run qc_metrics first",
                                recoverable=True, suggested_next_tools=["qc_metrics"])
-            base = art_dir / (f"qc_violin_{tag}" if tag else "qc_violin")
+            base = _art(art_dir, f"qc_violin_{tag}" if tag else "qc_violin")
             fit = P.save_violin(adata, cfg, base, keys=ks, groupby=groupby)
             label = f"QC violins ({tag or 'all'}): {ks}"
 
@@ -121,7 +139,7 @@ def plots(session, *, kind: str = "umap", color: str | None = None,
                                    recoverable=True, suggested_next_tools=["qc_metrics"])
             cc = (color or "pct_counts_mt")
             cc = cc if cc in adata.obs else None
-            base = art_dir / (f"qc_scatter_{tag}" if tag else "qc_scatter")
+            base = _art(art_dir, f"qc_scatter_{tag}" if tag else "qc_scatter")
             fit = P.save_scatter(adata, cfg, base, x, y, color=cc)
             label = f"scatter {x} vs {y}" + (f" (color {cc})" if cc else "")
 
@@ -137,7 +155,7 @@ def plots(session, *, kind: str = "umap", color: str | None = None,
                 "total_counts": {"min": cut.get("min_counts"), "max": cut.get("max_counts")},
                 "pct_counts_mt": {"max": cut.get("max_pct_mt")},
             }
-            base = art_dir / (f"qc_thresholds_{tag}" if tag else "qc_thresholds")
+            base = _art(art_dir, f"qc_thresholds_{tag}" if tag else "qc_thresholds")
             fit = P.save_qc_thresholds(adata, cfg, base, keys=ks, cutoffs=bounds)
             label = "QC cutoffs over distributions"
 
@@ -147,7 +165,7 @@ def plots(session, *, kind: str = "umap", color: str | None = None,
                 return S.error("plots", "missing_input",
                                "resolution_sweep needs sweep=[{resolution,n_clusters},...]",
                                recoverable=True, suggested_next_tools=["cluster_sweep"])
-            base = art_dir / (f"resolution_sweep_{tag}" if tag else "resolution_sweep")
+            base = _art(art_dir, f"resolution_sweep_{tag}" if tag else "resolution_sweep")
             fit = P.save_resolution_sweep(cfg, base, sweep, suggested=params.get("suggested"))
             label = "resolution sweep (n_clusters vs resolution)"
 
@@ -155,14 +173,14 @@ def plots(session, *, kind: str = "umap", color: str | None = None,
             if "highly_variable" not in adata.var:
                 return S.error("plots", "invalid_state", "no HVG — run preprocess first",
                                recoverable=True, suggested_next_tools=["preprocess"])
-            fit = P.save_highly_variable_genes(adata, cfg, art_dir / "hvg")
+            fit = P.save_highly_variable_genes(adata, cfg, _art(art_dir, "hvg"))
             label = "highly variable genes"
 
         elif kind == "pca_variance":
             if "pca" not in adata.uns:
                 return S.error("plots", "invalid_state", "no PCA — run preprocess first",
                                recoverable=True, suggested_next_tools=["preprocess"])
-            fit = P.save_pca_variance_ratio(adata, cfg, art_dir / "pca_variance")
+            fit = P.save_pca_variance_ratio(adata, cfg, _art(art_dir, "pca_variance"))
             label = "PCA variance ratio"
 
         elif kind == "dotplot":
@@ -217,7 +235,7 @@ def plots(session, *, kind: str = "umap", color: str | None = None,
             cats_order = [ct for ct in groups if ct in present]
             cats_order += [ct for ct in present if ct not in cats_order]
 
-            fit = P.save_dotplot(adata, cfg, art_dir / f"dotplot_{gb}", groups, gb,
+            fit = P.save_dotplot(adata, cfg, _art(art_dir, f"dotplot_{gb}"), groups, gb,
                                  categories_order=cats_order, logger=None)
             label = f"dotplot (markers grouped by cell type) over {gb}"
 
