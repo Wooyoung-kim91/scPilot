@@ -58,6 +58,11 @@ DEFAULT_TOOLSET = [
 # description carries the semantics). Empty schema => the model may pass any params, which
 # the tool validates. We give explicit, decision-relevant knobs for the common steps.
 _PARAM_HINTS: dict[str, dict] = {
+    "qc_metrics": {
+        "n_mads": {"type": "number", "description": "MAD multiplier for suggested QC cutoffs (5=lenient, 3=strict)"},
+        "run_scrublet": {"type": "boolean", "description": "per-sample doublet detection"},
+        "sample_key": {"type": "string", "description": "obs column identifying samples (batch-aware QC)"},
+    },
     "qc_filter": {
         "min_genes": {"type": "integer", "description": "min genes/cell to keep"},
         "max_pct_mt": {"type": "number", "description": "max %% mito to keep"},
@@ -220,10 +225,16 @@ def build_tool_schemas(toolset: list[str] | None = None) -> list[dict]:
 
 
 def _system_prompt(goal: str | None, tissue: str | None = None,
-                   resolutions: dict | None = None) -> str:
+                   resolutions: dict | None = None, param_overrides: dict | None = None) -> str:
     parts = [prompts.ORCHESTRATION_PROMPT, prompts.ANNOTATION_PROMPT,
              prompts.ANNOTATION_REVIEW_PROMPT, prompts.TISSUE_CONTEXT_GUIDANCE,
              prompts.MALIGNANCY_PROMPT, prompts.FINE_ANNOTATION_PROMPT, prompts.DE_DESIGN_PROMPT]
+    if param_overrides:
+        # user-fixed params (human-in-the-loop): the agent MUST use these and not re-choose them.
+        fixed = "; ".join(f"{tool}({', '.join(f'{k}={v}' for k, v in p.items())})"
+                          for tool, p in param_overrides.items() if p)
+        parts.insert(0, f"USER-FIXED PARAMETERS (use these exactly; do NOT choose your own for "
+                        f"these knobs — they are applied automatically): {fixed}\n")
     if resolutions:
         # clustering resolution(s) the agent must use (per embedding/model); 'all' applies to every stage.
         res = ", ".join(f"{k}={v}" for k, v in resolutions.items())
@@ -236,11 +247,18 @@ def _system_prompt(goal: str | None, tissue: str | None = None,
 
 
 def _execute_registry_tool(session, name: str, args: dict, seed: int,
-                           stats: RunStats, rationale: str = "") -> S.ToolResult:
+                           stats: RunStats, rationale: str = "",
+                           param_overrides: dict | None = None) -> S.ToolResult:
     """Run one registry tool and LOG it (run-log + decision) so replay reproduces it.
 
     ``rationale`` is the model's own prose from the tool-call turn — recorded verbatim
-    as the decision rationale (we do NOT fabricate candidates/rationale)."""
+    as the decision rationale (we do NOT fabricate candidates/rationale). ``param_overrides``
+    are the user's pre-set FIXED params: ``{tool: {param: value}}`` — they OVERRIDE whatever the
+    model passed for those knobs (human-in-the-loop), while unset params stay model-chosen."""
+    fixed = (param_overrides or {}).get(name) or {}
+    if fixed:
+        args = {**args, **fixed}                  # user-fixed params win over the model's choice
+        rationale = (rationale + f" [user-fixed: {fixed}]").strip()
     spec = tools.get(name)
     result = spec.fn(session, **args)
     stats.errors += 0 if result.status == "success" else 1
@@ -314,7 +332,7 @@ def _persist_structured(session, name: str, args: dict, stats: RunStats) -> dict
 def run_agent(session, provider: Provider, *, goal: str | None = None,
               tissue: str | None = None, resolutions: dict | None = None,
               toolset: list[str] | None = None, seed: int = 0,
-              max_iters: int = 40) -> AgentResult:
+              max_iters: int = 40, param_overrides: dict | None = None) -> AgentResult:
     """Drive the autonomous tool loop until the model stops calling tools (or max_iters).
 
     ``tissue`` (e.g. 'human pancreas, PDAC') is a soft annotation prior. ``resolutions`` is the
@@ -322,7 +340,7 @@ def run_agent(session, provider: Provider, *, goal: str | None = None,
     only these and never auto-choose. Returns an ``AgentResult`` (prose, stats, transcript);
     all tool runs are logged for deterministic replay.
     """
-    system = _system_prompt(goal, tissue, resolutions)
+    system = _system_prompt(goal, tissue, resolutions, param_overrides)
     tool_schemas = build_tool_schemas(toolset)
     stats = RunStats()
     transcript: list[dict] = []
@@ -363,7 +381,8 @@ def run_agent(session, provider: Provider, *, goal: str | None = None,
                     content = json.dumps(payload)
                 else:
                     result = _execute_registry_tool(session, call.name, call.arguments,
-                                                     seed, stats, rationale=resp.text or "")
+                                                     seed, stats, rationale=resp.text or "",
+                                                     param_overrides=param_overrides)
                     content = json.dumps(result.to_dict(), default=str)
             except KeyError:
                 content = json.dumps({"status": "error", "error_code": "unknown_tool",
