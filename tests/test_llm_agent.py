@@ -94,6 +94,51 @@ def test_build_tool_schemas_includes_emit_tools():
     assert "method" in de["input_schema"]["required"]
 
 
+def test_invalid_param_is_recoverable_not_fatal(tmp_path):
+    # F2: a model-proposed out-of-range param (res_step=0 → would div-by-zero) must come back as a
+    # RECOVERABLE invalid_params error, the loop survives, and a corrected retry succeeds.
+    s = _session(tmp_path)
+    script = [
+        _resp(_tc(1, "preprocess", {"n_top_genes": 80, "n_pcs": 20})),
+        _resp(_tc(2, "cluster_sweep", {"res_min": 0.1, "res_max": 0.3, "res_step": 0})),  # bad
+        _resp(_tc(3, "cluster_sweep", {"res_min": 0.1, "res_max": 0.3, "res_step": 0.1})),  # fixed
+        LLMResponse(text="done", tool_calls=[], stop_reason="end_turn", usage={}),
+    ]
+    res = run_agent(s, FakeProvider(script), seed=0, max_iters=20)
+    assert res.stopped_reason == "completed"
+    # the bad call was NOT logged as a successful run; the corrected one ran
+    runs = [json.loads(l) for l in s.run_log_path.read_text().splitlines() if l.strip()]
+    sweeps = [r for r in runs if r["tool"] == "cluster_sweep" and r.get("status") == "success"]
+    assert sweeps and all(r["params"]["res_step"] == 0.1 for r in sweeps)
+
+
+def test_max_iters_is_clamped(tmp_path):
+    # F9: a non-positive max_iters must be clamped to >=1 (not skip the loop), and the run proceeds.
+    s = _session(tmp_path)
+    script = [LLMResponse(text="done", tool_calls=[], stop_reason="end_turn", usage={})]
+    res = run_agent(s, FakeProvider(script), seed=0, max_iters=0)
+    assert res.stats.llm_turns >= 1
+
+
+def test_tool_output_wrapped_as_untrusted(tmp_path):
+    # F4: tool results handed back to the model are wrapped in the untrusted-data envelope.
+    captured = {}
+
+    class CapturingProvider(FakeProvider):
+        def tool_result_message(self, call, content):     # noqa: D401 — capture wrapper
+            captured["content"] = content
+            return {"role": "tool", "tool_call_id": call.id, "name": call.name, "content": content}
+
+    s = _session(tmp_path)
+    script = [
+        _resp(_tc(1, "detect_state", {})),
+        LLMResponse(text="done", tool_calls=[], stop_reason="end_turn", usage={}),
+    ]
+    run_agent(s, CapturingProvider(script), seed=0, max_iters=20)
+    assert captured["content"].startswith("<tool_output_data>")
+    assert captured["content"].rstrip().endswith("</tool_output_data>")
+
+
 def test_agent_drives_tools_logs_and_stats(tmp_path):
     s = _session(tmp_path)
     script = [

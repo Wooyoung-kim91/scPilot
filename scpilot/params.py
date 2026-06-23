@@ -100,14 +100,21 @@ def load_param_file(path: str) -> dict:
 
 
 def validate_overrides(overrides: dict, catalog: dict | None = None) -> list[str]:
-    """Return warnings for unknown tools/params (never raises — overrides are advisory)."""
+    """Return problems for a user preset: unknown tools/params AND out-of-range / wrong-type values.
+
+    A user-fixed preset is authoritative (it overrides the LLM), so it is validated STRICTLY — the
+    CLI rejects the run if this returns anything, rather than silently feeding a bad value into a
+    tool. Never raises; the caller decides how to surface the list."""
+    from scpilot.validate import validate_params
+
     catalog = catalog if catalog is not None else params_catalog()
-    warns: list[str] = []
+    problems: list[str] = []
     for tool, params in overrides.items():
         if tool not in catalog:
-            warns.append(f"unknown tool in param-file: '{tool}'")
+            problems.append(f"unknown tool in param-file: '{tool}'")
             continue
         for p in params:
             if p not in catalog[tool]:
-                warns.append(f"unknown param '{p}' for tool '{tool}'")
-    return warns
+                problems.append(f"unknown param '{p}' for tool '{tool}'")
+        problems.extend(validate_params(tool, params))   # type / bound / enum guards
+    return problems

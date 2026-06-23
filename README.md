@@ -160,6 +160,14 @@ Connect from an MCP host (Claude Code, Codex CLI, …). Each tool takes `input`
 dict, and a `seed` (pinned per call). A tool run returns its `ToolResult` JSON and
 records the step to the session for replay.
 
+By default every registered tool is exposed (the host is a trusted local process).
+To restrict the surface, gate by tool name with env vars:
+
+```bash
+SCPILOT_MCP_ENABLE_TOOLS=qc_metrics,qc_filter,preprocess scpilot mcp   # allowlist
+SCPILOT_MCP_DISABLE_TOOLS=train_scvi,cnv_score scpilot mcp             # denylist
+```
+
 ### Mode 2 — autonomous agent
 
 ```bash
