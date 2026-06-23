@@ -1,50 +1,57 @@
-# scpilot
+# scPilot
 
-**LLM-driven single-cell RNA-seq analysis pipeline**, exposed as both an **MCP
-(stdio) server** (primary) and a **self-driving CLI agent**.
+**LLM-driven single-cell RNA-seq analysis pipeline** — exposed as both an **MCP
+(stdio) server** (primary integration) and a **self-driving CLI agent**.
 
-Tools return *summary statistics*, never the data — the LLM reasons over those
-compact JSON summaries to decide QC thresholds, integration method, clustering
-resolution, and cell-type annotation, while the (multi-GB) AnnData stays
-server-side. Every run is recorded to a durable on-disk session so a crash can
-resume and the whole analysis can be **deterministically replayed without the LLM**.
+scPilot's core idea: **tools return summary statistics, never the data.** Each
+analysis step (QC, integration, clustering, annotation, CNV, …) emits a compact
+JSON summary; the LLM reasons over those summaries to *decide* the thresholds,
+the integration method, the clustering resolution, and the cell-type labels —
+while the multi-GB `AnnData` stays server-side. Every run is recorded to a
+durable on-disk session, so a crash can resume and the whole analysis can be
+**deterministically replayed without the LLM**.
 
 - Plan: [`scpilot_plan.md`](scpilot_plan.md)
 - Annotation strategy (single source): [`cancer_scrnaseq_annotation_strategy.md`](cancer_scrnaseq_annotation_strategy.md)
-- Vendored reproducibility/IO/figure primitives: [`scpilot/vendor/`](scpilot/vendor/)
+- Vendored reproducibility / IO / figure primitives: [`scpilot/vendor/`](scpilot/vendor/)
 
 ---
 
-## Why scpilot
+## Why scPilot
 
 - **Summary-in → decision-out.** Tools emit small JSON (`ToolResult`); the LLM
-  never loads the AnnData. This keeps the reasoning loop cheap and the data on
+  never loads the `AnnData`. The reasoning loop stays cheap and the data stays on
   the analysis host.
-- **Reproducible by construction.** Seeds are pinned, every tool run is appended
-  to `run_log.jsonl` with a `recipe_hash`, and `scpilot replay` re-runs the exact
-  recipe with **no LLM in the loop**, diffing each result under a determinism grade.
+- **No hardcoded parameters.** Thresholds and resolutions are *suggested from the
+  data* (e.g. MAD-based QC cutoffs, a resolution sweep with a knee detector) and
+  the *LLM judges the final call* from the evidence — nothing is baked in. A user
+  can still **pre-fix any knob** via a preset (see below).
+- **Reproducible by construction.** Seeds are pinned per run, every tool run is
+  appended to `run_log.jsonl` with a `recipe_hash`, and `scpilot replay` re-runs
+  the exact recipe with **no LLM in the loop**, diffing each result under a
+  determinism grade.
 - **Single chokepoints.** All four drivers (MCP, autonomous agent, deterministic
   `step`, `replay`) route tool-logging through one helper, and AnnData invariants
   (`layers["counts"]` immutable, genes never dropped) are enforced at the single
-  checkpoint write boundary.
+  checkpoint-write boundary.
 - **Capability-gated.** Optional tools (scVI, Harmony, inferCNV, scib) check their
   dependencies via `scpilot doctor` and return a recoverable error instead of
   crashing when a package is missing.
 
 ---
 
-## Installation (dev)
+## Installation
 
-The scientific stack is provided by the conda env **`scpilot`**. Install the
-package editable **without touching env deps** (so pip does not re-resolve the
-verified numpy-2.x stack):
+The scientific stack is provided by the conda env **`scpilot`** (numpy-2.x
+verified). Install the package editable **without touching env deps** so pip does
+not re-resolve the stack:
 
 ```bash
 conda run -n scpilot pip install -e . --no-deps
 conda run -n scpilot scpilot version
 ```
 
-Optional Tier-2/3 + trajectory extras (gated at runtime by `doctor`):
+Optional Tier-2 (CNV) + trajectory extras (gated at runtime by `doctor`):
 
 ```bash
 conda run -n scpilot pip install -e ".[extra]" --no-deps   # infercnvpy, gtfparse, pybiomart, celltypist
@@ -56,17 +63,83 @@ anndata, numpy ≥ 2, scvi-tools, harmonypy, leidenalg, scib-metrics, mcp, anthr
 ### Preflight
 
 ```bash
-conda run -n scpilot scpilot doctor      # deps + capability flags + smoke test, as JSON
+conda run -n scpilot scpilot doctor      # deps + per-tool capability flags + smoke test, as JSON
 ```
 
 `doctor` reports per-tool **capability flags**; the orchestrator must not select a
 tool whose capability is `false`.
 
+### LLM credentials (mode 2 only)
+
+The autonomous agent needs an LLM backend. Anthropic by default
+(`ANTHROPIC_API_KEY`), or any OpenAI-compatible endpoint — including a **local**
+model — via `--backend openai --base-url`. Modes 1/3/4 need no LLM key.
+
 ---
 
-## Usage
+## The analysis method
 
-scpilot has four run modes plus the preflight:
+The autonomous pipeline (`scpilot run`) follows the cancer-scRNAseq annotation
+strategy in tiers. The LLM walks this sequence, reading each tool's JSON summary
+to set the next step's parameters from the evidence:
+
+| Stage | Tools | What the LLM decides from the summary |
+|---|---|---|
+| **Tier 0 — QC** | `qc_metrics` → `qc_filter` | MAD-suggested cutoffs (`n_mads`); keeps/relaxes per the distribution + doublet rate. Before/after violin + scatter plots justify the call. |
+| **Embedding** | `preprocess` (HVG → PCA) | `n_top_genes`, `n_pcs` from the variance curve (HVG + PCA-variance plots). |
+| **Clustering** | `cluster_sweep` → `cluster` | Sweeps resolution 0.1–0.5; picks the value **just before clusters suddenly multiply** (knee, `jump_ratio`). |
+| **Integration** | `integrate_harmony` / `integrate_scvi` → `benchmark` | Runs candidate embeddings, then scIB-benchmarks them and picks the **best reduction** for downstream work. |
+| **Tier 1 — broad** | `annotation_review` → `apply_annotation` → `harmonize_annotations` | Top-50 DE per cluster (expression + specificity) → LLM combines a ≥3-gene marker set per broad type → harmonizes labels across reductions. Broad-type UMAP + family-contiguous dotplot. |
+| **Tier 2 — subtype** | `compartment_plan` → `compartment_subset` → `fine_annotation_review` → `apply_fine_annotation` → `merge_fine_annotations` | Re-clusters each compartment on the best reduction; fine subtypes with **FACS-like names** as the primary label. |
+| **Malignancy (CNV)** | `annotate_genomic_positions` → `cnv_score` → `malignancy_evidence` → `apply_malignancy` | inferCNV with immune cells as reference; derives `cnv_status` (tumor vs normal) + CNV UMAP/heatmaps. |
+| **Finalize + report** | `finalize_annotation` → `report` | Consolidated FACS-like `final_annotation` (Malignant-prefixed where applicable) + a figures-and-interpretation report. |
+
+Every threshold above is **data-driven, not hardcoded** — but any of them can be
+fixed in advance via a parameter preset (next section).
+
+---
+
+## Pre-selecting parameters (catalog + presets)
+
+Before launching a run you can list every tunable knob and **fix only the ones
+you care about**; the rest stay dynamically chosen by the LLM. This generalizes
+the human-in-the-loop `--resolution` override to every catalogued parameter.
+
+```bash
+# 1) See the tunable knobs (+ defaults). Unset = chosen dynamically by the LLM.
+conda run -n scpilot scpilot params
+conda run -n scpilot scpilot params --json            # machine-readable
+
+# 2) Generate a fillable preset; uncomment + set only what you want to FIX.
+conda run -n scpilot scpilot params --template preset.yaml
+```
+
+`preset.yaml` — fix only chosen knobs:
+
+```yaml
+qc_metrics:
+  n_mads: 3            # stricter QC than the lenient default (5)
+preprocess:
+  n_top_genes: 3000
+cluster_sweep:
+  res_max: 0.8         # widen the resolution sweep
+```
+
+```bash
+# 3) Run with the preset — fixed values override the LLM for those knobs;
+#    everything else stays dynamic. The fixed set is echoed + recorded for replay.
+conda run -n scpilot scpilot run data.h5ad --param-file preset.yaml \
+  --tissue "human pancreas, PDAC"
+```
+
+Fixed values are recorded in `run_log.jsonl` / `outputs.jsonl`, so a preset run is
+just as reproducible as a fully autonomous one.
+
+---
+
+## Run modes
+
+scPilot has four run modes plus the preflight:
 
 | Command | Mode | What it does |
 |---|---|---|
@@ -74,7 +147,7 @@ scpilot has four run modes plus the preflight:
 | `scpilot run <input.h5ad>` | 2 — autonomous agent | LLM drives the full pipeline end-to-end |
 | `scpilot step <stage> <input.h5ad>` | 3 — deterministic | run one tool, no LLM (debug / regression) |
 | `scpilot replay <session>` | 4 — replay | re-run a session's recipe with no LLM, diff results |
-| `scpilot doctor` | preflight | environment / capability report |
+| `scpilot doctor` / `scpilot params` | preflight | environment / capability report · tunable-knob catalog |
 
 ### Mode 1 — MCP server (primary)
 
@@ -82,10 +155,10 @@ scpilot has four run modes plus the preflight:
 conda run -n scpilot scpilot mcp        # stdout carries ONLY MCP protocol JSON
 ```
 
-Connect from an MCP host (Claude Code, Codex CLI, …). Each tool takes
-`input` (absolute `.h5ad` path), an optional `workdir` (session directory), a
-`params` dict, and a `seed` (pinned per call). A tool run returns its `ToolResult`
-JSON and records the step to the session for replay.
+Connect from an MCP host (Claude Code, Codex CLI, …). Each tool takes `input`
+(absolute `.h5ad` path), an optional `workdir` (session directory), a `params`
+dict, and a `seed` (pinned per call). A tool run returns its `ToolResult` JSON and
+records the step to the session for replay.
 
 ### Mode 2 — autonomous agent
 
@@ -93,14 +166,14 @@ JSON and records the step to the session for replay.
 conda run -n scpilot scpilot run data.h5ad \
   --tissue "human pancreas, PDAC" \
   --goal "annotate major + fine cell types, flag malignant cells" \
-  --resolution 0.25 \
-  --backend anthropic         # or: --backend openai --base-url http://localhost:11434/v1
+  --param-file preset.yaml \              # optional: fix chosen knobs
+  --backend anthropic                     # or: --backend openai --base-url http://localhost:11434/v1
 ```
 
 The agent reads each tool's JSON summary, chooses the next tool + params, and
-writes a final report (figures + interpretation). Every tool run and consequential
-decision is logged so the session replays with **no LLM**. Use `--seed`,
-`--max-iters`, `--model`, `--effort` to control the run.
+writes a final report. Every tool run and consequential decision is logged so the
+session replays with **no LLM**. Control the run with `--seed`, `--max-iters`,
+`--model`, `--effort`, `--resolution`.
 
 ### Mode 3 — deterministic single step (no LLM)
 
@@ -119,7 +192,7 @@ Each `step` prints the `ToolResult` JSON and writes a checkpoint. `-p k=v`
 
 ```bash
 conda run -n scpilot scpilot replay runs/demo               # re-execute + diff
-conda run -n scpilot scpilot replay runs/demo --dry-run     # validate/list only
+conda run -n scpilot scpilot replay runs/demo --dry-run     # validate / list only
 ```
 
 Re-runs every recorded tool with its recorded params on a fresh session and diffs
@@ -133,16 +206,17 @@ cross-checks that the raw counts layer reproduced identically.
 ## Pipeline tools
 
 QC & embedding: `ingest` · `load` · `detect_state` · `qc_metrics` · `qc_filter` ·
-`preprocess` · `cluster` · `markers` · `plots`
+`preprocess` · `cluster` · `cluster_sweep` · `markers` · `plots`
 
 Integration & benchmark: `integrate_scvi` · `train_scvi` · `integrate_harmony` ·
 `benchmark`
 
-Annotation (Tier 1–3): `annotation_review` · `apply_annotation` ·
-`consensus_annotation` · `compartment_plan` · `compartment_subset` ·
-`fine_annotation_review` · `apply_fine_annotation` · `merge_fine_annotations`
+Annotation (Tier 1–2): `annotation_review` · `apply_annotation` ·
+`consensus_annotation` · `harmonize_annotations` · `compartment_plan` ·
+`compartment_subset` · `fine_annotation_review` · `apply_fine_annotation` ·
+`merge_fine_annotations` · `finalize_annotation`
 
-Malignancy (Tier 2, CNV): `annotate_genomic_positions` · `cnv_score` ·
+Malignancy (CNV): `annotate_genomic_positions` · `cnv_score` ·
 `malignancy_evidence` · `apply_malignancy`
 
 Reporting: `report`
@@ -158,6 +232,7 @@ A session is a working directory that owns the analysis state on disk:
   session.json          # manifest (id, x_state, checkpoints[], stage, …)
   run_log.jsonl         # append-only: one record per tool run (params, summary, seed, recipe_hash)
   decisions.jsonl       # append-only: LLM decision events (frozen schema)
+  outputs.jsonl         # append-only: every artifact (figure/CSV) + its provenance + reasoning
   reasoning_log.md      # human-readable narrative (one section per step + plots)
   checkpoints/NN_<stage>.h5ad
   artifacts/            # CSV / PNG outputs
@@ -174,9 +249,11 @@ The in-memory AnnData is just a cache of the latest checkpoint, so any `step`
 
 - **Seed control** — `set_global_seed` pins numpy/random/torch/scvi; every driver
   (incl. the MCP server) pins per run and records the seed.
-- **Run log** — each tool run is a `RunLogRecord` with `params`, structural-invariant
+- **Run log** — each tool run is a `RunLogRecord` with `params`, a structural
   `summary`, `seed`, `lib_versions`, and a `recipe_hash` (params + libs + input +
   data fingerprint) for drift detection.
+- **Output provenance** — each figure/CSV is logged to `outputs.jsonl` with the
+  tool, params, and per-output reasoning that produced it.
 - **Invariants** — enforced at `Session.checkpoint()`: `layers["counts"]` content
   never changes and genes are never dropped (cells may shrink via filtering).
 - **Replay** — `scpilot replay` consumes the recorded recipe to reproduce a session
@@ -191,4 +268,5 @@ conda run -n scpilot python -m pytest tests/ -q
 ```
 
 Each tool has unit + structural-invariant tests on a tiny fixture; the harness has
-driver-parity, replay round-trip, and invariant-violation regression tests.
+driver-parity, replay round-trip, parameter-catalog, and invariant-violation
+regression tests.
