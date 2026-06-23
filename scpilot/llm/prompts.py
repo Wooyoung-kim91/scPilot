@@ -211,7 +211,9 @@ CANONICAL FLOW (skip steps already satisfied per detect_state; stop when the goa
       expansion) — never a CNV-score threshold alone. If cnv_available is false, decide from
       markers+reference+expansion and flag review_required (apply_malignancy enforces this).
       See MALIGNANCY_PROMPT.
-   Then DE per the goal and a final report.
+10. finalize_annotation -> consolidate every label into obs['final_annotation'] (FACS-like): base =
+    facs_style_label > fine_cell_type > major_cell_type (most specific), qualified by malignancy
+    ('Malignant <base>' for malignant cells). Then DE per the goal and a final report.
 
 When the analysis goal is achieved (or no further safe step exists), STOP calling tools
 and write a short final summary of what was done and the key results.

@@ -561,6 +561,42 @@ def test_phase_d_fine_facs_primary(tmp_path):
     assert d.status == "success" and d.artifacts
 
 
+def test_finalize_annotation_consolidates_facs_like(tmp_path):
+    from scpilot import tools
+
+    s = Session.create(tmp_path / "sess")
+    a = _tiny_adata()
+    n = a.n_obs
+    # broad for all; facs (subtype) for the first half only; malignancy on a slice
+    a.obs["major_cell_type"] = ["Epithelial" if i < n // 2 else "T cell" for i in range(n)]
+    a.obs["facs_style_label"] = ["CD8+ T" if i >= n // 2 else "" for i in range(n)]   # only T half has FACS
+    a.obs["malignancy"] = ["malignant" if i < n // 4 else "non_malignant" for i in range(n)]
+    s.set_adata(a)
+
+    res = tools.run("finalize_annotation", s)
+    assert res.status == "success"
+    fa = s.adata.obs["final_annotation"].astype(str)
+    # most-specific base: T half uses FACS, Epithelial half uses broad; malignant slice prefixed
+    assert set(fa[n // 2:]) == {"CD8+ T"}                     # FACS subtype wins where present
+    assert fa.iloc[0] == "Malignant Epithelial"               # broad base + malignancy qualifier
+    assert fa.iloc[n // 2 - 1] == "Epithelial"                # non-malignant Epithelial, no FACS
+    assert res.summary["n_malignant"] == n // 4
+    assert res.summary["label_distribution"]
+
+
+def test_finalize_annotation_no_malignancy(tmp_path):
+    from scpilot import tools
+
+    s = Session.create(tmp_path / "sess")
+    a = _tiny_adata()
+    a.obs["major_cell_type"] = ["B cell"] * a.n_obs           # broad only, no facs/malignancy
+    s.set_adata(a)
+    res = tools.run("finalize_annotation", s)
+    assert res.status == "success"
+    assert set(s.adata.obs["final_annotation"].astype(str)) == {"B cell"}   # base only, no prefix
+    assert res.summary["n_malignant"] == 0
+
+
 def test_harmonize_annotations_consensus_fallback(tmp_path):
     # cellhint is not installed → harmonize_annotations must fall back to the embedding-independent
     # majority vote (graceful), write the harmonized label, and report which path it used.

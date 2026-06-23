@@ -101,6 +101,10 @@ def report(session, *, interpretation: str | None = None, title: str = "scpilot 
         "checkpoints": [cp.get("id") for cp in man.checkpoints],
         "log_consistency": session.log_consistency(),   # run_log ↔ outputs.jsonl coupling (C-2)
     }
+    # final consolidated annotation distribution (Phase F), if finalize_annotation ran
+    _fin = next((r for r in runs if r.get("tool") == "finalize_annotation"), None)
+    if _fin:
+        report_json["final_annotation"] = (_fin.get("summary", {}) or {}).get("label_distribution", {})
 
     # ---- render Markdown ----
     md: list[str] = [f"# {title}", ""]

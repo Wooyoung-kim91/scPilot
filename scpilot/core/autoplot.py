@@ -134,6 +134,10 @@ def plan_autoplots(tool: str, summary: dict, *, obs: set, obsm: set,
         key = "facs_style_label" if "facs_style_label" in obs else summary.get("fine_key", "fine_cell_type")
         if key in obs:
             specs.append({"kind": "umap", "color": key, "basis": _best_basis(obsm)})
+    elif tool == "finalize_annotation":
+        key = summary.get("out_key", "final_annotation")        # consolidated FACS-like map
+        if key in obs:
+            specs.append({"kind": "umap", "color": key, "basis": _best_basis(obsm)})
     return specs
 
 

@@ -51,7 +51,7 @@ DEFAULT_TOOLSET = [
     "markers", "annotation_review", "apply_annotation", "plots",
     "integrate_scvi", "integrate_harmony", "harmonize_annotations", "benchmark",
     "compartment_plan", "compartment_subset",
-    "fine_annotation_review", "apply_fine_annotation",
+    "fine_annotation_review", "apply_fine_annotation", "finalize_annotation",
 ]
 
 # Per-tool parameter hints surfaced to the model (kept minimal; the registry's ToolSpec
@@ -128,6 +128,10 @@ _PARAM_HINTS: dict[str, dict] = {
         "cell_state": {"type": "object", "description": "optional subcluster_id -> functional state"},
         "confidence": {"type": "object"}, "review_required": {"type": "object"},
         "evidence_for": {"type": "object", "description": "subcluster_id -> [supporting evidence]"}},
+    "finalize_annotation": {
+        "out_key": {"type": "string", "description": "final consolidated label column (default final_annotation)"},
+        "malignant_prefix": {"type": "string", "description": "prefix for malignant cells (default 'Malignant')"},
+        "labels": {"type": "object", "description": "optional base->final display-name refinement"}},
 }
 
 # Decision-event type per tool (which step the agent's choice maps to in the frozen schema).

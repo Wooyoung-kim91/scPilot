@@ -1238,3 +1238,81 @@ def apply_fine_annotation(session, *, groupby: str = "leiden", fine_labels: dict
     return S.success("apply_fine_annotation", summary=summary, warnings=warnings, checkpoint=cp.path,
                      determinism_grade="A", duration_s=round(time.time() - t0, 3),
                      suggested_next_tools=["plots", "trajectory", "report"])
+
+
+# --------------------------------------------------------------------------- #
+# Phase F — final consolidated annotation (FACS-like)
+# --------------------------------------------------------------------------- #
+@register("finalize_annotation", mutating=True,
+          description="Consolidate every per-cell label into ONE final FACS-like annotation in obs[out_key]: "
+                      "base = facs_style_label > fine_cell_type > major_cell_type (most specific available), "
+                      "qualified by malignancy (malignancy=='malignant', else cnv_status=='tumor' -> "
+                      "'<malignant_prefix> <base>'). Deterministic/replayable; optional `labels` refines display "
+                      "names. NO hardcoded cell-type vocabulary (labels come from the prior LLM calls). Run last.")
+def finalize_annotation(session, *, facs_key: str = "facs_style_label", fine_key: str = "fine_cell_type",
+                        major_key: str = "major_cell_type", malignancy_key: str = "malignancy",
+                        cnv_status_key: str = "cnv_status", out_key: str = "final_annotation",
+                        malignant_prefix: str = "Malignant", labels: dict | None = None,
+                        **params) -> S.ToolResult:
+    import pandas as pd
+
+    t0 = time.time()
+    adata = session.adata
+    have = [k for k in (facs_key, fine_key, major_key) if k in adata.obs.columns]
+    if not have:
+        return S.error("finalize_annotation", "invalid_state",
+                       f"no annotation columns to consolidate (need one of {facs_key}/{fine_key}/{major_key}) — "
+                       "run apply_annotation first", recoverable=True, suggested_next_tools=["apply_annotation"])
+
+    n = adata.n_obs
+    blank = pd.Series([""] * n, index=adata.obs.index)
+
+    def _clean(key):
+        if key not in adata.obs.columns:
+            return blank
+        s = adata.obs[key].fillna("").astype(str)
+        return s.mask(s.str.strip().str.lower().isin(["", "nan", "unassigned"]), "")
+
+    facs, fine, major = _clean(facs_key), _clean(fine_key), _clean(major_key)
+    # most-specific-available base: FACS subtype > fine > broad
+    base = facs.where(facs != "", fine.where(fine != "", major.where(major != "", "Unassigned")))
+
+    # malignancy qualifier — from the call (else cnv_status); FACS-like 'Malignant <base>'
+    if malignancy_key in adata.obs.columns:
+        is_mal = adata.obs[malignancy_key].astype(str) == "malignant"
+    elif cnv_status_key in adata.obs.columns:
+        is_mal = adata.obs[cnv_status_key].astype(str) == "tumor"
+    else:
+        is_mal = pd.Series(False, index=adata.obs.index)
+    final = base.where(~is_mal, malignant_prefix + " " + base)
+
+    if labels:                                   # optional display-name refinement
+        lm = {str(k): str(v) for k, v in labels.items()}
+        final = final.astype(str).map(lambda v: lm.get(v, v))
+
+    adata.obs[out_key] = pd.Categorical(final.astype(str))
+    dist = {str(k): int(v) for k, v in adata.obs[out_key].value_counts().items()}
+    n_malignant = int(is_mal.sum())
+    adata.uns.setdefault(UNS_ANNO, {})
+    adata.uns[UNS_ANNO]["final"] = {
+        "out_key": out_key, "source_keys": have, "malignant_prefix": malignant_prefix,
+        "n_malignant": n_malignant, "n_final_labels": len(dist),
+    }
+    try:
+        session.log_decision(S.DecisionEvent(
+            decision_type="annotation_finalized", choice={"out_key": out_key, "source_keys": have},
+            candidates=[], rationale="consolidate FACS>fine>major + malignancy qualifier (FACS-like)",
+            stage="finalize_annotation", params={"out_key": out_key}).to_dict())
+    except Exception:  # noqa: BLE001
+        pass
+
+    summary = {
+        "out_key": out_key, "source_keys": have, "n_final_labels": len(dist),
+        "n_malignant": n_malignant, "malignant_prefix": malignant_prefix,
+        "label_distribution": dist,
+    }
+    cp = session.checkpoint("finalize_annotation", x_state=session.manifest.x_state,
+                            params={"out_key": out_key, "malignant_prefix": malignant_prefix})
+    return S.success("finalize_annotation", summary=summary, checkpoint=cp.path,
+                     determinism_grade="A", duration_s=round(time.time() - t0, 3),
+                     suggested_next_tools=["plots", "report"])
