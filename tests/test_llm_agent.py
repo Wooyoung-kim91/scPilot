@@ -200,6 +200,22 @@ def test_mode2_writes_reasoning_log_and_outputs(tmp_path):
     assert any(r.get("reasoning") == "reasoning" for r in orecs)   # _resp() prose captured
 
 
+def test_param_overrides_fix_tool_args(tmp_path):
+    # the user pre-fixes cluster resolution=0.7; the model proposes 0.3 — the FIXED value must win
+    # and be recorded (human-in-the-loop param preset).
+    s = _session(tmp_path)
+    script = [
+        _resp(_tc(1, "preprocess", {"n_top_genes": 80, "n_pcs": 20})),
+        _resp(_tc(2, "cluster", {"resolution": 0.3})),
+        LLMResponse(text="done", tool_calls=[], stop_reason="end_turn", usage={}),
+    ]
+    run_agent(s, FakeProvider(script), seed=0, max_iters=20,
+              param_overrides={"cluster": {"resolution": 0.7}})
+    runs = [json.loads(l) for l in s.run_log_path.read_text().splitlines() if l.strip()]
+    cl = next(r for r in runs if r["tool"] == "cluster")
+    assert cl["params"]["resolution"] == 0.7        # user-fixed override won over the model's 0.3
+
+
 def test_agent_signals_max_iters_when_never_stops(tmp_path):
     # model keeps calling a tool forever → loop must stop and report it (not silently)
     s = _session(tmp_path)

@@ -53,6 +53,29 @@ def doctor() -> None:
 
 
 @app.command()
+def params(
+    json_out: bool = typer.Option(False, "--json", help="emit the catalog as JSON"),
+    template: str = typer.Option(None, "--template", help="write a fillable YAML preset to this path"),
+) -> None:
+    """List the tunable analysis parameters (+ defaults) a user can pre-set before `scpilot run`.
+
+    Unset params are chosen dynamically by the LLM; values you fix in a preset YAML
+    (`--template` → edit → `run --param-file`) override the LLM for those knobs.
+    """
+    import json as _json
+
+    from scpilot.params import params_catalog, render_catalog_table, render_template
+
+    cat = params_catalog()
+    if template:
+        from pathlib import Path
+        Path(template).write_text(render_template(cat))
+        typer.echo(f"wrote preset template: {template}  (edit, then: scpilot run <input> --param-file {template})")
+        raise typer.Exit(0)
+    typer.echo(_json.dumps(cat, indent=2, default=str) if json_out else render_catalog_table(cat))
+
+
+@app.command()
 def mcp() -> None:
     """Start the MCP (stdio) server (plan A6/C2). stdout = protocol only."""
     from scpilot.mcp_server import main as run_server
@@ -149,6 +172,8 @@ def run(
                                  help="OpenAI-compatible endpoint for a LOCAL LLM (e.g. http://localhost:11434/v1)"),
     seed: int = typer.Option(0, "--seed", help="global RNG seed (recorded for replay)"),
     max_iters: int = typer.Option(40, "--max-iters", help="max LLM tool-loop iterations"),
+    param_file: str = typer.Option(None, "--param-file",
+                                   help="YAML preset of {tool: {param: value}} to FIX (see `scpilot params --template`)"),
 ) -> None:
     """Self-driving full pipeline (plan D5 / mode 2).
 
@@ -199,8 +224,17 @@ def run(
     else:
         resolutions = {"all": DEFAULT_RESOLUTION}
 
+    # user-fixed parameter preset (human-in-the-loop): {tool: {param: value}} overrides
+    param_overrides = None
+    if param_file:
+        from scpilot.params import load_param_file, validate_overrides
+        param_overrides = load_param_file(param_file)
+        for w in validate_overrides(param_overrides):
+            typer.secho(f"[param-file] {w}", fg=typer.colors.YELLOW, err=True)
+        typer.secho(f"[scpilot run] user-fixed params: {param_overrides}", fg=typer.colors.CYAN, err=True)
+
     result = run_agent(session, provider, goal=goal, tissue=tissue, resolutions=resolutions,
-                       seed=seed, max_iters=max_iters)
+                       seed=seed, max_iters=max_iters, param_overrides=param_overrides)
 
     # final interpretation + report (LLM prose injected into the deterministic report tool)
     interp = ""
