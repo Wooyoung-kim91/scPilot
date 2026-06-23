@@ -21,12 +21,11 @@ LLM reasoning agents can be useful at each tier, but they should act as evidence
 
 ```text
 QC / doublet / ambient RNA assessment
--> broad cell type annotation
--> malignant vs non-malignant classification
--> compartment-specific subclustering
--> fine annotation using markers and references
--> trajectory / state interpretation
--> consistency review and uncertainty flagging
+-> broad cell type annotation (Tier 1)
+-> compartment-specific subclustering + fine / subtype annotation (Tier 2)
+-> malignant vs non-malignant classification (CNV track, tumor only — after subtype)
+-> trajectory / state interpretation (Tier 3)
+-> consistency review and uncertainty flagging (Tier 4)
 ```
 
 ## Tiered LLM Reasoning Agent Design
@@ -98,6 +97,23 @@ Representative markers:
 | Fibroblast / CAF | `COL1A1`, `COL1A2`, `DCN`, `LUM`, `ACTA2`, `FAP` |
 | Pericyte | `RGS5`, `PDGFRB`, `MCAM` |
 
+### Tier 2: Compartment-Specific Fine / Subtype Annotation Agent
+
+Purpose:
+
+- Refine annotation within each major compartment.
+- Prevent unrelated cell types from being forced into the same trajectory or label space.
+
+Recommended compartment-specific analyses:
+
+| Compartment | Fine annotation examples |
+| --- | --- |
+| T/NK | CD4 T, CD8 T, Treg, exhausted T, cycling T, NK |
+| Myeloid | Monocyte, macrophage, TAM, cDC1, cDC2, pDC, neutrophil |
+| Stromal | Fibroblast, myCAF, iCAF, apCAF, pericyte |
+| Epithelial / malignant | Tumor cells, cycling tumor cells, EMT-like tumor cells, hypoxic tumor cells, IFN-high tumor cells |
+| B/Plasma | B cell, memory B cell, plasma cell |
+
 ### Malignancy Agent (CNV track — after Tier 2 subtype; tumor only)
 
 Purpose:
@@ -135,23 +151,6 @@ Example output:
   ]
 }
 ```
-
-### Tier 2: Compartment-Specific Fine / Subtype Annotation Agent
-
-Purpose:
-
-- Refine annotation within each major compartment.
-- Prevent unrelated cell types from being forced into the same trajectory or label space.
-
-Recommended compartment-specific analyses:
-
-| Compartment | Fine annotation examples |
-| --- | --- |
-| T/NK | CD4 T, CD8 T, Treg, exhausted T, cycling T, NK |
-| Myeloid | Monocyte, macrophage, TAM, cDC1, cDC2, pDC, neutrophil |
-| Stromal | Fibroblast, myCAF, iCAF, apCAF, pericyte |
-| Epithelial / malignant | Tumor cells, cycling tumor cells, EMT-like tumor cells, hypoxic tumor cells, IFN-high tumor cells |
-| B/Plasma | B cell, memory B cell, plasma cell |
 
 ### Tier 3: Trajectory and Cell State Agent
 
