@@ -240,3 +240,29 @@ def test_apply_malignancy_forces_review_without_cnv(tmp_path):
     assert "Epithelial" in r.summary["forced_review_no_cnv"]
     rr = s.adata.obs.loc[s.adata.obs["major_cell_type"] == "Epithelial", "malignancy_review_required"]
     assert bool(rr.iloc[0]) is True
+
+
+# --------------------------------------------------------------------------- #
+# Phase E — CNV plot suite + cnv_status derivation
+# --------------------------------------------------------------------------- #
+def test_cnv_score_emits_plot_suite(tmp_path):
+    s = _coord_session(tmp_path)
+    r = tools.run("cnv_score", s, reference_key="condition", reference_cat=["Normal"])
+    assert r.status == "success"
+    # cnv-space UMAP computed + the cnv UMAP panel emitted. (chromosome heatmaps are best-effort:
+    # they need real CNV signal and are defensively skipped on near-zero synthetic data.)
+    assert "X_cnv_umap" in s.adata.obsm
+    assert any("umap_panel" in a.path for a in r.artifacts)
+
+
+def test_apply_malignancy_derives_cnv_status_and_plots(tmp_path):
+    s = _scored_session(tmp_path)
+    r = tools.run("apply_malignancy", s, groupby="major_cell_type",
+                  labels={"Epithelial": "malignant", "T_cell": "non_malignant"})
+    assert r.status == "success"
+    cs = s.adata.obs["cnv_status"].astype(str)
+    mct = s.adata.obs["major_cell_type"].astype(str)
+    assert set(cs[mct == "Epithelial"]) == {"tumor"}         # derived from the call, not hardcoded
+    assert set(cs[mct == "T_cell"]) == {"normal"}
+    assert r.summary["cnv_status_distribution"].get("tumor", 0) > 0
+    assert any("cnv_status" in a.path for a in r.artifacts)  # cnv_status panel emitted

@@ -236,6 +236,66 @@ def annotate_genomic_positions(session, *, gtf: str | None = None, genome_build:
                      warnings=warnings, suggested_next_tools=nxt)
 
 
+def _cnv_save_fig(session, base: str):
+    """Save the current matplotlib figure as a no-overwrite PNG artifact (CNV figures are
+    genome-wide / panel layouts, so they bypass the journal-column fit harness)."""
+    import matplotlib.pyplot as plt
+
+    p = session.artifact_path(f"{base}.png")
+    plt.savefig(p, bbox_inches="tight", dpi=200)
+    plt.close("all")
+    return S.artifact_png(str(p), description=base)
+
+
+def _save_cnv_plots(session, adata, cnv, *, celltype_key):
+    """Emit the infercnvpy CNV evidence figures (chromosome heatmaps + cnv/standard UMAP panels)
+    as artifacts. Fully defensive: any plot failure is swallowed (a figure must never fail the
+    tool), mirroring benchmark's plot_results_table handling."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import scanpy as sc
+
+    arts: list = []
+    colors = ["cnv_leiden", "cnv_score"] + ([celltype_key] if (celltype_key and celltype_key in adata.obs) else [])
+
+    if celltype_key and celltype_key in adata.obs:
+        try:
+            cnv.pl.chromosome_heatmap(adata, groupby=celltype_key, show=False)
+            arts.append(_cnv_save_fig(session, "cnv_heatmap_celltype"))
+        except Exception:  # noqa: BLE001
+            plt.close("all")
+    try:
+        cnv.pl.chromosome_heatmap(adata, groupby="cnv_leiden", dendrogram=True, show=False)
+        arts.append(_cnv_save_fig(session, "cnv_heatmap_cnvleiden"))
+    except Exception:  # noqa: BLE001
+        plt.close("all")
+    # cnv-space UMAP panel (cnv_leiden / cnv_score / cell type)
+    try:
+        _, axes = plt.subplots(2, 2, figsize=(11, 11))
+        flat = list(axes.ravel())
+        for ax, c in zip(flat, colors):
+            cnv.pl.umap(adata, color=c, ax=ax, show=False)
+        for ax in flat[len(colors):]:
+            ax.axis("off")
+        arts.append(_cnv_save_fig(session, "cnv_umap_panel"))
+    except Exception:  # noqa: BLE001
+        plt.close("all")
+    # the same colours on the standard expression UMAP, when present
+    if "X_umap" in adata.obsm:
+        try:
+            _, axes = plt.subplots(2, 2, figsize=(12, 11))
+            flat = list(axes.ravel())
+            for ax, c in zip(flat, colors):
+                sc.pl.umap(adata, color=c, ax=ax, show=False)
+            for ax in flat[len(colors):]:
+                ax.axis("off")
+            arts.append(_cnv_save_fig(session, "umap_cnv_panel"))
+        except Exception:  # noqa: BLE001
+            plt.close("all")
+    return arts
+
+
 @register("cnv_score", mutating=True, long_running=True,
           description="CNV evidence (malignancy track) (plan B12): infercnvpy tl.infercnv -> cnv-space leiden -> per-cell "
                       "cnv_score. DETERMINISTIC EVIDENCE ONLY (no malignant/non-malignant call here — that is a "
@@ -287,8 +347,12 @@ def cnv_score(session, *, reference_key: str | None = None, reference_cat: list 
     import scanpy as sc
     sc.settings.verbosity = 0
     cnv.tl.leiden(adata, resolution=leiden_resolution, random_state=seed)
-    # 3) per-cell + per-cnv-cluster CNV burden
+    # 3) per-cell + per-cnv-cluster CNV burden + a cnv-space UMAP (for cnv.pl.umap panels)
     cnv.tl.cnv_score(adata, groupby="cnv_leiden")
+    try:
+        cnv.tl.umap(adata)
+    except Exception:  # noqa: BLE001 — UMAP is for plotting only; never fail scoring on it
+        pass
 
     scores = adata.obs["cnv_score"].astype(float)
     per_cnv_leiden = (adata.obs.groupby("cnv_leiden", observed=True)["cnv_score"]
@@ -335,14 +399,17 @@ def cnv_score(session, *, reference_key: str | None = None, reference_cat: list 
     if celltype_cnv is not None:
         tables["cnv_by_celltype"] = celltype_cnv
 
+    # CNV evidence figures (chromosome heatmaps + cnv/standard UMAP panels) — defensive
+    cnv_arts = _save_cnv_plots(session, adata, cnv, celltype_key=groupby)
+
     cp = session.checkpoint("cnv_score", x_state=session.manifest.x_state,
                             params={"reference_key": reference_key, "reference_cat": reference_cat,
                                     "window_size": window_size, "step": step,
                                     "leiden_resolution": leiden_resolution, "seed": seed})
-    return S.success("cnv_score", summary=summary, tables=tables, checkpoint=cp.path,
+    return S.success("cnv_score", summary=summary, tables=tables, artifacts=cnv_arts, checkpoint=cp.path,
                      determinism_grade="B", duration_s=round(time.time() - t0, 3),
                      warnings=warnings,
-                     suggested_next_tools=["annotation_review", "markers", "plots"])
+                     suggested_next_tools=["malignancy_evidence", "annotation_review", "markers"])
 
 
 # --------------------------------------------------------------------------- #
@@ -504,6 +571,38 @@ def malignancy_evidence(session, *, groupby: str | None = None, reference_key: s
                      suggested_next_tools=["apply_malignancy"])
 
 
+def _save_cnv_status_plots(session, adata, *, status_key="cnv_status"):
+    """cnv_status figures: a cnv-space + standard UMAP panel and a tumor-only chromosome
+    heatmap. Defensive (never raises); needs the cnv-space data from cnv_score."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import scanpy as sc
+
+    arts: list = []
+    try:
+        import infercnvpy as cnv
+    except Exception:  # noqa: BLE001
+        return arts
+    try:
+        _, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+        cnv.pl.umap(adata, color=status_key, ax=ax1, show=False)
+        if "X_umap" in adata.obsm:
+            sc.pl.umap(adata, color=status_key, ax=ax2, show=False)
+        else:
+            ax2.axis("off")
+        arts.append(_cnv_save_fig(session, "cnv_status_panel"))
+    except Exception:  # noqa: BLE001
+        plt.close("all")
+    try:
+        if bool((adata.obs[status_key].astype(str) == "tumor").any()):
+            cnv.pl.chromosome_heatmap(adata[adata.obs[status_key].astype(str) == "tumor"], show=False)
+            arts.append(_cnv_save_fig(session, "cnv_heatmap_tumor"))
+    except Exception:  # noqa: BLE001
+        plt.close("all")
+    return arts
+
+
 @register("apply_malignancy", mutating=True,
           description="Write the LLM's malignancy call into obs['malignancy'] over the FIXED vocabulary "
                       "{malignant, non_malignant, uncertain, not_applicable} — the group->label map the LLM "
@@ -535,6 +634,9 @@ def apply_malignancy(session, *, groupby: str = "cnv_leiden", labels: dict | Non
     clusters = set(obs_g.unique())
     missing = sorted(clusters - set(lab))
     adata.obs[key] = obs_g.map(lambda c: lab.get(c, unassigned)).astype("category")
+    # cnv_status (tumor/normal) DERIVED from the malignancy call — not hardcoded cnv_leiden IDs.
+    adata.obs["cnv_status"] = (adata.obs[key].astype(str)
+                               .map(lambda m: "tumor" if m == "malignant" else "normal").astype("category"))
 
     # HARD RULE: 'malignant' without CNV evidence cannot be trusted -> force review.
     has_cnv = "cnv_score" in adata.obs.columns
@@ -569,14 +671,17 @@ def apply_malignancy(session, *, groupby: str = "cnv_leiden", labels: dict | Non
     if forced:
         warnings.append(f"{len(forced)} group(s) called malignant WITHOUT CNV evidence -> review_required "
                         f"forced (HARD RULE): {forced}")
+    cnv_status_dist = {str(k): int(v) for k, v in adata.obs["cnv_status"].value_counts().items()}
     summary = {
         "key": key, "method": method, "groupby": groupby,
         "vocabulary": list(MALIGNANCY_VOCAB), "cnv_evidence_available": has_cnv,
         "n_groups_labeled": len(lab), "unlabeled_groups": missing,
         "label_distribution": dist, "forced_review_no_cnv": forced,
+        "cnv_status_distribution": cnv_status_dist,    # tumor/normal derived from the call
     }
+    status_arts = _save_cnv_status_plots(session, adata)
     cp = session.checkpoint("apply_malignancy", x_state=session.manifest.x_state,
                             params={"groupby": groupby, "key": key, "method": method})
-    return S.success("apply_malignancy", summary=summary, warnings=warnings, checkpoint=cp.path,
-                     determinism_grade="A", duration_s=round(time.time() - t0, 3),
+    return S.success("apply_malignancy", summary=summary, artifacts=status_arts, warnings=warnings,
+                     checkpoint=cp.path, determinism_grade="A", duration_s=round(time.time() - t0, 3),
                      suggested_next_tools=["annotation_review", "plots", "report"])
