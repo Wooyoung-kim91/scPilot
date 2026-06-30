@@ -48,21 +48,30 @@ durable on-disk session, so a crash can resume and the whole analysis can be
 Requires Python ≥ 3.11. Core deps (in `pyproject.toml`): scanpy, anndata,
 numpy ≥ 2, scvi-tools, harmonypy, leidenalg, scib-metrics, mcp, anthropic.
 
-### Option A — fresh environment
+### Option A — fresh environment (clone + editable)
 
 ```bash
+git clone https://github.com/Wooyoung-kim91/scPilot.git
+cd scPilot
 conda create -n scpilot python=3.11 -y
 conda activate scpilot
 pip install -e .                  # installs the scientific stack from pyproject
 scpilot version
 ```
 
-### Option B — into an existing verified env (recommended)
-
-If you already have the numpy-2.x-verified conda env, install editable **without
-re-resolving deps** so pip does not upgrade the verified stack:
+Or install straight from GitHub without cloning (non-editable):
 
 ```bash
+pip install "scpilot @ git+https://github.com/Wooyoung-kim91/scPilot.git"
+```
+
+### Option B — into an existing verified env (recommended)
+
+If you already have the numpy-2.x-verified conda env, clone the repo and install
+editable **without re-resolving deps** so pip does not upgrade the verified stack:
+
+```bash
+git clone https://github.com/Wooyoung-kim91/scPilot.git && cd scPilot
 conda run -n scpilot pip install -e . --no-deps
 conda run -n scpilot scpilot version
 ```
