@@ -250,6 +250,11 @@ and write a short final summary of what was done and the key results.
 # canonical flow on demand. This is the SAME single source mode-2 uses (no divergent copy).
 # ---------------------------------------------------------------------------
 MCP_INSTRUCTIONS = """\
+FIRST, BEFORE ANYTHING ELSE: call the `scpilot_guidance` tool ONCE to load scpilot's full canonical
+pipeline + rules. This is a mandatory fallback — if your client did not surface these server
+instructions to you, `scpilot_guidance` returns the identical guidance on any tool-calling client,
+so always fetch it at the start of a run (it is cheap and read-only).
+
 scpilot is a DETERMINISTIC scRNA-seq tool registry. The connecting LLM is the reasoning layer:
 each tool returns only a small JSON summary (you never see the matrix); you read those numbers
 and choose the next tool + its parameters.

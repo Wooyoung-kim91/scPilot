@@ -446,6 +446,8 @@ def run_agent(session, provider: Provider, *, goal: str | None = None,
     stats = RunStats()
     transcript: list[dict] = []
 
+    # mode-2 already has the full guidance inline (see _system_prompt); the scpilot_guidance
+    # fallback lives in MCP_INSTRUCTIONS for mode-1 hosts that may not surface server instructions.
     user_kick = (
         "Begin the autonomous analysis. Call detect_state first to find the re-entry "
         "point, then proceed through the canonical flow, choosing parameters from each "

@@ -71,6 +71,7 @@ def test_mcp_workflow_guidance_is_model_agnostic(tmp_path):
     # in the initialize handshake AND fetchable via prompt / resource / tool.
     instructions, tool_names, prompt_names, res_uris, guidance = asyncio.run(_drive_guidance())
     assert instructions and "summary-in" in instructions          # shipped in `initialize`
+    assert "scpilot_guidance" in instructions                      # fallback directive for any client
     assert "scpilot_workflow" in prompt_names                      # MCP prompt channel
     assert "scpilot://workflow" in res_uris                        # MCP resource channel
     assert "scpilot_guidance" in tool_names                        # tool channel (tool-only clients)
