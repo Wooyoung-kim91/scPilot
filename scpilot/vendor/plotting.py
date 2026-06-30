@@ -158,6 +158,31 @@ def _overlap_area(a: Bbox, b: Bbox) -> float:
     return dx * dy if (dx > 0 and dy > 0) else 0.0
 
 
+def text_overlap_count(fig, p: dict) -> int:
+    """Number of ink-vs-ink overlapping LABEL pairs on ``fig`` (0 = none). A first-class verified
+    harness invariant (alongside dot_clipped / staircase): rotated / 45deg labels are tested on
+    DEFLATED boxes (visible ink, not the padded line box) so adjacent vertical gene labels do not
+    falsely 'overlap'. Assumes the canvas was already drawn by the caller (check_constraints draws
+    before measuring). Used both to gate the layout fit AND to surface the residual on the final
+    render, so a figure that ships with overlapping text is reported, never silent."""
+    renderer = fig.canvas.get_renderer()
+    shrink = float(p.get("text_shrink_px", 0.0))
+
+    def _shrunk(b):
+        if shrink <= 0 or b.width <= 2 * shrink or b.height <= 2 * shrink:
+            return b
+        return Bbox.from_extents(b.x0 + shrink, b.y0 + shrink, b.x1 - shrink, b.y1 - shrink)
+
+    bbs = [_shrunk(b) for b in (_bbox(t, renderer) for t in _text_artists(fig)) if b is not None]
+    thresh = 2.0  # px² — ignore shared-edge touches
+    n = 0
+    for i in range(len(bbs)):
+        for j in range(i + 1, len(bbs)):
+            if _overlap_area(bbs[i], bbs[j]) > thresh:
+                n += 1
+    return n
+
+
 def check_constraints(fig, p: dict, n_categories: int | None) -> list[str]:
     """Return list of constraint violations ([] = all satisfied).
 
@@ -186,28 +211,11 @@ def check_constraints(fig, p: dict, n_categories: int | None) -> list[str]:
                 or tight.x1 > w_in + eps or tight.y1 > h_in + eps):
             problems.append("clipping")
 
-    # 3) text–text overlap. A rotated label's axis-aligned window_extent is the LINE box
-    #    (cap height + asc/descent + line spacing), wider than the visible ink, so adjacent
-    #    vertical/45° labels falsely "overlap" by that padding. Deflate each box by
-    #    ``text_shrink_px`` (per side) to test ink-vs-ink rather than box-vs-box.
-    shrink = float(p.get("text_shrink_px", 0.0))
-
-    def _shrunk(b):
-        if shrink <= 0 or b.width <= 2 * shrink or b.height <= 2 * shrink:
-            return b
-        return Bbox.from_extents(b.x0 + shrink, b.y0 + shrink, b.x1 - shrink, b.y1 - shrink)
-
-    texts = _text_artists(fig)
-    bbs = [(t, _bbox(t, renderer)) for t in texts]
-    bbs = [(t, _shrunk(b)) for t, b in bbs if b is not None]
-    thresh = 2.0  # px² — ignore shared-edge touches
-    for i in range(len(bbs)):
-        for j in range(i + 1, len(bbs)):
-            if _overlap_area(bbs[i][1], bbs[j][1]) > thresh:
-                problems.append("text_overlap")
-                break
-        if "text_overlap" in problems:
-            break
+    # 3) text–text overlap (verified invariant) — see text_overlap_count: ink-vs-ink on deflated
+    #    boxes so adjacent rotated gene labels don't falsely collide.
+    texts = _text_artists(fig)            # also reused by the font-floor check (item 6)
+    if text_overlap_count(fig, p) > 0:
+        problems.append("text_overlap")
 
     data_axes = _data_axes(fig) or fig.axes
 
@@ -519,9 +527,10 @@ def fit_and_save(build, cfg: PipelineConfig, base_path: Path, *,
             ff = build(size, knob["font"], draft=False)
             _finalize_layout(ff, p, knob["font"], size[1])
             final_problems = check_constraints(ff, p, n_categories)
+            overlap_n = text_overlap_count(ff, p) if "text_overlap" in final_problems else 0
         paths = _save(ff, base_path, p)
         plt.close(ff)
-        return paths, final_problems
+        return paths, final_problems, overlap_n
 
     rows, cols = grid
     for (w, h) in _size_grid(p, cols=cols, rows=rows):
@@ -534,11 +543,12 @@ def fit_and_save(build, cfg: PipelineConfig, base_path: Path, *,
                 problems = check_constraints(fig, p, n_categories)
             plt.close(fig)
             if not problems:
-                paths, final_problems = _final((w * col, h * col), knob)
+                paths, final_problems, overlap_n = _final((w * col, h * col), knob)
                 warns = []
                 if final_problems:
+                    detail = f" [text_overlap×{overlap_n} label pairs]" if overlap_n else ""
                     warns = [f"final-render-violations({base_path.name}) at {w}x{h} col: "
-                             f"{sorted(set(final_problems))} — passed on the draft subsample but "
+                             f"{sorted(set(final_problems))}{detail} — passed on the draft subsample but "
                              "not on full data"]
                     warnings.warn(warns[0])
                     if logger:
@@ -557,9 +567,10 @@ def fit_and_save(build, cfg: PipelineConfig, base_path: Path, *,
         _finalize_layout(fig, p, p["min_font_pt"], max_size[1])
         remaining = check_constraints(fig, p, n_categories)
         plt.close(fig)
-    paths, final_problems = _final(max_size, knob)
+    paths, final_problems, overlap_n = _final(max_size, knob)
     remaining = sorted(set(remaining) | set(final_problems))   # draft + full-data residuals
-    warn = [f"fit-at-max-failed: {base_path.name}: {remaining}"]
+    detail = f" [text_overlap×{overlap_n} label pairs]" if overlap_n else ""
+    warn = [f"fit-at-max-failed: {base_path.name}: {remaining}{detail}"]
     warnings.warn(warn[0])
     if logger:
         logger.warning(warn[0])

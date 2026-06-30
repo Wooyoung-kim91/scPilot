@@ -53,6 +53,33 @@ async def _drive(h5ad_path, workdir):
             return names, ver, ok, err
 
 
+async def _drive_guidance():
+    """Fetch the model-agnostic workflow guidance over every MCP channel."""
+    params = StdioServerParameters(command=sys.executable, args=["-m", "scpilot", "mcp"])
+    async with stdio_client(params) as (read, write):
+        async with ClientSession(read, write) as session:
+            init = await session.initialize()
+            tool_names = {t.name for t in (await session.list_tools()).tools}
+            prompt_names = {p.name for p in (await session.list_prompts()).prompts}
+            res_uris = {str(r.uri) for r in (await session.list_resources()).resources}
+            guidance = _parse(await session.call_tool("scpilot_guidance", {}))
+            return init.instructions, tool_names, prompt_names, res_uris, guidance
+
+
+def test_mcp_workflow_guidance_is_model_agnostic(tmp_path):
+    # ANY MCP client (Claude Code, Codex, a local LLM) must receive the pipeline guidance:
+    # in the initialize handshake AND fetchable via prompt / resource / tool.
+    instructions, tool_names, prompt_names, res_uris, guidance = asyncio.run(_drive_guidance())
+    assert instructions and "summary-in" in instructions          # shipped in `initialize`
+    assert "scpilot_workflow" in prompt_names                      # MCP prompt channel
+    assert "scpilot://workflow" in res_uris                        # MCP resource channel
+    assert "scpilot_guidance" in tool_names                        # tool channel (tool-only clients)
+    wf = guidance["workflow"]
+    assert "CANONICAL FLOW" in wf and "detect_state" in wf         # full pipeline present
+    assert "malignant" in wf                                        # incl. annotation/CNV hard rules
+    assert "Tier-4 consistency" in wf                              # incl. the independent audit/critique
+
+
 def test_mcp_stdio_tool_discovery_and_call(tmp_path):
     h5ad = tmp_path / "tiny.h5ad"
     _tiny_h5ad(h5ad)

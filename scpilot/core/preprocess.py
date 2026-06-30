@@ -27,12 +27,15 @@ def _suggest_n_pcs(variance_ratio, *, floor: float = 0.01) -> int:
     return int(above[-1] + 1) if above.size else min(10, len(vr))
 
 
+_BATCH_OFF = {"none", "", "off", "false", "no"}   # explicit "disable batch-aware HVG" tokens
+
+
 @register("preprocess", mutating=True, long_running=False,
           description="normalize_total → log1p → HVG(seurat_v3, batch-aware) → PCA from the counts layer; "
                       "returns variance-ratio + HVG/elbow summary for choosing n_pcs (plan B4).")
 def preprocess(session, *, target_sum: float = 1e4, n_top_genes: int = 2000,
-               hvg_batch_key: str | None = None, n_pcs: int = 50, seed: int = 0,
-               **params) -> S.ToolResult:
+               hvg_batch_key: str | None = None, min_cells_per_batch: int = 1000,
+               n_pcs: int = 50, seed: int = 0, **params) -> S.ToolResult:
     import numpy as np
     import scanpy as sc
 
@@ -54,11 +57,16 @@ def preprocess(session, *, target_sum: float = 1e4, n_top_genes: int = 2000,
     adata.layers["scale.data"] = adata.X.copy()
 
     # --- HVG (seurat_v3, counts-based; batch-aware) ---
-    batch_key = hvg_batch_key
+    # Explicit OFF token disables batch-aware HVG outright (no auto-detect fallthrough) —
+    # the only way to truly turn it off (fixes the "can't disable batch HVG" trap).
+    batch_off = isinstance(hvg_batch_key, str) and hvg_batch_key.strip().lower() in _BATCH_OFF
+    batch_key = None if batch_off else hvg_batch_key
+    if batch_off:
+        warnings.append("hvg_batch_key disabled — global (non-batch-aware) HVG")
     if batch_key and batch_key not in adata.obs.columns:
         warnings.append(f"hvg_batch_key '{batch_key}' absent — HVG computed without batch")
         batch_key = None
-    if batch_key is None:
+    if batch_key is None and not batch_off:
         # auto-detect a sample-like batch column so HVG is batch-aware by default (the
         # caller/LLM may still override via hvg_batch_key). Skip degenerate/huge cardinality.
         for cand in ("sample_id", "sample", "batch", "donor", "patient"):
@@ -72,9 +80,30 @@ def preprocess(session, *, target_sum: float = 1e4, n_top_genes: int = 2000,
                     warnings.append(f"hvg_batch_key auto-detected: '{cand}' (n={nu}); "
                                     "pass hvg_batch_key to override")
                     break
+    # Tiny-batch guard: seurat_v3 fits a per-batch loess; batches with too few cells make
+    # the design singular ("reciprocal condition number" error). If any batch is below
+    # min_cells_per_batch, fall back to global HVG rather than crash.
+    if batch_key is not None:
+        vc = adata.obs[batch_key].value_counts()
+        tiny = vc[vc < min_cells_per_batch]
+        if len(tiny):
+            warnings.append(
+                f"hvg_batch_key '{batch_key}' has {len(tiny)} batch(es) < {min_cells_per_batch} cells "
+                f"(smallest={int(vc.min())}: {list(tiny.index[:3])}) — batch-aware HVG disabled to "
+                "avoid a singular per-batch loess; sample effects are corrected at integration")
+            batch_key = None
     n_top = min(n_top_genes, adata.n_vars)
-    sc.pp.highly_variable_genes(adata, flavor="seurat_v3", n_top_genes=n_top,
-                                layer="counts", batch_key=batch_key)
+    try:
+        sc.pp.highly_variable_genes(adata, flavor="seurat_v3", n_top_genes=n_top,
+                                    layer="counts", batch_key=batch_key)
+    except (ValueError, np.linalg.LinAlgError) as exc:
+        # last-resort auto-recovery: a singular per-batch loess (or similar) → retry global
+        if batch_key is None:
+            raise
+        warnings.append(f"batch-aware HVG failed ({type(exc).__name__}: {exc}); retried without batch")
+        batch_key = None
+        sc.pp.highly_variable_genes(adata, flavor="seurat_v3", n_top_genes=n_top,
+                                    layer="counts", batch_key=None)
     n_hvg = int(adata.var["highly_variable"].sum())
 
     # --- PCA on HVGs (no global scale; svd centers) ---

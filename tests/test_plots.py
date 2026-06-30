@@ -194,6 +194,39 @@ def test_dot_clipped_invariant():
     plt.close(plain)
 
 
+def test_text_overlap_invariant():
+    """text_overlap_count / check_constraints flag overlapping LABELS on ink-vs-ink boxes, so a
+    dotplot (rotated gene labels + cell-type brackets) can't ship with colliding text silently.
+    The harness gates the layout fit on this AND re-checks it on the final render."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from scpilot.vendor import plotting as P
+    from scpilot.vendor.config import PipelineConfig
+
+    p = P.plotting_cfg(PipelineConfig())
+
+    # two labels stacked at the SAME spot → ink overlaps (1 pair)
+    fig, ax = plt.subplots(figsize=(3, 3), dpi=p["dpi"])
+    ax.set_xticks([]); ax.set_yticks([])          # only our two texts exist
+    ax.text(0.5, 0.5, "OverlappingLabel", ha="center", va="center")
+    ax.text(0.5, 0.5, "OverlappingLabel", ha="center", va="center")
+    fig.canvas.draw()
+    assert P.text_overlap_count(fig, p) >= 1
+    assert "text_overlap" in P.check_constraints(fig, p, None)
+    plt.close(fig)
+
+    # two labels far apart → no overlap
+    fig2, ax2 = plt.subplots(figsize=(6, 3), dpi=p["dpi"])
+    ax2.set_xticks([]); ax2.set_yticks([])
+    ax2.text(0.02, 0.5, "left", ha="left", va="center")
+    ax2.text(0.98, 0.5, "right", ha="right", va="center")
+    fig2.canvas.draw()
+    assert P.text_overlap_count(fig2, p) == 0
+    assert "text_overlap" not in P.check_constraints(fig2, p, None)
+    plt.close(fig2)
+
+
 def test_dotplot_staircase_invariant(tmp_path):
     """Staircase: y-axis rows follow the marker-PANEL declaration order (so a caller's fixed
     compartment order is honoured), and the verification flags a cell type whose strongest

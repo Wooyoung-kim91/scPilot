@@ -297,6 +297,44 @@ def test_qc_metrics_emits_mad_suggested_cutoffs(tmp_path):
     assert sc["global"]["min_genes"] >= 0
 
 
+def test_qc_metrics_detects_mouse_and_resolves_mixed_lineage(tmp_path):
+    # no-hardcoding rule: organism is DETECTED, and human reference symbols (EPCAM/CD3D)
+    # are resolved to the data's mouse casing (Epcam/Cd3d) instead of being missed.
+    from scpilot import tools
+
+    a = _qc_adata(n_obs=120, n_vars=60)
+    mouse = [f"Gene{i}" for i in range(a.n_vars - 5)] + ["Epcam", "Cd3d", "mt-Nd1", "mt-Co1", "Rps2"]
+    a.var_names = mouse
+    inp = tmp_path / "in.h5ad"
+    a.write_h5ad(inp)
+    s = Session.create(tmp_path / "sess", input_path=str(inp))
+    s.load_input()
+    res = tools.run("qc_metrics", s, run_scrublet=False,   # mito_prefix auto-detected
+                    mixed_lineage_genes=("EPCAM", "CD3D"))  # opt-in; resolved to mouse Epcam/Cd3d
+    assert res.status == "success"
+    assert res.summary["organism"] == "mouse"
+    assert res.summary["mito_prefix"] == "mt-"
+    assert res.summary["mixed_lineage_frac"] is not None   # Epcam/Cd3d resolved, flag computed
+
+
+def test_preprocess_tiny_batch_guard_disables_batch_hvg(tmp_path):
+    # a batch far below min_cells_per_batch would make the seurat_v3 per-batch loess
+    # singular; the guard falls back to global HVG instead of crashing.
+    from scpilot import tools
+
+    a = _qc_adata(n_obs=200, n_vars=80)
+    sid = ["big"] * 195 + ["tiny"] * 5            # one 5-cell batch
+    a.obs["sample_id"] = sid
+    inp = tmp_path / "in.h5ad"
+    a.write_h5ad(inp)
+    s = Session.create(tmp_path / "sess", input_path=str(inp))
+    s.load_input()
+    res = tools.run("preprocess", s, n_top_genes=40, n_pcs=15, min_cells_per_batch=50)
+    assert res.status == "success"
+    assert res.summary["hvg_batch_key"] is None       # guard disabled batch-aware HVG
+    assert any("min_cells_per_batch" in w or "batch" in w.lower() for w in res.warnings)
+
+
 def test_qc_autoplots_before_after_and_thresholds(tmp_path):
     from typer.testing import CliRunner
 
@@ -344,7 +382,8 @@ def test_preprocess_auto_detects_hvg_batch_key(tmp_path):
     _qc_adata(n_obs=150, n_vars=80).write_h5ad(inp)
     s = Session.create(tmp_path / "sess", input_path=str(inp))
     s.load_input()
-    res = tools.run("preprocess", s, n_top_genes=40, n_pcs=15)   # no hvg_batch_key passed
+    # min_cells_per_batch low so the tiny-batch guard doesn't fire on this small fixture
+    res = tools.run("preprocess", s, n_top_genes=40, n_pcs=15, min_cells_per_batch=10)
     assert res.status == "success"
     assert res.summary["hvg_batch_key"] == "sample_id"           # auto-detected
 

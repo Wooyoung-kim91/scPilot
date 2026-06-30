@@ -121,17 +121,23 @@ if __name__ == "__main__":
 
 
 # Cell-delimited (jupytext "percent") notebook — open directly in Jupyter/VSCode and run
-# CELL BY CELL: each step prints its result summary and renders its plot inline. MCP-free
-# (uses the pinned scpilot package only). This is the human-facing, visual repro artifact.
+# CELL BY CELL: each step prints its status/warnings/summary and renders its plot inline.
+# MCP-free (uses the pinned scpilot package only). This is the human-facing, visual repro
+# artifact. NO helper functions (no `def`) — every step's actions are written out flat in
+# its own cell so you can watch the whole process and edit any step in place.
 _NOTEBOOK_TEMPLATE = '''# %% [markdown]
 # # scpilot pipeline — reproducible notebook (AUTO-GENERATED)
-# Run top-to-bottom, **cell by cell**, to watch every step: each prints its result
-# summary and renders its plot inline. No MCP server needed.
+# Run top-to-bottom, **cell by cell**, to watch every step: each prints its status,
+# warnings, result summary and renders its plot inline. No MCP server needed, no helper
+# functions — each cell is flat, self-contained, and editable.
 #
 # Provenance:
 # {prov_md}
 #
 # Input: `{input_comment}`
+
+# %% [markdown]
+# ## setup — pin the scpilot source, seed the RNG, open the session
 
 # %%
 import json, sys
@@ -144,11 +150,7 @@ except NameError:
     _HERE = Path.cwd()
 sys.path.insert(0, str(_HERE / "{snapshot_rel}"))   # pin exact scpilot source
 _RUN_DIR = _HERE.parent                              # code/ -> session root
-try:
-    from IPython.display import Image, display
-except Exception:                       # noqa: BLE001 — allow plain `python` execution too
-    def display(x): print(x)
-    def Image(filename=None): return f"[plot] {{filename}}"
+from IPython.display import Image, display           # this notebook runs in a Jupyter kernel
 
 from scpilot import tools
 from scpilot.repro import set_global_seed
@@ -158,12 +160,7 @@ from scpilot.core.autoplot import auto_plots
 set_global_seed({seed})
 sess = Session.create(str(_RUN_DIR / "repro_notebook"), input_path={input_lit}, exist_ok=True)
 sess.load_input()
-
-def _show(stage, res):
-    print(json.dumps(res.summary, indent=2, default=str)[:2500])
-    for _a in (auto_plots(sess, stage, res.summary) or []):
-        if getattr(_a, "kind", None) == "png":
-            display(Image(filename=_a.path))
+print("session:", sess.out)
 {cells}
 '''
 
@@ -171,15 +168,27 @@ def _show(stage, res):
 def _notebook_cell(cid: str, stage: str, params: dict, seed: int = 0) -> str:
     """One markdown + one code cell for a pipeline step (percent format).
 
-    Each cell RE-PINS the step's recorded seed before the tool call so the cell is
+    The code is written out FLAT — no helper function — so the reader sees exactly what
+    each step does: re-pin the recorded seed, run the stage, then print status / warnings /
+    error / summary and render any plot inline. Re-pinning the step's seed makes the cell
     self-contained: running top-to-bottom — or re-running a single cell — reproduces the
     SAME result as the recorded run, independent of accumulated kernel RNG state
     (cell-by-cell determinism requirement).
     """
     return (
         f'\n# %% [markdown]\n# ## {cid} · {stage}\n# params: `{params!r}`\n\n'
-        f'# %%\nset_global_seed({seed})\n'
-        f'_res = tools.run("{stage}", sess, **{params!r})\n_show("{stage}", _res)\n'
+        f'# %%\n'
+        f'set_global_seed({seed})\n'
+        f'_res = tools.run("{stage}", sess, **{params!r})\n'
+        f'print("[" + _res.status + "]", "{stage}", "·", _res.determinism_grade or "")\n'
+        f'for _w in (_res.warnings or []):\n'
+        f'    print("  warn:", _w)\n'
+        f'if _res.error:\n'
+        f'    print("  ERROR[" + str(_res.error_code) + "]:", _res.error)\n'
+        f'print(json.dumps(_res.summary, indent=2, default=str)[:2500])\n'
+        f'for _a in (auto_plots(sess, "{stage}", _res.summary) or []):\n'
+        f'    if getattr(_a, "kind", None) == "png":\n'
+        f'        display(Image(filename=_a.path))\n'
     )
 
 

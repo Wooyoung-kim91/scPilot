@@ -198,12 +198,13 @@ def error(
 
 
 def artifact_csv(path: str, *, n_rows: int | None = None, n_cols: int | None = None,
-                 description: str = "") -> Artifact:
+                 description: str = "", **meta_fields) -> Artifact:
     meta: dict = {}
     if n_rows is not None:
         meta["n_rows"] = int(n_rows)
     if n_cols is not None:
         meta["n_cols"] = int(n_cols)
+    meta.update(meta_fields)
     return Artifact(path=path, kind="csv", description=description, meta=meta)
 
 

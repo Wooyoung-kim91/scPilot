@@ -33,6 +33,8 @@ def _is_num(v: Any) -> bool:
 def _check_one(param: str, value: Any, spec: dict) -> list[str]:
     """Validate one value against its JSON-Schema-style constraint spec."""
     problems: list[str] = []
+    if value is None and spec.get("nullable"):
+        return problems
     t = spec.get("type")
     # type checks (bool is NOT an int here; reject ints where a bool is wanted and vice-versa)
     if t == "integer" and (not isinstance(value, int) or isinstance(value, bool)):

@@ -22,7 +22,10 @@ from scpilot import schemas as S
 from scpilot.tools import register
 
 _RIBO_PREFIXES = ("RPS", "RPL")
-_MIXED_LINEAGE_GENES = ("EPCAM", "CD3D")   # epithelial + T-cell co-expression => doublet-like
+# EXAMPLE only — NOT a default. The mixed-lineage flag is opt-in: the caller (agent) supplies the
+# co-expression gene pair appropriate to the tissue (e.g. epithelial+T-cell => doublet-like). No
+# gene names are hardcoded into the call (no-hardcoding rule).
+_EXAMPLE_MIXED_LINEAGE_GENES = ("EPCAM", "CD3D")
 _QUANTILES = (0.0, 0.05, 0.25, 0.5, 0.75, 0.95, 1.0)
 
 
@@ -103,16 +106,26 @@ def _per_sample_scrublet(adata, sample_key: str, *, seed: int = 0):
 @register("qc_metrics", mutating=True,
           description="Compute QC metrics (%MT/%ribo), per-sample scrublet doublets, mixed-lineage flag, "
                       "and a batch-aware distribution summary for cutoff selection (plan B3).")
-def qc_metrics(session, *, sample_key: str = "sample_id", mito_prefix: str = "MT-",
+def qc_metrics(session, *, sample_key: str = "sample_id", mito_prefix: str | None = None,
+               mixed_lineage_genes: tuple[str, ...] | list[str] | None = None,
                run_scrublet: bool = True, n_mads: float = 5.0, seed: int = 0,
                **params) -> S.ToolResult:
     import numpy as np
     import pandas as pd
     import scanpy as sc
 
+    from scpilot.core import _species
+
     t0 = time.time()
     adata = session.adata
     warnings: list[str] = []
+
+    # --- organism is DETECTED from the data, never assumed (no-hardcoding rule) ---
+    org = _species.detect_organism(adata)
+    if mito_prefix is None:                      # caller didn't pin it → use detected style
+        mito_prefix = org["mito_prefix"]
+        warnings.append(f"organism={org['organism']} ({org['evidence']}); "
+                        f"mito_prefix auto-set to '{mito_prefix}'")
 
     # --- QC metrics on COUNTS (X may be normalized on the merged object) ---
     # exception-safe swap: restore X in finally so a failure can't leave X bound
@@ -133,19 +146,31 @@ def qc_metrics(session, *, sample_key: str = "sample_id", mito_prefix: str = "MT
         if x_backup is not None:
             adata.X = x_backup
 
-    # --- mixed-lineage (EPCAM + CD3D co-expression) on counts ---
-    present = [g for g in _MIXED_LINEAGE_GENES if g in adata.var_names]
-    if len(present) == len(_MIXED_LINEAGE_GENES):
-        src = adata.layers["counts"] if "counts" in adata.layers else adata.X
-        cols = [adata.var_names.get_loc(g) for g in _MIXED_LINEAGE_GENES]
-        sub = src[:, cols]
-        dense = sub.toarray() if hasattr(sub, "toarray") else np.asarray(sub)
-        adata.obs["mixed_lineage_flag"] = (dense > 0).all(axis=1)
-        mixed_frac = float(adata.obs["mixed_lineage_flag"].mean())
-    else:
+    # --- mixed-lineage co-expression flag — OPT-IN (caller supplies the gene pair) ---
+    # No gene names are hardcoded: the flag is only computed when mixed_lineage_genes is given.
+    # Supplied symbols are resolved to the data's actual casing (EPCAM->Epcam in mouse) so the
+    # caller's pair works cross-organism.
+    if not mixed_lineage_genes:
         adata.obs["mixed_lineage_flag"] = False
         mixed_frac = None
-        warnings.append(f"mixed-lineage genes absent ({_MIXED_LINEAGE_GENES}); flag set False")
+        warnings.append("mixed-lineage flag skipped (opt-in — pass mixed_lineage_genes=[g1,g2] to enable)")
+    else:
+        resolved = _species.resolve(adata, mixed_lineage_genes)
+        present = [v for v in resolved.values() if v is not None]
+        if len(present) == len(list(mixed_lineage_genes)):
+            src = adata.layers["counts"] if "counts" in adata.layers else adata.X
+            cols = [adata.var_names.get_loc(g) for g in present]
+            sub = src[:, cols]
+            dense = sub.toarray() if hasattr(sub, "toarray") else np.asarray(sub)
+            adata.obs["mixed_lineage_flag"] = (dense > 0).all(axis=1)
+            mixed_frac = float(adata.obs["mixed_lineage_flag"].mean())
+            if present != list(mixed_lineage_genes):
+                warnings.append(f"mixed-lineage genes resolved to data casing: {present}")
+        else:
+            adata.obs["mixed_lineage_flag"] = False
+            mixed_frac = None
+            missing = [k for k, v in resolved.items() if v is None]
+            warnings.append(f"mixed-lineage genes absent ({missing}); flag set False")
 
     # --- per-sample scrublet ---
     scrublet_skipped = []
@@ -190,6 +215,8 @@ def qc_metrics(session, *, sample_key: str = "sample_id", mito_prefix: str = "MT
 
     summary = {
         "n_cells": int(adata.n_obs), "n_genes": int(adata.n_vars),
+        "organism": org["organism"], "organism_evidence": org["evidence"],
+        "mito_prefix": mito_prefix,
         "sample_key": sample_key if have_sample else None,
         "n_samples": int(per_sample_df.shape[0]) if have_sample else None,
         "qc_metrics": metrics,

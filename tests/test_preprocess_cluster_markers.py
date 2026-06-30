@@ -79,11 +79,41 @@ def test_cluster_and_markers_chain(tmp_path):
     assert rm.status == "success"
     assert rm.summary["n_clusters"] == rc.summary["n_clusters"]
     assert "top_markers" in rm.tables
-    # full ranking CSV artifact written, absolute path
+    # ranking CSV artifact written, absolute path
     assert rm.artifacts and rm.artifacts[0].kind == "csv"
     from pathlib import Path
     assert Path(rm.artifacts[0].path).exists()
     rm.to_dict()
+
+
+def test_markers_caps_ranking_wilcoxon(tmp_path):
+    s = _session(tmp_path)
+    tools.run("preprocess", s, n_top_genes=100, n_pcs=20)
+    rc = tools.run("cluster", s, resolution=0.5)
+    assert rc.status == "success"
+
+    rm = tools.run("markers", s, n_genes=15, max_genes_ranked=7)
+    assert rm.status == "success"
+    assert rm.summary["method"] == "wilcoxon"          # DE method is fixed to Wilcoxon
+    assert rm.summary["n_genes_ranked"] == 7
+    assert rm.summary["max_genes_ranked"] == 7
+    assert rm.summary["csv_is_full_ranking"] is False
+    assert "capped" in rm.artifacts[0].description
+    assert rm.artifacts[0].meta["csv_is_full_ranking"] is False
+    assert rm.artifacts[0].meta["n_genes_ranked"] == 7
+    assert rm.artifacts[0].meta["n_rows"] == rc.summary["n_clusters"] * 7
+
+
+def test_markers_full_ranking_when_cap_is_none(tmp_path):
+    s = _session(tmp_path)
+    tools.run("preprocess", s, n_top_genes=100, n_pcs=20)
+    tools.run("cluster", s, resolution=0.5)
+
+    rm = tools.run("markers", s, max_genes_ranked=None)
+    assert rm.status == "success"
+    assert rm.summary["csv_is_full_ranking"] is True
+    assert rm.summary["n_genes_ranked"] == s.adata.n_vars
+    assert rm.artifacts[0].description == "full rank_genes_groups ranking"
 
 
 def test_cluster_defaults_resolution(tmp_path):

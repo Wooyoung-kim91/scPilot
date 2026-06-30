@@ -7,8 +7,15 @@ from scipy import sparse
 
 from scpilot import tools
 from scpilot.core.annotate import (AMBIGUOUS_LABEL, ARTIFACT_LABELS, BROAD_MARKERS,
-                                   LOWQ_LABEL, MIXED_LABEL, UNS_ANNO)
+                                   IMMUNE_COMPARTMENTS, LOWQ_LABEL, MIXED_LABEL,
+                                   NEG_MARKERS, NONIMMUNE_COMPARTMENTS, UNS_ANNO)
 from scpilot.session import Session
+
+# annotate_broad is now agent-supplied (no hardcoded default panel): tests pass the example
+# panels explicitly, simulating the panel the reasoning layer would hand the tool.
+_PANEL_KW = dict(panels=BROAD_MARKERS, neg_panels=NEG_MARKERS, ptprc_gene="PTPRC",
+                 immune_compartments=IMMUNE_COMPARTMENTS,
+                 nonimmune_compartments=NONIMMUNE_COMPARTMENTS)
 
 
 def _two_lineage_adata(n=400):
@@ -40,7 +47,7 @@ def _prep(a, tmp_path):
 
 def test_annotate_broad_de_marker_combination(tmp_path):
     s = _prep(_two_lineage_adata(), tmp_path)
-    r = tools.run("annotate_broad", s, min_markers=3)
+    r = tools.run("annotate_broad", s, min_markers=3, **_PANEL_KW)
     assert r.status == "success", r.error
     sm = r.summary
     assert "leiden_DE_marker_combination" in sm["method"]
@@ -61,7 +68,7 @@ def test_annotate_broad_de_marker_combination(tmp_path):
 def test_annotate_broad_requires_min_3_markers(tmp_path):
     # with min_markers=99, nothing can be called → all Unknown
     s = _prep(_two_lineage_adata(), tmp_path)
-    r = tools.run("annotate_broad", s, min_markers=99)
+    r = tools.run("annotate_broad", s, min_markers=99, **_PANEL_KW)
     assert r.status == "success"
     assert set(s.adata.obs["major_cell_type"].unique()) == {"Unknown"}
     assert r.summary["unknown_clusters"]
@@ -72,7 +79,7 @@ def test_annotate_broad_flags_single_source(tmp_path):
     a = _two_lineage_adata()
     a.obs["sample_id"] = (["s1"] * (a.n_obs // 2) + ["s2"] * (a.n_obs - a.n_obs // 2))
     s = _prep(a, tmp_path)
-    r = tools.run("annotate_broad", s, single_source_frac=0.8)
+    r = tools.run("annotate_broad", s, single_source_frac=0.8, **_PANEL_KW)
     assert r.summary["single_source_clusters"]
     assert any("single-sample" in w for w in r.warnings)
 
@@ -85,9 +92,18 @@ def test_annotate_broad_needs_cluster(tmp_path):
     assert r.status == "error" and r.error_code == "invalid_state"
 
 
+def test_annotate_broad_requires_caller_panel(tmp_path):
+    # no-hardcoding: annotate_broad carries NO built-in panel — with clusters present but no
+    # panel supplied it must refuse to guess and route to the marker-DB-free path.
+    s = _prep(_two_lineage_adata(), tmp_path)
+    r = tools.run("annotate_broad", s)            # leiden present, panels omitted
+    assert r.status == "error" and r.error_code == "invalid_params"
+    assert "markers" in (r.suggested_next_tools or [])
+
+
 def test_dotplot_with_celltype_brackets(tmp_path):
     s = _prep(_two_lineage_adata(), tmp_path)
-    tools.run("annotate_broad", s, min_markers=3)
+    tools.run("annotate_broad", s, min_markers=3, **_PANEL_KW)
     r = tools.run("plots", s, kind="dotplot", groupby="major_cell_type")
     assert r.status == "success", r.error
     # dotplot writes a vector SVG (deliverable) + a PNG (preview)
@@ -145,7 +161,7 @@ def _ruleset_session(tmp_path):
 
 def test_annotate_broad_new_rules(tmp_path):
     s = _ruleset_session(tmp_path)
-    r = tools.run("annotate_broad", s, groupby="leiden")
+    r = tools.run("annotate_broad", s, groupby="leiden", **_PANEL_KW)
     assert r.status == "success", r.error
     ev = s.adata.uns[UNS_ANNO]["tier1"]["clusters"]
 
@@ -174,7 +190,7 @@ def test_annotate_broad_top_n_limits_positives(tmp_path):
     # top_n_markers=1 keeps only the single strongest DE gene per cluster → a 3-marker
     # panel call is impossible, so even clean lineages fall back to Unknown.
     s = _ruleset_session(tmp_path)
-    r = tools.run("annotate_broad", s, groupby="leiden", top_n_markers=1)
+    r = tools.run("annotate_broad", s, groupby="leiden", top_n_markers=1, **_PANEL_KW)
     assert r.status == "success"
     ev = s.adata.uns[UNS_ANNO]["tier1"]["clusters"]
     assert ev["1"]["label"] == "Unknown" and ev["2"]["label"] == "Unknown"

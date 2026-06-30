@@ -3,6 +3,7 @@
 import anndata as ad
 import numpy as np
 import scanpy as sc
+from pathlib import Path
 from scipy import sparse
 
 from scpilot import tools
@@ -39,6 +40,35 @@ def test_load_tool_registered_and_runs(tmp_path):
     assert r.summary["n_obs"] == 80 and r.summary["has_counts"] is True
     assert r.summary["x_state_guess"] == "raw_counts"
     r.to_dict()  # JSON-serializable
+
+
+def test_mcp_default_session_uses_requested_checkpoint_input(tmp_path):
+    raw = _raw()
+    raw_path = tmp_path / "obesity_merged_counts.h5ad"
+    raw.write_h5ad(raw_path)
+
+    clustered = raw.copy()
+    clustered.obs["leiden"] = (["0"] * (clustered.n_obs // 2)
+                               + ["1"] * (clustered.n_obs - clustered.n_obs // 2))
+    clustered.layers["scale.data"] = clustered.X.copy()
+    checkpoint = tmp_path / "scpilot_obesity_run" / "checkpoints" / "04_cluster.h5ad"
+    checkpoint.parent.mkdir(parents=True)
+    clustered.write_h5ad(checkpoint)
+
+    # Simulate a stale unrelated default session: the MCP no-workdir path must not reopen it.
+    stale = Session.create(tmp_path / "scpilot_run", input_path=str(raw_path))
+    stale.load_input()
+
+    from scpilot.mcp_server import default_workdir_for_input
+
+    wd = default_workdir_for_input(str(checkpoint))
+    assert Path(wd) != stale.out
+    sess = Session.create(wd, input_path=str(checkpoint))
+    r = tools.run("markers", sess, max_genes_ranked=5)
+    assert r.status == "success"
+    assert sess.manifest.input["path"] == str(checkpoint.resolve())
+    assert "leiden" in sess.adata.obs
+    assert r.summary["n_genes_ranked"] == 5
 
 
 def test_registry_lists_b1_b2_tools():

@@ -150,12 +150,19 @@ CANONICAL FLOW (skip steps already satisfied per detect_state; stop when the goa
 3. preprocess -> from variance_ratio + suggested_n_pcs_elbow choose n_top_genes and n_pcs.
 4. cluster_sweep (use_rep=X_pca) -> pick resolution at the knee; then cluster (baseline,
    use_rep=X_pca, resolution=<chosen>). markers -> per-cluster ranked DE (Wilcoxon, with pts).
-5. Tier-1 annotation is MARKER-DB-FREE — do NOT use a fixed marker panel (annotate_broad is
-   legacy/opt-in only): call annotation_review -> read each cluster's de_table and INFER its
+5. Tier-1 annotation is MARKER-DB-FREE — do NOT use a fixed marker panel. (annotate_broad is
+   opt-in and carries NO built-in panel: if you ever call it you must SUPPLY panels={cell_type:
+   [genes]} yourself, adapted to this dataset's organism/tissue — there is no hardcoded default.)
+   Prefer the marker-DB-free path: call annotation_review -> read each cluster's de_table and INFER its
    broad cell type from the DE itself (see the annotation-review prompt; apply the tissue
    prior to flag implausible calls; treat QC/doublet/single-source flags as artifact signals).
    Then call apply_annotation with the cluster->label map you inferred -> this writes
    obs['major_cell_type'] (the benchmark label_key) and records your calls for replay.
+   VERIFY broad labels before moving on: run the Tier-4 loop NOW on the broad annotation
+   (annotation_audit -> independent critique -> re-annotate refuted clusters), exactly as in
+   step 11 but label_key=major_cell_type. In mode-2 `scpilot run` this fires AUTOMATICALLY after
+   every apply_annotation/apply_fine_annotation/finalize (the reviewer may be a different model);
+   as a mode-1 host, run it yourself (ideally delegating the critique to a second model).
 6. Integration + PER-METHOD annotation. Run integrate_harmony and/or integrate_scvi
    (or train_scvi). Then, FOR EACH embedding separately — baseline X_pca AND every
    integration (X_harmony, X_scVI) — repeat the SAME annotation pipeline on that
@@ -216,9 +223,69 @@ CANONICAL FLOW (skip steps already satisfied per detect_state; stop when the goa
     facs_style_label > fine_cell_type > major_cell_type (most specific), qualified by malignancy
     ('Malignant <base>' for malignant cells). Then DE per the goal and a final report.
 
+11. Tier-4 consistency review — a BOUNDED annotation+verification LOOP (AFTER finalize; up to ~3
+    rounds). Each round:
+    a. annotation_audit(groupby=<final leiden key>, label_key=major_cell_type/final_annotation) →
+       the seven inconsistency checks as EVIDENCE, incl. per-marker pct/logFC/p-value validation.
+    b. As an INDEPENDENT ADVERSARIAL reviewer — prefer a DIFFERENT model than the annotator (see
+       ANNOTATION_AUDIT_PROMPT) — try to REFUTE each label and emit_annotation_audit with verdicts
+       (confirmed/suspect/refuted) and, for every suspect/refuted, the REASON in `note`. You do NOT
+       propose a replacement label. apply_annotation_audit(verdicts=..., reviewer_model=<you>).
+    c. If any cluster is REFUTED, the ANNOTATOR re-infers ONLY those clusters' labels from the DE
+       evidence (annotation_review → emit_annotation_labels → apply_annotation), told the rejection
+       reason but NOT a replacement type; then re-run finalize_annotation and loop back to (a).
+    Stop when no label is refuted (converged) or the round cap is reached; leave any still-refuted
+    labels as review_required for a human. (mode-2 `scpilot run` runs this loop automatically via
+    --review / --reviewer-model / --review-max-rounds.)
+
 When the analysis goal is achieved (or no further safe step exists), STOP calling tools
 and write a short final summary of what was done and the key results.
 """
+
+# ---------------------------------------------------------------------------
+# Model-agnostic delivery: every MCP client (Claude Code, Codex, a local LLM) receives the
+# same orchestration guidance — not just Claude. The MCP server ships MCP_INSTRUCTIONS in the
+# `initialize` handshake (compliant clients surface it to their model) and exposes
+# full_workflow_guidance() via an MCP prompt / resource / tool so any driver can fetch the full
+# canonical flow on demand. This is the SAME single source mode-2 uses (no divergent copy).
+# ---------------------------------------------------------------------------
+MCP_INSTRUCTIONS = """\
+scpilot is a DETERMINISTIC scRNA-seq tool registry. The connecting LLM is the reasoning layer:
+each tool returns only a small JSON summary (you never see the matrix); you read those numbers
+and choose the next tool + its parameters.
+
+Operating rules (apply regardless of which model you are):
+- summary-in -> decision-out. Never fabricate a value; if you need a number, call the tool that
+  produces it. One tool at a time; inspect each result before the next call.
+- Evidence-based, NEVER hardcoded. Tools emit EVIDENCE (DE, CNV burden, distributions); the
+  biological CALL (cell type, malignancy, cutoff, resolution) is YOUR judgment. There is no
+  built-in marker panel/threshold and organism is detected, not assumed.
+- Reproducibility is automatic but state your reasoning: before any non-trivial choice, write the
+  candidates + your pick + a one-line rationale (the server records it as a decision event).
+- On error read error_code: invalid_state -> run the prerequisite; capability_unavailable -> skip
+  that optional branch; data_gate_failed -> do not retry that path. Respect suggested_next_tools.
+
+For the FULL canonical pipeline (QC -> preprocess -> cluster/markers -> marker-DB-free Tier-1 ->
+integration + per-embedding annotation -> harmonize/benchmark/best -> Tier-2 subtype -> CNV/
+malignancy -> finalize/report) call the `scpilot_workflow` prompt, read the `scpilot://workflow`
+resource, or call the `scpilot_guidance` tool. Start any run with `detect_state`.
+"""
+
+
+def full_workflow_guidance() -> str:
+    """The complete, model-neutral orchestration guidance, assembled from the single-source
+    prompts. Served by the MCP server (prompt/resource/tool) so any LLM client gets the same
+    pipeline mode-2 follows — no duplicated copy."""
+    return "\n\n".join([
+        "# scpilot — canonical analysis workflow (model-agnostic)",
+        ORCHESTRATION_PROMPT.strip(),
+        "## Annotation reasoning (hierarchical, evidence-based)",
+        ANNOTATION_PROMPT.strip(),
+        "## Malignancy / CNV call (multi-axis evidence, never a lone threshold)",
+        MALIGNANCY_PROMPT.strip(),
+        "## Tier-4 consistency & review (independent adversarial audit of the final annotation)",
+        ANNOTATION_AUDIT_PROMPT.strip(),
+    ])
 
 # ---------------------------------------------------------------------------
 # Annotation strategy — defers to the in-repo single source
@@ -330,6 +397,55 @@ a call with empty evidence_for is forced review_required — surface those rathe
 """
 
 # ---------------------------------------------------------------------------
+# Tier-4 consistency & review — an INDEPENDENT, adversarial audit of the FINAL annotation.
+# Consumes the annotation_audit tool JSON; commits via apply_annotation_audit.
+# ---------------------------------------------------------------------------
+ANNOTATION_AUDIT_PROMPT = """\
+You are scpilot's Tier-4 consistency & review agent — an INDEPENDENT, ADVERSARIAL second opinion
+on the FINAL annotation, ideally run by a DIFFERENT model than the one that made the calls. You
+receive the deterministic evidence from the `annotation_audit` tool (the seven checks). You did NOT
+assign these labels; your job is to TRY TO REFUTE each one, not to rubber-stamp it.
+
+For each cluster, weigh the audit evidence:
+- marker_set_support_frac + marker_criteria_check — each CLAIMED marker is validated against the
+  standard cell-type-marker bar: expressed fraction (pct_in >= min_pct), up-regulation
+  (logFC >= min_lfc), and significance (padj < padj_max). marker_criteria_check lists, per gene,
+  the pct/logFC/padj and which criteria FAILED. Low support (many genes failing pct/lfc/pvalue, or
+  absent from the DE ranking) => the label is not backed by its own evidence.
+- hierarchy triple (major / fine / facs / final) — self-consistent, or contradictory
+  (e.g. major=T/NK but fine=Macrophage)? You judge lineage compatibility; there is no built-in map.
+- marker_profile_collisions — two differently-labeled clusters sharing most top markers => at least
+  one label is wrong, or they should merge.
+- provenance — single_patient_dominant / batch_dominant => the "cell type" may be a donor/batch
+  artifact, not biology.
+- QC — doublet_dominated / high_mt / high_stress => artifact-suspect, not a clean type.
+- malignant_without_cnv — a malignant call with no CNV evidence must drop to uncertain + review
+  unless tumor-marker AND clonal-expansion evidence is strong.
+
+Verdict per cluster (FIXED vocabulary):
+- confirmed — evidence concordant; the label stands.
+- suspect   — partial/conflicting evidence; keep the label but set review_required=true; say why.
+- refuted   — the label is contradicted by its own evidence; set review_required=true. The cluster
+              will be RE-ANNOTATED from scratch by the annotator.
+
+CRITICAL — stay a PURE CRITIC: you only judge WHETHER the current label holds. Do NOT propose what
+the correct cell type should be (there is no corrected_label field, and your note must not name a
+replacement type). Refuted clusters are re-inferred INDEPENDENTLY from the DE evidence by the
+annotator — your job is to catch wrong/unsupported labels, not to relabel them.
+
+ALWAYS give the REASON. For every suspect or refuted verdict, `note` is REQUIRED and must state WHY
+the label fails — cite the specific evidence (e.g. "support 0/3: CD3D/CD3E/TRAC all below min_pct;
+collides with cluster 5 sharing 8 markers; single-patient 0.94"). The annotator re-annotates using
+this reason (so it avoids repeating the mistake) but WITHOUT any cell-type hint from you.
+
+Be skeptical: default to suspect/refuted when evidence is weak, and cite the specific audit numbers
+(support fraction, failed pct/logFC/p-value criteria, collisions, provenance) in your note. Emit the
+ANNOTATION_AUDIT_SCHEMA object, then apply_annotation_audit records it (pass reviewer_model). This
+runs as a BOUNDED loop: refuted clusters are re-annotated and re-audited for up to a few rounds, then
+any still-refuted labels are left flagged for a human.
+"""
+
+# ---------------------------------------------------------------------------
 # DE design — group sizes / replicates / confounders before any test.
 # ---------------------------------------------------------------------------
 DE_DESIGN_PROMPT = """\
@@ -409,4 +525,28 @@ DE_DESIGN_SCHEMA = {
         "rationale": {"type": "string"},
     },
     "required": ["method", "comparison_axis", "group_key", "groups", "rationale"],
+}
+
+ANNOTATION_AUDIT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "verdicts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "cluster_id": {"type": "string"},
+                    "status": {"type": "string", "enum": ["confirmed", "suspect", "refuted"]},
+                    "review_required": {"type": "boolean"},
+                    # NOTE: the reviewer does NOT propose a replacement label — refuted clusters are
+                    # re-annotated INDEPENDENTLY by the annotator. The reviewer only flags WHETHER the
+                    # current label holds, citing the audit numbers in `note`.
+                    "note": {"type": "string"},
+                },
+                "required": ["cluster_id", "status", "review_required"],
+            },
+        },
+        "reviewer_model": {"type": "string"},   # which model produced this second opinion
+    },
+    "required": ["verdicts"],
 }

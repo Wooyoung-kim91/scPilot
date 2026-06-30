@@ -16,6 +16,12 @@ import logging
 import os
 import sys
 import warnings
+from pathlib import Path
+
+
+def default_workdir_for_input(input_path: str) -> str:
+    p = Path(input_path).resolve()
+    return str(p.parent / f"{p.stem}_scpilot_session")
 
 
 def _select_specs(specs, lg):
@@ -70,25 +76,26 @@ def build_server():
     over MCP — no edits here. Session working dir comes from a ``workdir`` arg
     (defaults next to the input) so MCP callers get the same on-disk session model.
     """
-    from pathlib import Path
-
     from mcp.server.fastmcp import FastMCP
 
     from scpilot import __version__, tools
+    from scpilot.llm import prompts
     from scpilot.session import Session
 
     specs = tools.all_specs()  # triggers registration of all core tool modules
 
     lg = _configure_io()
     specs = _select_specs(specs, lg)   # F5: optional env-gated allow/deny filter
-    mcp = FastMCP("scpilot")
+    # Model-agnostic guidance: ship the orchestration brief in the MCP `initialize` handshake so
+    # EVERY client's LLM (Claude Code, Codex, a local model) — not just Claude — sees how to drive
+    # the pipeline. The full canonical flow is fetchable via prompt/resource/tool below.
+    mcp = FastMCP("scpilot", instructions=prompts.MCP_INSTRUCTIONS)
 
     def _make_handler(name: str):
         def handler(input: str, workdir: str = "", params: dict | None = None,
                     seed: int = 0) -> dict:
             from scpilot import schemas as S
             from scpilot.repro import set_global_seed
-            from scpilot.session import DEFAULT_RUN_DIR
             lg.info("tool=%s input=%s seed=%s", name, input, seed)
             params = dict(params or {})
             # optional LLM narration for reasoning_log.md (not a tool param)
@@ -96,7 +103,7 @@ def build_server():
             try:
                 # pin RNGs per call so mode-1 (MCP) is reproducible like the CLI (plan A1).
                 set_global_seed(seed)
-                wd = workdir or DEFAULT_RUN_DIR
+                wd = workdir or default_workdir_for_input(input)
                 session = Session.create(wd, input_path=input)
                 result = tools.run(name, session, **params)
                 # result-plot rule + run_log.jsonl + reasoning_log.md via the shared chokepoint
@@ -134,7 +141,29 @@ def build_server():
         """Return the scpilot version (cheap connectivity check)."""
         return {"scpilot_version": __version__}
 
-    names = [f"{s.name}_tool" for s in specs] + ["scpilot_version"]
+    # --- model-agnostic workflow guidance, delivered over EVERY MCP channel so any client can
+    # reach it regardless of which capabilities its LLM host supports (prompt / resource / tool) ---
+    @mcp.tool()
+    def scpilot_guidance() -> dict:
+        """Return scpilot's full canonical analysis workflow (the same pipeline mode-2 follows):
+        golden rules + step-by-step flow (QC -> preprocess -> cluster/markers -> marker-DB-free
+        Tier-1 -> integration + per-embedding annotation -> harmonize/benchmark/best -> Tier-2
+        subtype -> CNV/malignancy -> finalize/report) + annotation & malignancy hard rules.
+        Call this once at the start of a run if your client did not surface the server instructions."""
+        return {"workflow": prompts.full_workflow_guidance()}
+
+    @mcp.prompt(name="scpilot_workflow",
+                description="scpilot's full canonical scRNA-seq analysis pipeline + golden rules.")
+    def scpilot_workflow() -> str:
+        return prompts.full_workflow_guidance()
+
+    @mcp.resource("scpilot://workflow", name="scpilot_workflow",
+                  description="scpilot canonical analysis workflow (model-agnostic).",
+                  mime_type="text/markdown")
+    def scpilot_workflow_resource() -> str:
+        return prompts.full_workflow_guidance()
+
+    names = [f"{s.name}_tool" for s in specs] + ["scpilot_version", "scpilot_guidance"]
     lg.info("scpilot MCP server ready (v%s) — tools: %s", __version__, ", ".join(names))
     return mcp
 

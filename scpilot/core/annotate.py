@@ -50,8 +50,14 @@ import time
 from scpilot import schemas as S
 from scpilot.tools import register
 
-# Tier 1 broad lineage panels (positive markers; from cancer_scrnaseq_annotation_strategy.md).
-BROAD_MARKERS = {
+# EXAMPLE Tier-1 broad lineage panels (positive markers; human PDAC-style, from
+# cancer_scrnaseq_annotation_strategy.md). These are NOT applied by default and are NOT a
+# prior baked into any call — annotate_broad requires the panel to be SUPPLIED by the caller
+# (the reasoning/agent layer), and the marker-DB-free path (markers → annotation_review)
+# uses no panel at all. They are kept only as (a) a starting point an agent can adapt to the
+# dataset's organism/tissue and (b) a last-resort cosmetic fallback for the annotation dotplot.
+# No-hardcoding rule: the cell-type CALL must never depend on this fixed list by default.
+EXAMPLE_BROAD_MARKERS = {
     "Epithelial":  ["EPCAM", "KRT8", "KRT18", "KRT19"],
     "T_NK":        ["CD3D", "CD3E", "TRAC", "NKG7", "GNLY", "KLRD1"],
     "B_Plasma":    ["MS4A1", "CD79A", "CD79B", "MZB1", "JCHAIN", "XBP1"],
@@ -60,11 +66,12 @@ BROAD_MARKERS = {
     "Endothelial": ["PECAM1", "VWF", "KDR", "CLDN5"],
     "Mast":        ["TPSAB1", "TPSB2", "CPA3", "KIT"],
 }
+# Back-compat alias (the dotplot fallback + tests import this name); it is an EXAMPLE, not a prior.
+BROAD_MARKERS = EXAMPLE_BROAD_MARKERS
 
-# Negative markers (rule 3): genes a compartment should NOT express. Used only as a
-# tie-breaker — a candidate loses a point per negative gene that is a significant
-# up-marker of the cluster. Kept to the strongest cross-compartment discriminators.
-NEG_MARKERS = {
+# EXAMPLE negative markers (rule 3): genes a compartment should NOT express. Tie-breaker only.
+# Like the positive panel, supplied by the caller (neg_panels=) — never applied by default.
+EXAMPLE_NEG_MARKERS = {
     "Epithelial":  ["PTPRC"],                  # CD45- (not immune)
     "T_NK":        ["EPCAM", "LYZ"],           # not epithelial / myeloid
     "B_Plasma":    ["EPCAM", "CD3D"],
@@ -73,9 +80,15 @@ NEG_MARKERS = {
     "Endothelial": ["PTPRC", "EPCAM"],
     "Mast":        ["EPCAM", "CD3D"],
 }
+NEG_MARKERS = EXAMPLE_NEG_MARKERS
 
-IMMUNE_COMPARTMENTS = {"T_NK", "B_Plasma", "Myeloid", "Mast"}
-NONIMMUNE_COMPARTMENTS = {"Epithelial", "Stromal", "Endothelial"}
+# EXAMPLE immune/non-immune compartment split for the PTPRC-consistency rule. Supplied by the
+# caller (immune_compartments=/nonimmune_compartments=) when it opts into that rule — never a
+# default classification of agent-chosen labels.
+EXAMPLE_IMMUNE_COMPARTMENTS = {"T_NK", "B_Plasma", "Myeloid", "Mast"}
+EXAMPLE_NONIMMUNE_COMPARTMENTS = {"Epithelial", "Stromal", "Endothelial"}
+IMMUNE_COMPARTMENTS = EXAMPLE_IMMUNE_COMPARTMENTS
+NONIMMUNE_COMPARTMENTS = EXAMPLE_NONIMMUNE_COMPARTMENTS
 MIXED_LABEL = "Mixed/Artifact"
 LOWQ_LABEL = "Low_quality"
 UNKNOWN_LABEL = "Unknown"
@@ -109,16 +122,22 @@ def _expressed_fraction(adata, gene: str):
 
 
 @register("annotate_broad", mutating=True,
-          description="LEGACY / opt-in (FIXED marker panel). Deterministic Tier-1 via leiden-cluster DE matched "
-                      "to hardcoded BROAD_MARKERS panels — organism/tissue-biased, misses panel-absent types. "
-                      "The PRIMARY Tier-1 path is now marker-DB-FREE: markers → annotation_review → apply_annotation "
-                      "(LLM infers types from DE). Use this only as a quick fixed-panel sanity check.")
-def annotate_broad(session, *, groupby: str = "leiden", min_pct: float = 0.25, min_lfc: float = 1.0,
+          description="Opt-in deterministic Tier-1 via leiden-cluster DE matched to a CALLER-SUPPLIED marker "
+                      "panel (panels={cell_type:[genes]}); no panel is hardcoded — without one this errors and "
+                      "points to the PRIMARY marker-DB-FREE path (markers → annotation_review → apply_annotation, "
+                      "LLM infers types from DE). The agent supplies a panel adapted to THIS dataset's "
+                      "organism/tissue, or omits it and reasons over the DE directly.")
+def annotate_broad(session, *, groupby: str = "leiden",
+                   panels: dict | None = None, neg_panels: dict | None = None,
+                   min_pct: float = 0.25, min_lfc: float = 1.0,
                    min_markers: int = 3, top_n_markers: int = 30,
                    sample_key: str = "sample_id", batch_key: str = "GSE",
                    layer: str | None = "scale.data", single_source_frac: float = 0.8,
-                   # rule 2 (PTPRC consistency)
-                   ptprc_gene: str = "PTPRC", immune_ptprc_min: float = 0.20,
+                   # rule 2 (PTPRC consistency) — opt-in: supply ptprc_gene + the compartment split
+                   ptprc_gene: str | None = None,
+                   immune_compartments: list | set | None = None,
+                   nonimmune_compartments: list | set | None = None,
+                   immune_ptprc_min: float = 0.20,
                    nonimmune_ptprc_max: float = 0.50, ptprc_penalty: float = 0.7,
                    # rule 1 (Mixed/Artifact)
                    doublet_key: str = "predicted_doublet", doublet_frac: float = 0.5,
@@ -137,13 +156,35 @@ def annotate_broad(session, *, groupby: str = "leiden", min_pct: float = 0.25, m
                        f"clustering '{groupby}' absent — run cluster first", recoverable=True,
                        suggested_next_tools=["cluster"])
 
-    # present panels (genes actually in the data)
-    panels = {ct: [g for g in gs if g in adata.var_names] for ct, gs in BROAD_MARKERS.items()}
+    # The marker panel is AGENT-SUPPLIED, never a hardcoded default. No panel → don't guess:
+    # route to the marker-DB-free reasoning path instead.
+    if not panels:
+        return S.error("annotate_broad", "invalid_params",
+                       "annotate_broad needs a caller-supplied panel (panels={cell_type:[genes]}) — no marker "
+                       "panel is hardcoded. Supply one adapted to this dataset, or use the marker-DB-free path "
+                       "(markers -> annotation_review -> apply_annotation).", recoverable=True,
+                       suggested_next_tools=["markers", "annotation_review"])
+
+    # resolve supplied reference symbols to the data's own casing (EPCAM->Epcam in mouse);
+    # organism is detected, never assumed (no-hardcoding rule).
+    from scpilot.core import _species
+    org = _species.detect_organism(adata)
+    _sidx = _species._symbol_index(adata)
+    panels = {ct: _species.present(adata, gs, index=_sidx) for ct, gs in panels.items()}
     panels = {ct: gs for ct, gs in panels.items() if gs}
     if not panels:
         return S.error("annotate_broad", "data_gate_failed",
-                       "no broad-marker genes present in var_names", recoverable=False)
-    neg_panels = {ct: [g for g in NEG_MARKERS.get(ct, []) if g in adata.var_names] for ct in panels}
+                       f"none of the supplied panel genes are present in var_names (organism={org['organism']}); "
+                       "use the marker-DB-free path (markers -> annotation_review)", recoverable=True,
+                       suggested_next_tools=["markers", "annotation_review"])
+    neg_panels = neg_panels or {}
+    neg_panels = {ct: _species.present(adata, neg_panels.get(ct, []), index=_sidx) for ct in panels}
+    # PTPRC-consistency rule (rule 2) is opt-in: only active when the caller supplies both the
+    # pan-immune gene and the immune/non-immune compartment split for ITS OWN labels.
+    immune_set = {str(c) for c in immune_compartments} if immune_compartments else set()
+    nonimmune_set = {str(c) for c in nonimmune_compartments} if nonimmune_compartments else set()
+    if ptprc_gene is not None:
+        ptprc_gene = (_species.resolve(adata, [ptprc_gene], index=_sidx).get(ptprc_gene) or ptprc_gene)
 
     # 1) leiden-cluster DE (Wilcoxon) with per-group expressed fraction (pts)
     use_layer = layer if (layer and layer in adata.layers) else None
@@ -239,11 +280,11 @@ def annotate_broad(session, *, groupby: str = "leiden", min_pct: float = 0.25, m
             label = ct
             conf = round(len(matched) / len(panels[ct]), 3)
             reason = f"{len(matched)}/{len(panels[ct])} {ct} markers (adj {adj.get(ct)})"
-            # rule 2: PTPRC consistency
-            if ptprc_frac is not None:
-                if ct in IMMUNE_COMPARTMENTS and ptprc_frac < immune_ptprc_min:
+            # rule 2: PTPRC consistency (opt-in — needs ptprc_gene + a compartment split)
+            if ptprc_frac is not None and (immune_set or nonimmune_set):
+                if ct in immune_set and ptprc_frac < immune_ptprc_min:
                     ptprc_consistent = False
-                elif ct in NONIMMUNE_COMPARTMENTS and ptprc_frac > nonimmune_ptprc_max:
+                elif ct in nonimmune_set and ptprc_frac > nonimmune_ptprc_max:
                     ptprc_consistent = False
                 else:
                     ptprc_consistent = True
@@ -276,12 +317,16 @@ def annotate_broad(session, *, groupby: str = "leiden", min_pct: float = 0.25, m
     adata.obs["major_confidence"] = obs_g.map(cluster_conf).astype(float)
     adata.obs["major_review_required"] = obs_g.map(cluster_review).astype(bool)
     adata.uns.setdefault(UNS_ANNO, {})
+    _rules = ["positive_top_n", "negative_marker_tiebreak", "mixed_artifact",
+              "low_quality_qc", "sample_provenance"]
+    if ptprc_expr is not None and (immune_set or nonimmune_set):
+        _rules.append("ptprc_consistency")
     adata.uns[UNS_ANNO]["tier1"] = {
         "method": "leiden_DE_marker_combination",
+        "marker_panel_source": "caller_supplied",
         "groupby": groupby, "min_pct": min_pct, "min_lfc": min_lfc, "min_markers": min_markers,
         "top_n_markers": top_n_markers,
-        "rules": ["positive_top_n", "negative_marker_tiebreak", "mixed_artifact",
-                  "low_quality_qc", "ptprc_consistency", "sample_provenance"],
+        "rules": _rules,
         "ptprc_gene": ptprc_gene if ptprc_expr is not None else None,
         "qc_gate": bool(has_mt or has_genes),
         "sample_key": sample_key if has_sample else None, "batch_key": batch_key if has_batch else None,

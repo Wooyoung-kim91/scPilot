@@ -37,7 +37,8 @@ def _session_with(adata, tmp_path):
 
 def test_qc_metrics_computes_and_summarizes(tmp_path):
     s = _session_with(_qc_fixture(), tmp_path)
-    r = tools.run("qc_metrics", s, run_scrublet=True, seed=0)
+    r = tools.run("qc_metrics", s, run_scrublet=True, seed=0,
+                  mixed_lineage_genes=("EPCAM", "CD3D"))   # opt-in flag (no hardcoded default)
     assert r.status == "success"
     sm = r.summary
     assert sm["n_samples"] == 2

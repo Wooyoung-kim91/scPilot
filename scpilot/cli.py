@@ -170,6 +170,17 @@ def run(
     model: str = typer.Option(None, "--model", help="model name (default per backend; never hardcoded)"),
     base_url: str = typer.Option(None, "--base-url",
                                  help="OpenAI-compatible endpoint for a LOCAL LLM (e.g. http://localhost:11434/v1)"),
+    review: bool = typer.Option(True, "--review/--no-review",
+                                help="run the Tier-4 INDEPENDENT consistency audit after annotation"),
+    reviewer_model: str = typer.Option(None, "--reviewer-model",
+                                       help="model for the Tier-4 review (independent second opinion); "
+                                            "default = the same model that ran the analysis"),
+    reviewer_backend: str = typer.Option(None, "--reviewer-backend",
+                                         help="backend for the reviewer (anthropic|openai); default = --backend"),
+    reviewer_base_url: str = typer.Option(None, "--reviewer-base-url",
+                                          help="OpenAI-compatible endpoint for a local reviewer model"),
+    review_max_rounds: int = typer.Option(3, "--review-max-rounds",
+                                          help="bounded annotation+review loop: max audit→re-annotate rounds"),
     seed: int = typer.Option(0, "--seed", help="global RNG seed (recorded for replay)"),
     max_iters: int = typer.Option(40, "--max-iters", help="max LLM tool-loop iterations"),
     param_file: str = typer.Option(None, "--param-file",
@@ -243,8 +254,26 @@ def run(
             raise typer.Exit(code=2)
         typer.secho(f"[scpilot run] user-fixed params: {param_overrides}", fg=typer.colors.CYAN, err=True)
 
+    # Tier-4 verification runs INSIDE the agent loop, right after EVERY annotation-apply step
+    # (broad/fine/final). Build the reviewer first: a SEPARATE model when --reviewer-model/-backend
+    # is given (cross-model second opinion), else the same provider (self-critique).
+    reviewer = provider
+    if review and (reviewer_model or reviewer_backend or reviewer_base_url):
+        try:
+            rcfg = ProviderConfig.from_env(backend=reviewer_backend or backend,
+                                           model=reviewer_model, base_url=reviewer_base_url,
+                                           effort=effort, thinking={"type": "adaptive"})
+            reviewer = build_provider(rcfg)
+            typer.secho(f"[scpilot run] Tier-4 reviewer: backend={reviewer.name} model={reviewer.model}",
+                        fg=typer.colors.CYAN, err=True)
+        except ProviderUnavailable as exc:
+            typer.secho(f"[scpilot run] reviewer unavailable ({exc}); using the analysis model",
+                        fg=typer.colors.YELLOW, err=True)
+
     result = run_agent(session, provider, goal=goal, tissue=tissue, resolutions=resolutions,
-                       seed=seed, max_iters=max_iters, param_overrides=param_overrides)
+                       seed=seed, max_iters=max_iters, param_overrides=param_overrides,
+                       reviewer_provider=(reviewer if review else None), review=review,
+                       review_max_rounds=review_max_rounds)
 
     # final interpretation + report (LLM prose injected into the deterministic report tool)
     interp = ""
