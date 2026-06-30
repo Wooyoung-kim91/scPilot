@@ -213,6 +213,54 @@ def _notebook_cell(cid: str, stage: str, params: dict, seed: int = 0,
     )
 
 
+def _step_script(idx: int, cid: str, stage: str, params: dict, seed: int, snapshot_rel: str,
+                 input_lit: str, reasoning: str | None = None, is_first: bool = False) -> str:
+    """One STANDALONE numbered step script (``code/NN_<stage>.py``) — the per-step tutorial form:
+    shebang + docstring (name / why / parameters / outputs / run-command), pinned-source setup, the
+    single tool call with EXPLICIT params, then status/summary/plot-paths. Run the NN_*.py files IN
+    ORDER: step 00 opens the repro session and loads the input; later steps open the same session so
+    its latest checkpoint auto-loads (state flows through checkpoints, one process per step)."""
+    if params:
+        md = "\n".join(f"#   - {k} = {v!r}" for k, v in params.items())
+        kw = "".join(f"    {k}={v!r},\n" for k, v in params.items())
+        call = f'_res = tools.run("{stage}", sess,\n{kw})'
+    else:
+        md = "#   - (no parameters — tool defaults)"
+        call = f'_res = tools.run("{stage}", sess)'
+    why = ("why: " + " ".join(str(reasoning).split())[:400]) if reasoning else \
+        "scpilot deterministic step (re-pins its recorded seed → reproducible)."
+    load = ("sess.load_input()                       # step 00 loads the input\n" if is_first
+            else "# (steps after 00 open the existing session → its latest checkpoint auto-loads)\n")
+    return (
+        f'#!/usr/bin/env python\n"""\n'
+        f'{cid}_{stage}.py — scpilot pipeline step {idx} (AUTO-GENERATED tutorial; run the NN_*.py files IN ORDER)\n'
+        f'{why}\n'
+        f'parameters:\n{md}\n'
+        f'산출: checkpoints/ (mutating step) + any artifacts/\n'
+        f'실행: <scpilot-env>/bin/python {cid}_{stage}.py\n"""\n'
+        f'import json, sys\n'
+        f'from pathlib import Path\n'
+        f'_HERE = Path(__file__).resolve().parent\n'
+        f'sys.path.insert(0, str(_HERE / "{snapshot_rel}"))   # pinned scpilot source\n'
+        f'_RUN_DIR = _HERE.parent\n'
+        f'from scpilot import tools\n'
+        f'from scpilot.repro import set_global_seed\n'
+        f'from scpilot.session import Session\n'
+        f'from scpilot.core.autoplot import auto_plots\n\n'
+        f'set_global_seed({seed})\n'
+        f'sess = Session.create(str(_RUN_DIR / "repro_pipeline"), input_path={input_lit}, exist_ok=True)\n'
+        f'{load}{call}\n'
+        f'print("[{cid}] {stage}:", _res.status, _res.determinism_grade or "")\n'
+        f'for _w in (_res.warnings or []):\n'
+        f'    print("    warn:", _w)\n'
+        f'if _res.error:\n'
+        f'    print("    ERROR[" + str(_res.error_code) + "]:", _res.error)\n'
+        f'print(json.dumps(_res.summary, indent=2, default=str)[:2000])\n'
+        f'for _a in (auto_plots(sess, "{stage}", _res.summary) or []):\n'
+        f'    print("    plot:", getattr(_a, "path", _a))\n'
+    )
+
+
 def counts_fingerprint(adata) -> dict | None:
     """Fingerprint of ``layers['counts']`` to detect accidental mutation.
 
@@ -629,6 +677,42 @@ class Session:
             tmp.write_text(text)
         return str(path)
 
+    def _write_step_scripts(self) -> list[str]:
+        """(Re)write per-step numbered standalone scripts ``code/NN_<stage>.py`` — the tutorial form
+        of one .py file per step (run IN ORDER), complementing the single cell-by-cell notebook. Each
+        re-pins its recorded seed, opens the repro session, runs ONE tool with explicit params, and
+        prints status/summary/plot-paths. Driven by the run log (every step), like the notebook."""
+        self.code_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_rel = self._snapshot_source()
+        inp = self.manifest.input.get("path", "")
+        runs = self._read_runs()
+        reason_by_hash: dict = {}
+        if self.outputs_path.exists():
+            for line in self.outputs_path.read_text().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:  # noqa: BLE001
+                    continue
+                if o.get("reasoning"):
+                    reason_by_hash[o.get("recipe_hash")] = o.get("reasoning")
+        written: list[str] = []
+        for i, r in enumerate(runs):
+            stage, params = r.get("tool"), r.get("params", {}) or {}
+            step_seed = r.get("seed")
+            if step_seed is None:
+                step_seed = int(params["seed"]) if "seed" in params else 0
+            cid = f"{i:02d}"
+            text = _step_script(i, cid, stage, params, int(step_seed), snapshot_rel, repr(inp),
+                                reasoning=reason_by_hash.get(r.get("recipe_hash")), is_first=(i == 0))
+            path = self.code_dir / f"{cid}_{stage}.py"
+            with atomic_path(path) as tmp:
+                tmp.write_text(text)
+            written.append(str(path))
+        return written
+
     # ---------- append-only logs ----------
     def log_run(self, record: dict) -> None:
         """Append one tool-run record to run_log.jsonl (full schema frozen in A7)."""
@@ -720,6 +804,7 @@ class Session:
         try:
             self.manifest.pipeline_script = self._write_pipeline()
             self._write_notebook()
+            self._write_step_scripts()      # per-step numbered tutorial scripts (code/NN_<stage>.py)
             self.save()
         except Exception:  # noqa: BLE001 — repro-artifact emission must never break the result
             pass

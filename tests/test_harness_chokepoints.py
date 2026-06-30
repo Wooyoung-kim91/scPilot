@@ -707,3 +707,34 @@ def test_phase_b_annotation_evidence(tmp_path):
     d2 = tools.run("plots", s, kind="dotplot", groupby="major_cell_type",
                    cluster_key="leiden", label_map=labels)
     assert d2.status == "success" and d2.artifacts
+
+
+def test_per_step_tutorial_scripts(tmp_path):
+    """The pipeline is ALSO emitted as numbered standalone step scripts code/NN_<stage>.py (tutorial
+    form, run in order): shebang + docstring (name/why/parameters/실행) + explicit-param tool call."""
+    import ast
+
+    import anndata as ad
+    import numpy as np
+    from scipy import sparse
+
+    from scpilot.session import Session
+
+    a = ad.AnnData(sparse.csr_matrix(np.random.default_rng(0).poisson(2, (20, 6)).astype("float32")))
+    a.var_names = [f"G{i}" for i in range(6)]
+    a.layers["counts"] = a.X.copy()
+    p = tmp_path / "in.h5ad"; a.write_h5ad(p)
+    s = Session.create(tmp_path / "sess", input_path=str(p)); s.load_input()
+    s._append_jsonl(s.run_log_path, {"tool": "ingest", "status": "success", "seed": 0, "recipe_hash": "h0"})
+    s._append_jsonl(s.run_log_path, {"tool": "qc_filter", "status": "success", "seed": 0,
+                                     "recipe_hash": "h1", "params": {"min_genes": 500, "max_pct_mt": 15.0}})
+
+    written = s._write_step_scripts()
+    names = [__import__("pathlib").Path(f).name for f in written]
+    assert names == ["00_ingest.py", "01_qc_filter.py"]            # numbered, one file per step
+    for f in written:                                              # every script is valid Python
+        ast.parse(__import__("pathlib").Path(f).read_text())
+    qc = __import__("pathlib").Path(written[1]).read_text()
+    assert qc.startswith("#!/usr/bin/env python")                  # standalone script form
+    assert "min_genes=500," in qc and "max_pct_mt=15.0," in qc     # EXPLICIT, editable params
+    assert "IN ORDER" in qc and "set_global_seed(0)" in qc         # run-order + per-step seed
