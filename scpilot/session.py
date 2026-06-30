@@ -165,21 +165,42 @@ print("session:", sess.out)
 '''
 
 
-def _notebook_cell(cid: str, stage: str, params: dict, seed: int = 0) -> str:
+def _notebook_cell(cid: str, stage: str, params: dict, seed: int = 0,
+                   reasoning: str | None = None) -> str:
     """One markdown + one code cell for a pipeline step (percent format).
 
-    The code is written out FLAT — no helper function — so the reader sees exactly what
-    each step does: re-pin the recorded seed, run the stage, then print status / warnings /
-    error / summary and render any plot inline. Re-pinning the step's seed makes the cell
-    self-contained: running top-to-bottom — or re-running a single cell — reproduces the
-    SAME result as the recorded run, independent of accumulated kernel RNG state
-    (cell-by-cell determinism requirement).
+    TUTORIAL STYLE: every parameter chosen for this step is written as an EXPLICIT, editable
+    keyword argument (one per line) AND listed in the markdown, so the reader sees — from file
+    input through each step — exactly which settings were used and can tweak any value and re-run.
+
+    The code is written out FLAT — no helper function — so the reader sees exactly what each step
+    does: re-pin the recorded seed, run the stage, then print status / warnings / error / summary
+    and render any plot inline. Re-pinning the step's seed makes the cell self-contained: running
+    top-to-bottom — or re-running a single cell — reproduces the SAME result as the recorded run,
+    independent of accumulated kernel RNG state (cell-by-cell determinism requirement).
     """
+    if params:
+        md_params = "\n".join(f"# - `{k}` = `{v!r}`" for k, v in params.items())
+        kwargs = "".join(f"    {k}={v!r},\n" for k, v in params.items())
+        call = f'_res = tools.run("{stage}", sess,\n{kwargs})\n'
+    else:
+        md_params = "# - _(no parameters — tool defaults)_"
+        call = f'_res = tools.run("{stage}", sess)\n'
+    # the WHY (rationale recorded for this step) as a markdown blockquote — turns the cell into a
+    # tutorial ("we chose these params because …"); whitespace collapsed + capped for readability.
+    why_md = ""
+    if reasoning:
+        _why = " ".join(str(reasoning).split())
+        if len(_why) > 600:
+            _why = _why[:600].rstrip() + "…"
+        why_md = f"# > **why:** {_why}\n"
     return (
-        f'\n# %% [markdown]\n# ## {cid} · {stage}\n# params: `{params!r}`\n\n'
+        f'\n# %% [markdown]\n# ## {cid} · {stage}\n'
+        f'{why_md}'
+        f'# **parameters** (edit any value, then re-run the cell to explore):\n{md_params}\n\n'
         f'# %%\n'
         f'set_global_seed({seed})\n'
-        f'_res = tools.run("{stage}", sess, **{params!r})\n'
+        f'{call}'
         f'print("[" + _res.status + "]", "{stage}", "·", _res.determinism_grade or "")\n'
         f'for _w in (_res.warnings or []):\n'
         f'    print("  warn:", _w)\n'
@@ -573,6 +594,20 @@ class Session:
             f"# - {k}: {prov.get(k)}" for k in ("scpilot_version", "source_hash", "git_commit", "timestamp"))
         inp = self.manifest.input.get("path", "")
         runs = self._read_runs()
+        # rationale (the WHY) per step from outputs.jsonl, matched by recipe_hash so retries or a
+        # run_log↔outputs count mismatch can't misalign it (index zipping would be fragile).
+        reason_by_hash: dict = {}
+        if self.outputs_path.exists():
+            for line in self.outputs_path.read_text().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:  # noqa: BLE001 — skip a malformed outputs line, keep generating
+                    continue
+                if o.get("reasoning"):
+                    reason_by_hash[o.get("recipe_hash")] = o.get("reasoning")
         cells = []
         for i, r in enumerate(runs):
             stage, params = r.get("tool"), r.get("params", {}) or {}
@@ -581,7 +616,8 @@ class Session:
                 step_seed = int(params["seed"]) if "seed" in params else 0
             # each cell re-pins ITS recorded seed → cell-by-cell reproduction (not the
             # last step's seed for the whole notebook)
-            cells.append(_notebook_cell(f"{i:02d}_{stage}", stage, params, int(step_seed)))
+            cells.append(_notebook_cell(f"{i:02d}_{stage}", stage, params, int(step_seed),
+                                        reasoning=reason_by_hash.get(r.get("recipe_hash"))))
         # top-of-notebook seed = first step's seed (initial/load state); each cell reseeds itself
         seed = int(runs[0].get("seed") or 0) if runs else 0
         text = _NOTEBOOK_TEMPLATE.format(
