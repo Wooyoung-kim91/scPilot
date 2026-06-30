@@ -37,14 +37,30 @@ durable on-disk session, so a crash can resume and the whole analysis can be
 - **Capability-gated.** Optional tools (scVI, Harmony, inferCNV, scib) check their
   dependencies via `scpilot doctor` and return a recoverable error instead of
   crashing when a package is missing.
+- **Exports as plain scanpy.** Every run is written out as standalone, scPilot-free
+  tutorial scripts (`code/NN_<stage>.py`) — direct scanpy/pandas with the exact
+  parameters used — so the analysis is readable and re-runnable without scPilot.
 
 ---
 
 ## Installation
 
-The scientific stack is provided by the conda env **`scpilot`** (numpy-2.x
-verified). Install the package editable **without touching env deps** so pip does
-not re-resolve the stack:
+Requires Python ≥ 3.11. Core deps (in `pyproject.toml`): scanpy, anndata,
+numpy ≥ 2, scvi-tools, harmonypy, leidenalg, scib-metrics, mcp, anthropic.
+
+### Option A — fresh environment
+
+```bash
+conda create -n scpilot python=3.11 -y
+conda activate scpilot
+pip install -e .                  # installs the scientific stack from pyproject
+scpilot version
+```
+
+### Option B — into an existing verified env (recommended)
+
+If you already have the numpy-2.x-verified conda env, install editable **without
+re-resolving deps** so pip does not upgrade the verified stack:
 
 ```bash
 conda run -n scpilot pip install -e . --no-deps
@@ -54,11 +70,15 @@ conda run -n scpilot scpilot version
 Optional Tier-2 (CNV) + trajectory extras (gated at runtime by `doctor`):
 
 ```bash
-conda run -n scpilot pip install -e ".[extra]" --no-deps   # infercnvpy, gtfparse, pybiomart, celltypist
+pip install -e ".[extra]"         # infercnvpy, gtfparse, pybiomart, celltypist
 ```
 
-Requires Python ≥ 3.11. Core deps (documented in `pyproject.toml`): scanpy,
-anndata, numpy ≥ 2, scvi-tools, harmonypy, leidenalg, scib-metrics, mcp, anthropic.
+> **Running an exported analysis needs no scPilot install.** Every run also writes
+> plain-scanpy tutorial scripts to `<workdir>/code/NN_<stage>.py` that import only
+> `scanpy` / `anndata` / `numpy` / `pandas` (+ `harmonypy` / `scib-metrics` for the
+> integration & benchmark steps). You can re-run the whole pipeline from those
+> scripts in any scientific-Python env — scPilot itself is not required. See
+> [Reproducible standalone export](#reproducible-standalone-export).
 
 ### Preflight
 
@@ -244,12 +264,42 @@ A session is a working directory that owns the analysis state on disk:
   reasoning_log.md      # human-readable narrative (one section per step + plots)
   checkpoints/NN_<stage>.h5ad
   artifacts/            # CSV / PNG outputs
-  code/                 # auto-generated runnable pipeline.py + cell-by-cell notebook + pinned source snapshot
+  code/                 # auto-generated STANDALONE per-step scripts NN_<stage>.py (plain scanpy, no scpilot)
+  standalone_data/      # the h5ad chain the code/ scripts read & write (created when you run them)
   logs/
 ```
 
 The in-memory AnnData is just a cache of the latest checkpoint, so any `step`
 (a fresh process) resumes from on-disk state.
+
+---
+
+## Reproducible standalone export
+
+Every session writes its pipeline as **standalone, scPilot-free tutorial scripts**
+under `<workdir>/code/` — one numbered file per step (`00_ingest.py`,
+`01_qc_metrics.py`, `02_qc_filter.py`, …):
+
+- **Plain scanpy/pandas.** Each script is the actual operation written out directly
+  — no `tools.run`, no `Session`, no scPilot import — with the **exact parameter
+  values used in the run** baked in (e.g. `keep = (adata.obs["n_genes_by_counts"] >= 300) & …`).
+- **Chained via h5ad.** Step *N* reads `standalone_data/<N-1>_<stage>.h5ad` and writes
+  `standalone_data/<N>_<stage>.h5ad`; run the `NN_*.py` files **in order** in any
+  scientific-Python env. Non-mutating evidence steps (`annotation_review`,
+  `annotation_audit`, `benchmark`, …) also drop a sidecar JSON/CSV next to the h5ad.
+- **Verified equivalent.** `tests/test_scriptgen_equivalence.py` runs each generated
+  script as a real subprocess (with scPilot import *blocked*) and asserts its result
+  matches the scPilot tool — equivalence by regression test, not by trust.
+
+```bash
+cd <workdir>
+python code/00_ingest.py        # reads the dataset profile → standalone_data/00_ingest.h5ad
+python code/01_qc_metrics.py    # → 01_qc_metrics.h5ad (+ suggested MAD cutoffs)
+python code/02_qc_filter.py     # → 02_qc_filter.h5ad … run the rest in order
+```
+
+This turns a run into a readable, auditable, ordinary scanpy tutorial — independent
+of scPilot, and runnable in any env with just the scientific stack.
 
 ---
 
