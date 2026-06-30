@@ -593,31 +593,20 @@ def apply_annotation(session, *, groupby: str = "leiden", labels: dict | None = 
                        "no 'labels' map given (expected {cluster_id: cell_type} from the LLM)",
                        recoverable=True, suggested_next_tools=["annotation_review"])
 
-    obs_g = adata.obs[groupby].astype(str)
-    clusters = set(obs_g.unique())
-    lab = {str(k): str(v) for k, v in labels.items()}
-    missing = sorted(clusters - set(lab))                 # clusters the LLM did not label
-    adata.obs[key] = obs_g.map(lambda c: lab.get(c, unassigned)).astype("category")
-    if confidence:
-        cf = {str(k): float(v) for k, v in confidence.items()}
-        adata.obs[f"{key}_confidence"] = obs_g.map(lambda c: cf.get(c, float("nan"))).astype(float)
-    if review_required:
-        rv = {str(k): bool(v) for k, v in review_required.items()}
-        adata.obs[f"{key}_review_required"] = obs_g.map(lambda c: rv.get(c, False)).astype(bool)
-    if cell_state:
-        cs = {str(k): str(v) for k, v in cell_state.items()}
-        adata.obs["cell_state"] = obs_g.map(lambda c: cs.get(c, "")).astype("category")
+    from .. import recipes
 
-    # the LLM's chosen >=3-gene marker-set COMBINATION per cell type (high expr + high spec) —
-    # the annotation EVIDENCE; recorded as a first-class artifact and used as the dotplot panels.
-    msets = {str(k): [str(g) for g in v] for k, v in (marker_sets or {}).items()}
-    adata.uns.setdefault(UNS_ANNO, {})
-    adata.uns[UNS_ANNO]["tier1_llm"] = {
-        "method": method, "groupby": groupby, "label_key": key, "tissue_context": tissue,
-        "labels": lab, "marker_sets": msets, "marker_db_used": False,
-    }
-    dist = adata.obs[key].value_counts().to_dict()
-    n_unassigned = int((adata.obs[key].astype(str) == unassigned).sum())
+    # the deterministic obs/uns mutation (cluster->label map + optional confidence/review/state +
+    # marker_sets into uns) lives in scpilot.recipes (scpilot-free) so the generated standalone
+    # tutorial script inlines the SAME source — logic-identical by construction.
+    adata, info = recipes.apply_annotation(
+        adata, groupby=groupby, labels=labels, key=key, confidence=confidence,
+        review_required=review_required, cell_state=cell_state, marker_sets=marker_sets,
+        tissue=tissue, method=method, unassigned=unassigned)
+    lab = info["labels"]
+    msets = info["marker_sets"]
+    missing = info["unlabeled_clusters"]
+    n_unassigned = info["n_unassigned_cells"]
+    dist = info["label_distribution"]
     try:
         session.log_decision(S.DecisionEvent(
             decision_type="tier1_llm_labels", choice=lab, candidates=[],
@@ -641,33 +630,6 @@ def apply_annotation(session, *, groupby: str = "leiden", labels: dict | None = 
     return S.success("apply_annotation", summary=summary, warnings=warnings, checkpoint=cp.path,
                      determinism_grade="A", duration_s=round(time.time() - t0, 3),
                      suggested_next_tools=["plots", "consensus_annotation", "integrate_scvi", "benchmark"])
-
-
-def _majority_vote(adata, keys, *, min_agreement, ambiguous_label):
-    """Per-cell majority vote across obs annotation columns ``keys``. Returns (out, agree, pairwise):
-    ``out[i]`` = the unique-winner label held by a fraction > ``min_agreement`` of the columns
-    (else ``ambiguous_label``); ``agree[i]`` = winner fraction; ``pairwise`` = per-pair concordance.
-    Shared by consensus_annotation and harmonize_annotations' fallback (single source, no drift)."""
-    import numpy as np
-    import pandas as pd
-
-    n_keys = len(keys)
-    cats = pd.unique(np.concatenate([adata.obs[k].astype(str).values for k in keys]))
-    codes = np.column_stack([
-        pd.Categorical(adata.obs[k].astype(str).values, categories=cats).codes for k in keys])
-    out = np.empty(adata.n_obs, dtype=object)
-    agree = np.zeros(adata.n_obs, dtype=float)
-    for i in range(adata.n_obs):
-        counts = np.bincount(codes[i], minlength=len(cats))
-        mx = counts.max()
-        winners = np.flatnonzero(counts == mx)
-        agree[i] = mx / n_keys
-        out[i] = cats[winners[0]] if (winners.size == 1 and mx / n_keys > min_agreement) else ambiguous_label
-    pairwise = {}
-    for a in range(n_keys):
-        for b in range(a + 1, n_keys):
-            pairwise[f"{keys[a]}__vs__{keys[b]}"] = round(float((codes[:, a] == codes[:, b]).mean()), 3)
-    return out, agree, pairwise
 
 
 @register("consensus_annotation", mutating=True,
@@ -700,14 +662,17 @@ def consensus_annotation(session, *, keys: list | None = None, out_key: str = "c
                        f"annotation column(s) absent in obs: {missing}", recoverable=True,
                        suggested_next_tools=["apply_annotation"])
 
-    n_keys = len(keys)
-    out, agree, pairwise = _majority_vote(adata, keys, min_agreement=min_agreement,
-                                          ambiguous_label=ambiguous_label)
-    adata.obs[out_key] = pd.Categorical(out)
-    adata.obs[f"{out_key}_agreement"] = agree.astype("float32")
+    from .. import recipes
 
-    dist = adata.obs[out_key].value_counts().to_dict()
-    n_amb = int((adata.obs[out_key].astype(str) == ambiguous_label).sum())
+    n_keys = len(keys)
+    # the embedding-independent majority vote + obs writes live in scpilot.recipes (scpilot-free) so
+    # the generated standalone tutorial script inlines the SAME source — identical by construction.
+    adata, vinfo = recipes.consensus_vote(adata, keys=keys, out_key=out_key,
+                                          min_agreement=min_agreement, ambiguous_label=ambiguous_label)
+    pairwise = vinfo["pairwise"]
+    dist = {k: v for k, v in vinfo["label_distribution"].items()}
+    n_amb = vinfo["n_ambiguous"]
+    agree_mean = vinfo["mean_agreement"]
     adata.uns.setdefault(UNS_ANNO, {})
     adata.uns[UNS_ANNO]["consensus"] = {
         "out_key": out_key, "source_keys": keys, "min_agreement": min_agreement,
@@ -724,7 +689,7 @@ def consensus_annotation(session, *, keys: list | None = None, out_key: str = "c
     summary = {
         "out_key": out_key, "source_keys": keys, "n_keys": n_keys, "min_agreement": min_agreement,
         "n_ambiguous": n_amb, "ambiguous_frac": round(n_amb / adata.n_obs, 3),
-        "mean_agreement": round(float(agree.mean()), 3), "pairwise_agreement": pairwise,
+        "mean_agreement": agree_mean, "pairwise_agreement": pairwise,
         "label_distribution": {str(k): int(v) for k, v in dist.items()},
         "note": f"Embedding-independent consensus → use as benchmark label_key. '{ambiguous_label}' + other "
                 "non-cell-type labels should be passed to benchmark drop_labels (caller-chosen, not hardcoded).",
@@ -786,12 +751,14 @@ def harmonize_annotations(session, *, keys: list | None = None, out_key: str = "
     elif method == "cellhint" and not cellhint_present:
         warnings.append("method='cellhint' but cellhint not installed → consensus majority-vote fallback")
 
+    from .. import recipes
+
     pairwise: dict = {}
     if method_used is None:                          # embedding-independent majority-vote fallback
-        out, agree, pairwise = _majority_vote(adata, keys, min_agreement=min_agreement,
-                                              ambiguous_label=ambiguous_label)
-        adata.obs[out_key] = pd.Categorical(out)
-        adata.obs[f"{out_key}_agreement"] = agree.astype("float32")
+        # shared scpilot-free vote+obs writes (scpilot.recipes) → standalone script inlines the same.
+        adata, vinfo = recipes.consensus_vote(adata, keys=keys, out_key=out_key,
+                                              min_agreement=min_agreement, ambiguous_label=ambiguous_label)
+        pairwise = vinfo["pairwise"]
         method_used = "consensus_fallback"
 
     dist = adata.obs[out_key].value_counts().to_dict()

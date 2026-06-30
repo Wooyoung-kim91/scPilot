@@ -423,14 +423,14 @@ def _two_group_adata(n_obs=200, n_vars=120):
 
 
 def test_suggest_resolution_knee():
-    from scpilot.core.cluster import _suggest_resolution
+    from scpilot.recipes import suggest_resolution
 
     # n_clusters jumps 6→15 between 0.3 and 0.4 → choose 0.3 (just before the jump)
     jump = [(0.1, 5), (0.2, 6), (0.3, 6), (0.4, 15), (0.5, 16)]
-    assert _suggest_resolution(jump, jump_ratio=1.5)[0] == 0.3
+    assert suggest_resolution(jump, jump_ratio=1.5)[0] == 0.3
     # no abrupt jump → conservative lowest resolution
     flat = [(0.1, 4), (0.2, 4), (0.3, 5), (0.4, 5), (0.5, 6)]
-    assert _suggest_resolution(flat, jump_ratio=1.5)[0] == 0.1
+    assert suggest_resolution(flat, jump_ratio=1.5)[0] == 0.1
 
 
 def test_cluster_sweep_curve_and_cleanup(tmp_path):
@@ -710,9 +710,12 @@ def test_phase_b_annotation_evidence(tmp_path):
 
 
 def test_per_step_tutorial_scripts(tmp_path):
-    """The pipeline is ALSO emitted as numbered standalone step scripts code/NN_<stage>.py (tutorial
-    form, run in order): shebang + docstring (name/why/parameters/실행) + explicit-param tool call."""
+    """The pipeline is emitted as numbered step scripts code/NN_<stage>.py (tutorial form, run IN
+    ORDER, h5ad-chained). Transpiled stages (scriptgen.EMITTERS, e.g. qc_filter) emit STANDALONE
+    plain-scanpy code; not-yet-transpiled stages fall back to a scpilot-backed step that reads/writes
+    the SAME standalone_data/NN_<stage>.h5ad chain so converting a tool is a drop-in replacement."""
     import ast
+    from pathlib import Path
 
     import anndata as ad
     import numpy as np
@@ -730,11 +733,22 @@ def test_per_step_tutorial_scripts(tmp_path):
                                      "recipe_hash": "h1", "params": {"min_genes": 500, "max_pct_mt": 15.0}})
 
     written = s._write_step_scripts()
-    names = [__import__("pathlib").Path(f).name for f in written]
+    names = [Path(f).name for f in written]
     assert names == ["00_ingest.py", "01_qc_filter.py"]            # numbered, one file per step
     for f in written:                                              # every script is valid Python
-        ast.parse(__import__("pathlib").Path(f).read_text())
-    qc = __import__("pathlib").Path(written[1]).read_text()
-    assert qc.startswith("#!/usr/bin/env python")                  # standalone script form
-    assert "min_genes=500," in qc and "max_pct_mt=15.0," in qc     # EXPLICIT, editable params
-    assert "IN ORDER" in qc and "set_global_seed(0)" in qc         # run-order + per-step seed
+        ast.parse(Path(f).read_text())
+
+    # step 0 (ingest): not yet transpiled -> scpilot fallback, but still writes the h5ad chain
+    ingest = Path(written[0]).read_text()
+    assert 'tools.run("ingest"' in ingest
+    assert 'OUT = _DATA / "00_ingest.h5ad"' in ingest             # produces the chain file
+
+    # step 1 (qc_filter): transpiled -> STANDALONE plain scanpy, reads step 0's h5ad
+    qc = Path(written[1]).read_text()
+    assert qc.startswith("#!/usr/bin/env python")
+    assert "import scanpy as sc" in qc                            # standalone scientific stack
+    assert "import scpilot" not in qc and "tools.run" not in qc   # genuinely scpilot-free
+    assert "def " not in qc                                       # DIRECT code, no function wrapper
+    assert ">= 500" in qc and "<= 15.0" in qc                     # actual param values, inline in the ops
+    assert "IN ORDER" in qc                                       # run-order guidance
+    assert 'IN  = _DATA / "00_ingest.h5ad"' in qc                 # chained to the previous step

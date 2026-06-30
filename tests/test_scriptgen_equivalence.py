@@ -1,0 +1,239 @@
+"""Regression: each transpiled standalone step (scpilot.scriptgen) reproduces its scpilot tool.
+
+The standalone script inlines the SAME recipe source the tool calls, so equivalence is structural;
+these tests confirm (a) the generated script is genuinely scpilot-free and (b) the read/write wiring
+round-trips — executed as a real subprocess — to the identical result the scpilot tool produces."""
+
+import subprocess
+import sys
+
+import anndata as ad
+import numpy as np
+from scipy import sparse
+
+from scpilot import scriptgen, tools
+from scpilot.session import Session
+
+
+def _fixture(n=200, g=60):
+    """Two clear populations (so clustering finds >1 cluster) + 2 samples; counts in X + layer."""
+    rng = np.random.default_rng(0)
+    genes = ["MT-CO1", "MT-ND1", "RPS6", "RPL7", "EPCAM", "CD3D"] + [f"G{i}" for i in range(g - 6)]
+    X = rng.poisson(1.0, (n, g)).astype("float32")
+    X[:, 0:2] += rng.poisson(2.0, (n, 2)).astype("float32")          # MT signal
+    X[: n // 2, 6:16] += rng.poisson(5.0, (n // 2, 10)).astype("float32")   # population A
+    X[n // 2:, 16:26] += rng.poisson(5.0, (n - n // 2, 10)).astype("float32")  # population B
+    a = ad.AnnData(sparse.csr_matrix(X))
+    a.var_names = genes
+    a.obs_names = [f"c{i}" for i in range(n)]
+    a.layers["counts"] = a.X.copy()
+    a.obs["sample_id"] = [f"s{i % 2}" for i in range(n)]
+    return a
+
+
+def _run_standalone(tmp_path, cid, stage, params, in_path):
+    """Generate the standalone step script, assert it is scpilot-free, run it in a subprocess,
+    and return the AnnData it wrote to standalone_data/CID_STAGE.h5ad."""
+    code_dir = tmp_path / "code"
+    code_dir.mkdir(exist_ok=True)
+    script = scriptgen.build(int(cid), cid, stage, params, in_expr=repr(str(in_path)))
+    assert script is not None
+    for forbidden in ("import scpilot", "from scpilot", "tools.run", "Session"):
+        assert forbidden not in script, forbidden
+    f = code_dir / f"{cid}_{stage}.py"
+    f.write_text(script)
+    r = subprocess.run([sys.executable, str(f)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    out = tmp_path / "standalone_data" / f"{cid}_{stage}.h5ad"
+    assert out.exists()
+    return ad.read_h5ad(out)
+
+
+def _session(tmp_path):
+    p = tmp_path / "in.h5ad"
+    _fixture().write_h5ad(p)
+    s = Session.create(tmp_path / "sess", input_path=str(p))
+    s.load_input()
+    return s
+
+
+def test_qc_filter_standalone_matches_tool(tmp_path):
+    params = {"min_genes": 5, "max_pct_mt": 30.0, "max_doublet_score": 0.25}
+    s = _session(tmp_path)
+    tools.run("qc_metrics", s, run_scrublet=True, seed=0)
+    snap = tmp_path / "snap.h5ad"
+    s.adata.write_h5ad(snap)                       # standalone INPUT (has QC obs cols)
+    tools.run("qc_filter", s, **params)
+    tool_kept = set(map(str, s.adata.obs_names))
+
+    out = _run_standalone(tmp_path, "03", "qc_filter", params, snap)
+    assert set(map(str, out.obs_names)) == tool_kept and out.n_obs > 0
+
+
+def test_preprocess_standalone_matches_tool(tmp_path):
+    params = {"n_top_genes": 30, "n_pcs": 15, "seed": 0}
+    s = _session(tmp_path)
+    snap = tmp_path / "snap.h5ad"
+    s.adata.write_h5ad(snap)
+    tools.run("preprocess", s, **params)
+    tool_pca = np.asarray(s.adata.obsm["X_pca"])
+    tool_hvg = s.adata.var["highly_variable"].to_numpy()
+
+    out = _run_standalone(tmp_path, "01", "preprocess", params, snap)
+    assert (out.var["highly_variable"].to_numpy() == tool_hvg).all()
+    assert np.allclose(np.asarray(out.obsm["X_pca"]), tool_pca, atol=1e-5)
+
+
+def test_cluster_standalone_matches_tool(tmp_path):
+    params = {"resolution": 0.5, "seed": 0}
+    s = _session(tmp_path)
+    tools.run("preprocess", s, n_top_genes=30, n_pcs=15, seed=0)
+    snap = tmp_path / "snap.h5ad"
+    s.adata.write_h5ad(snap)                       # post-preprocess state (has X_pca)
+    tools.run("cluster", s, **params)
+    tool_leiden = s.adata.obs["leiden"].astype(str).to_numpy()
+
+    out = _run_standalone(tmp_path, "02", "cluster", params, snap)
+    assert (out.obs["leiden"].astype(str).to_numpy() == tool_leiden).all()
+    assert len(set(tool_leiden)) >= 2
+
+
+def test_markers_standalone_matches_tool(tmp_path):
+    params = {"groupby": "leiden", "max_genes_ranked": 20}
+    s = _session(tmp_path)
+    tools.run("preprocess", s, n_top_genes=30, n_pcs=15, seed=0)
+    tools.run("cluster", s, resolution=0.5, seed=0)
+    snap = tmp_path / "snap.h5ad"
+    s.adata.write_h5ad(snap)                       # post-cluster state (has leiden)
+    tools.run("markers", s, **params)
+    tool_rg = s.adata.uns["rank_genes_groups"]
+    tool_groups = list(tool_rg["names"].dtype.names)
+
+    out = _run_standalone(tmp_path, "03", "markers", params, snap)
+    out_rg = out.uns["rank_genes_groups"]
+    assert list(out_rg["names"].dtype.names) == tool_groups
+    for g in tool_groups:                          # identical ranked gene order per cluster
+        assert [str(x) for x in out_rg["names"][g]] == [str(x) for x in tool_rg["names"][g]]
+
+
+def test_qc_metrics_standalone_matches_tool(tmp_path):
+    params = {"run_scrublet": True, "seed": 0}     # mixed_lineage opt-in left off (matches real run)
+    s = _session(tmp_path)
+    snap = tmp_path / "snap.h5ad"
+    s.adata.write_h5ad(snap)
+    tools.run("qc_metrics", s, **params)
+    tool = s.adata.obs
+
+    out = _run_standalone(tmp_path, "01", "qc_metrics", params, snap)
+    o = out.obs
+    for col in ("n_genes_by_counts", "total_counts", "pct_counts_mt", "pct_counts_ribo"):
+        assert np.allclose(o[col].to_numpy(float), tool[col].to_numpy(float), equal_nan=True), col
+    if "doublet_score" in tool:                    # per-sample scrublet (seed-pinned -> identical)
+        assert np.allclose(o["doublet_score"].to_numpy(float), tool["doublet_score"].to_numpy(float),
+                           equal_nan=True)
+        assert (o["predicted_doublet"].to_numpy() == tool["predicted_doublet"].to_numpy()).all()
+
+
+def test_load_standalone_matches_tool(tmp_path):
+    p = tmp_path / "in.h5ad"
+    _fixture().write_h5ad(p)
+    s = Session.create(tmp_path / "sess", input_path=str(p))
+    tools.run("load", s)
+    tool_shape = (s.adata.n_obs, s.adata.n_vars)
+
+    out = _run_standalone(tmp_path, "00", "load", {}, p)   # step 0 reads the raw input path
+    assert (out.n_obs, out.n_vars) == tool_shape
+    assert list(out.var_names) == list(s.adata.var_names)
+
+
+def test_integrate_harmony_standalone_matches_tool(tmp_path):
+    import pytest
+    pytest.importorskip("harmonypy")
+    params = {"batch_key": "sample_id", "use_rep": "X_pca", "seed": 0}
+    s = _session(tmp_path)
+    tools.run("preprocess", s, n_top_genes=30, n_pcs=15, seed=0)
+    snap = tmp_path / "snap.h5ad"
+    s.adata.write_h5ad(snap)
+    r = tools.run("integrate_harmony", s, **params)
+    if r.status != "success":
+        pytest.skip(f"integrate_harmony unavailable: {r.error}")
+    tool_Z = np.asarray(s.adata.obsm["X_harmony"])
+
+    out = _run_standalone(tmp_path, "06", "integrate_harmony", params, snap)
+    assert np.allclose(np.asarray(out.obsm["X_harmony"]), tool_Z, atol=1e-4)
+
+
+def test_cluster_sweep_standalone_matches_tool(tmp_path):
+    params = {"res_min": 0.1, "res_max": 0.4, "res_step": 0.1, "seed": 0}
+    s = _session(tmp_path)
+    tools.run("preprocess", s, n_top_genes=30, n_pcs=15, seed=0)
+    snap = tmp_path / "snap.h5ad"
+    s.adata.write_h5ad(snap)
+    r = tools.run("cluster_sweep", s, **params)
+    tool_sweep = [(row["resolution"], row["n_clusters"]) for row in r.summary["sweep"]]
+
+    _run_standalone(tmp_path, "02", "cluster_sweep", params, snap)
+    import pandas as pd
+    sweep_csv = pd.read_csv(tmp_path / "standalone_data" / "02_cluster_sweep_sweep.csv")
+    std_sweep = list(zip(sweep_csv["resolution"].round(4), sweep_csv["n_clusters"]))
+    assert std_sweep == [(round(rr, 4), nn) for rr, nn in tool_sweep]
+
+
+def _two_label_state(tmp_path):
+    """A post-cluster session with two per-cell label columns to vote across."""
+    s = _session(tmp_path)
+    tools.run("preprocess", s, n_top_genes=30, n_pcs=15, seed=0)
+    tools.run("cluster", s, resolution=0.5, seed=0)
+    leid = s.adata.obs["leiden"].astype(str)
+    # two annotation columns that mostly agree (so consensus is non-trivial, some ambiguous)
+    s.adata.obs["anno_a"] = ("A_" + leid).astype("category")
+    flip = np.zeros(s.adata.n_obs, dtype=bool)
+    flip[::7] = True                                   # ~1/7 cells disagree
+    s.adata.obs["anno_b"] = np.where(flip, "OTHER", "A_" + leid)
+    s.adata.obs["anno_b"] = s.adata.obs["anno_b"].astype("category")
+    return s
+
+
+def test_consensus_annotation_standalone_matches_tool(tmp_path):
+    params = {"keys": ["anno_a", "anno_b"], "out_key": "celltype_consensus", "min_agreement": 0.5}
+    s = _two_label_state(tmp_path)
+    snap = tmp_path / "snap.h5ad"
+    s.adata.write_h5ad(snap)
+    tools.run("consensus_annotation", s, **params)
+    tool_lab = s.adata.obs["celltype_consensus"].astype(str).to_numpy()
+
+    out = _run_standalone(tmp_path, "03", "consensus_annotation", params, snap)
+    assert (out.obs["celltype_consensus"].astype(str).to_numpy() == tool_lab).all()
+
+
+def test_harmonize_annotations_standalone_matches_tool(tmp_path):
+    params = {"keys": ["anno_a", "anno_b"], "out_key": "celltype_harmonized", "method": "auto"}
+    s = _two_label_state(tmp_path)
+    snap = tmp_path / "snap.h5ad"
+    s.adata.write_h5ad(snap)
+    tools.run("harmonize_annotations", s, **params)
+    tool_lab = s.adata.obs["celltype_harmonized"].astype(str).to_numpy()
+
+    out = _run_standalone(tmp_path, "04", "harmonize_annotations", params, snap)
+    assert (out.obs["celltype_harmonized"].astype(str).to_numpy() == tool_lab).all()
+
+
+def test_apply_annotation_standalone_matches_tool(tmp_path):
+    s = _session(tmp_path)
+    tools.run("preprocess", s, n_top_genes=30, n_pcs=15, seed=0)
+    tools.run("cluster", s, resolution=0.5, seed=0)
+    clusters = sorted(s.adata.obs["leiden"].astype(str).unique())
+    labels = {c: f"CellType_{c}" for c in clusters}
+    labels.pop(clusters[-1])                        # leave one cluster unlabeled → Unassigned path
+    params = {"groupby": "leiden", "labels": labels, "key": "major_cell_type",
+              "confidence": {clusters[0]: 0.9}, "tissue": "test"}
+    snap = tmp_path / "snap.h5ad"
+    s.adata.write_h5ad(snap)
+    tools.run("apply_annotation", s, **params)
+    tool_lab = s.adata.obs["major_cell_type"].astype(str).to_numpy()
+    tool_uns = s.adata.uns["scpilot_annotation"]["tier1_llm"]
+
+    out = _run_standalone(tmp_path, "03", "apply_annotation", params, snap)
+    assert (out.obs["major_cell_type"].astype(str).to_numpy() == tool_lab).all()
+    assert out.uns["scpilot_annotation"]["tier1_llm"]["labels"] == tool_uns["labels"]
+    assert "Unassigned" in set(tool_lab)            # the unlabeled-cluster path exercised
