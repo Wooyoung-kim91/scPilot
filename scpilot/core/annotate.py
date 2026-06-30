@@ -385,7 +385,8 @@ def annotate_broad(session, *, groupby: str = "leiden",
                       "the calls via apply_annotation. Run after markers (which produces the pts DE). "
                       "See llm/prompts.py ANNOTATION_REVIEW_PROMPT + TISSUE_CONTEXT_GUIDANCE.")
 def annotation_review(session, *, groupby: str = "leiden", top_n: int = 50, padj_max: float = 0.05,
-                      min_specificity: float = 0.1, max_pct_out: float = 0.5, min_specific_markers: int = 3,
+                      min_in_group_fraction: float = 0.25, max_out_group_fraction: float = 0.10,
+                      min_fold_change: float = 1.5, min_specific_markers: int = 3,
                       sample_key: str = "sample_id", tissue: str | None = None, max_samples_reported: int = 8,
                       doublet_key: str = "predicted_doublet", doublet_frac: float = 0.5,
                       single_source_frac: float = 0.8, mt_key: str = "pct_counts_mt", max_pct_mt: float = 25.0,
@@ -423,16 +424,25 @@ def annotation_review(session, *, groupby: str = "leiden", top_n: int = 50, padj
     if "pvals_adj" in de.columns:
         de = de[de["pvals_adj"] < padj_max]
     n_sig_total = int(len(de))
-    # SPECIFICITY axis added to the DE step (spec = pct_in - pct_out): a marker must be ENRICHED
-    # in-cluster, not broadly expressed. A high-pct_out gene (MALAT1, ribosomal, ...) is weak identity
-    # evidence even at high logFC, so the list the LLM reads is significant AND specific — the data
-    # sets specificity, no marker DB. spec is surfaced per gene and the surfaced top-N is the most
-    # specific markers (so the cluster's own identity leads).
+    # MARKER-QUALITY filter — scanpy's CANONICAL sc.tl.filter_rank_genes_groups (pct_in /
+    # pct_out / fold-change; thresholds are tunable PARAMS, not a hardcoded panel). It writes a
+    # temporary filtered view to uns which we read back and immediately drop (annotation_review
+    # stays non-mutating); the p-value gate above stays explicit (this fn filters pct/FC only).
+    _FILT = "_scpilot_rgg_filtered"
+    sc.tl.filter_rank_genes_groups(adata, key="rank_genes_groups", key_added=_FILT,
+                                   min_in_group_fraction=min_in_group_fraction,
+                                   max_out_group_fraction=max_out_group_fraction,
+                                   min_fold_change=min_fold_change)
+    _qpairs = set(zip(*[sc.get.rank_genes_groups_df(adata, group=None, key=_FILT)[c].astype(str)
+                        for c in ("group", "names")]))   # (group, gene) passing the pct/FC bar
+    adata.uns.pop(_FILT, None)
     has_spec = {"pct_nz_group", "pct_nz_reference"}.issubset(de.columns)
     if has_spec:
         de = de.assign(spec=(de["pct_nz_group"] - de["pct_nz_reference"]).round(4))
-        _spec_ok = (de["spec"] >= min_specificity) & (de["pct_nz_reference"] <= max_pct_out)
-    n_specific_total = int(_spec_ok.sum()) if has_spec else n_sig_total
+    # significant markers that ALSO passed the quality filter (keeps pts/spec for the evidence table);
+    # spec = pct_in - pct_out is the ranking signal the LLM reads.
+    de_q = de[[(g, n) in _qpairs for g, n in zip(de["group"].astype(str), de["names"].astype(str))]]
+    n_specific_total = int(len(de_q))
 
     de_cols = {"names": "gene", "logfoldchanges": "logFC", "pvals_adj": "padj",
                "pct_nz_group": "pct_in", "pct_nz_reference": "pct_out", "spec": "spec", "scores": "score"}
@@ -448,9 +458,9 @@ def annotation_review(session, *, groupby: str = "leiden", top_n: int = 50, padj
     for cl, sub in de.groupby("group", observed=True):
         cl = str(cl)
         n_sig = int(len(sub))                          # significant up-markers for this cluster
-        # significant AND specific (delta + out-group ceiling), most-specific first.
-        spec_sub = sub[(sub["spec"] >= min_specificity) & (sub["pct_nz_reference"] <= max_pct_out)] \
-            .sort_values("spec", ascending=False) if has_spec else sub
+        # quality-passing (filter_rank_genes_groups) markers for this cluster, most-specific first.
+        spec_sub = de_q[de_q["group"].astype(str) == cl]
+        spec_sub = spec_sub.sort_values("spec", ascending=False) if has_spec else spec_sub
         n_specific = int(len(spec_sub))
         top = spec_sub.head(top_n)                     # top-N SPECIFIC markers
         mask = (obs_g == cl).values
@@ -516,12 +526,14 @@ def annotation_review(session, *, groupby: str = "leiden", top_n: int = 50, padj
     json_path.write_text(json.dumps(
         {"groupby": groupby, "top_n": top_n, "tissue_context": tissue,
          "significance_filter": f"pvals_adj < {padj_max}",
-         "specificity_filter": f"(pct_in - pct_out) >= {min_specificity} AND pct_out <= {max_pct_out}",
+         "marker_filter": (f"pct_in >= {min_in_group_fraction} AND pct_out <= {max_out_group_fraction} "
+                           f"AND fold_change >= {min_fold_change}"),
          "n_de_total": n_de_total, "n_significant_total": n_sig_total,
          "n_specific_total": n_specific_total,
          "marker_db_used": False, "candidate_labels_provided": False,
          "instruction": f"de_table = top-{top_n} markers per cluster that are SIGNIFICANT (padj<{padj_max}) "
-                        f"AND SPECIFIC (spec = pct_in - pct_out >= {min_specificity}), most-specific first. "
+                        f"AND pass the marker-quality filter (pct_in>={min_in_group_fraction}, "
+                        f"pct_out<={max_out_group_fraction}, fold_change>={min_fold_change}), most-specific first. "
                         "Each gene shows mean_in (mean log-normalized EXPRESSION in-cluster), pct_in/pct_out "
                         "and spec. For each cluster choose a MARKER-SET COMBINATION of >=3 genes that are both "
                         "HIGHLY EXPRESSED (high mean_in) and HIGHLY SPECIFIC (high spec, low pct_out), infer the "
@@ -537,14 +549,17 @@ def annotation_review(session, *, groupby: str = "leiden", top_n: int = 50, padj
     summary = {
         "groupby": groupby, "top_n": top_n, "n_clusters": len(payloads),
         "significance_filter": f"pvals_adj < {padj_max}", "padj_max": padj_max,
-        "specificity_filter": f"(pct_in - pct_out) >= {min_specificity} AND pct_out <= {max_pct_out}",
-        "min_specificity": min_specificity, "max_pct_out": max_pct_out,
+        "marker_filter": (f"pct_in >= {min_in_group_fraction} AND pct_out <= {max_out_group_fraction} "
+                          f"AND fold_change >= {min_fold_change}"),
+        "min_in_group_fraction": min_in_group_fraction, "max_out_group_fraction": max_out_group_fraction,
+        "min_fold_change": min_fold_change,
         "n_significant_total": n_sig_total, "n_specific_total": n_specific_total, "n_de_total": n_de_total,
         "tissue_context": tissue, "marker_db_used": False,
         "status_counts": status_counts, "flagged_clusters": flagged,
         "review_input": str(json_path),
         "note": f"DE-based annotation: de_table = top-{top_n} markers that are SIGNIFICANT (padj<{padj_max}) "
-                f"AND SPECIFIC (spec=pct_in-pct_out>={min_specificity}), most-specific first; the LLM assigns "
+                f"AND pass pct_in>={min_in_group_fraction}/pct_out<={max_out_group_fraction}/"
+                f"fold_change>={min_fold_change}, most-specific first; the LLM assigns "
                 "cell types WITHOUT a marker panel (tissue_context = soft prior), then calls apply_annotation. "
                 "'few_specific_markers' flags clusters lacking a distinct identity. Flags are panel-free QC only.",
     }
@@ -959,7 +974,8 @@ def _fine_score_genes(adata, genes, name):
                       "FINE_ANNOTATION_PROMPT), then calls apply_fine_annotation.")
 def fine_annotation_review(session, *, groupby: str = "leiden", compartment: str | None = None,
                            top_n: int = 40, padj_max: float = 0.05,
-                           min_specificity: float = 0.1, max_pct_out: float = 0.5, min_specific_markers: int = 3,
+                           min_in_group_fraction: float = 0.10, max_out_group_fraction: float = 0.10,
+                           min_fold_change: float = 1.5, min_specific_markers: int = 3,
                            sample_key: str = "sample_id",
                            major_key: str = "major_cell_type", malignancy_key: str = "malignancy",
                            confounder_keys: list | None = None, confounder_genes: dict | None = None,
@@ -988,12 +1004,23 @@ def fine_annotation_review(session, *, groupby: str = "leiden", compartment: str
                        recoverable=True, suggested_next_tools=["markers"])
     if "pvals_adj" in de.columns:
         de = de[de["pvals_adj"] < padj_max]
-    # SPECIFICITY axis (spec = pct_in - pct_out): within a compartment the broadly-shared epithelial
-    # genes (and ambient MALAT1/ribosomal) are NOT identity evidence; the surfaced list is significant
-    # AND specific so fine subtypes are told apart by genes they actually concentrate.
+    # MARKER-QUALITY filter — scanpy's CANONICAL sc.tl.filter_rank_genes_groups (pct_in / pct_out /
+    # fold-change; tunable PARAMS). For SUBTYPES the in-group floor is looser (a subtype marker may
+    # mark only part of the compartment) but the out-group ceiling + fold-change stay strict. The
+    # temporary filtered uns view is read back and dropped (fine_annotation_review stays non-mutating).
+    _FILT = "_scpilot_rgg_filtered"
+    sc.tl.filter_rank_genes_groups(adata, key="rank_genes_groups", key_added=_FILT,
+                                   min_in_group_fraction=min_in_group_fraction,
+                                   max_out_group_fraction=max_out_group_fraction,
+                                   min_fold_change=min_fold_change)
+    _qpairs = set(zip(*[sc.get.rank_genes_groups_df(adata, group=None, key=_FILT)[c].astype(str)
+                        for c in ("group", "names")]))   # (group, gene) passing the pct/FC bar
+    adata.uns.pop(_FILT, None)
     has_spec = {"pct_nz_group", "pct_nz_reference"}.issubset(de.columns)
     if has_spec:
         de = de.assign(spec=(de["pct_nz_group"] - de["pct_nz_reference"]).round(4))
+    # significant markers that ALSO passed the quality filter (keeps pts/spec for the evidence table)
+    de_q = de[[(g, n) in _qpairs for g, n in zip(de["group"].astype(str), de["names"].astype(str))]]
 
     de_cols = {"names": "gene", "logfoldchanges": "logFC", "pvals_adj": "padj",
                "pct_nz_group": "pct_in", "pct_nz_reference": "pct_out", "spec": "spec", "scores": "score"}
@@ -1028,9 +1055,9 @@ def fine_annotation_review(session, *, groupby: str = "leiden", compartment: str
     for cl in sorted(obs_g.unique()):
         cl = str(cl)
         sub = de[de["group"].astype(str) == cl]
-        # significant AND specific (delta + out-group ceiling), most-specific first.
-        spec_sub = sub[(sub["spec"] >= min_specificity) & (sub["pct_nz_reference"] <= max_pct_out)] \
-            .sort_values("spec", ascending=False) if has_spec else sub
+        # quality-passing (filter_rank_genes_groups) markers for this subcluster, most-specific first.
+        spec_sub = de_q[de_q["group"].astype(str) == cl]
+        spec_sub = spec_sub.sort_values("spec", ascending=False) if has_spec else spec_sub
         n_specific = int(len(spec_sub))
         top = spec_sub.head(top_n)
         mask = (obs_g == cl).values
@@ -1095,7 +1122,8 @@ def fine_annotation_review(session, *, groupby: str = "leiden", compartment: str
     json_path.write_text(json.dumps({
         "groupby": groupby, "compartment": overall_comp,
         "padj_max": padj_max,
-        "specificity_filter": f"(pct_in - pct_out) >= {min_specificity} AND pct_out <= {max_pct_out}",
+        "marker_filter": (f"pct_in >= {min_in_group_fraction} AND pct_out <= {max_out_group_fraction} "
+                          f"AND fold_change >= {min_fold_change}"),
         "confounder_keys_used": conf_cols,
         "confounder_genes_used": scored_used,
         "instruction": "Tier-2 (subtype) annotation. de_table shows mean_in (mean log-norm EXPRESSION), pct, "
@@ -1124,8 +1152,10 @@ def fine_annotation_review(session, *, groupby: str = "leiden", compartment: str
 
     summary = {
         "groupby": groupby, "compartment": overall_comp, "n_subclusters": len(payloads),
-        "specificity_filter": f"(pct_in - pct_out) >= {min_specificity} AND pct_out <= {max_pct_out}",
-        "min_specificity": min_specificity, "max_pct_out": max_pct_out,
+        "marker_filter": (f"pct_in >= {min_in_group_fraction} AND pct_out <= {max_out_group_fraction} "
+                          f"AND fold_change >= {min_fold_change}"),
+        "min_in_group_fraction": min_in_group_fraction, "max_out_group_fraction": max_out_group_fraction,
+        "min_fold_change": min_fold_change,
         "confounder_keys_used": conf_cols, "confounder_genes_used": scored_used,
         "evidence_input": str(json_path),
         "note": "Evidence only — no fine call. de_table is SIGNIFICANT AND SPECIFIC markers (spec=pct_in-pct_out, "

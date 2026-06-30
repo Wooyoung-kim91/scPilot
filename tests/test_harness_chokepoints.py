@@ -582,7 +582,9 @@ def test_phase_d_fine_facs_primary(tmp_path):
     s.adata.obs["major_cell_type"] = ["T cell"] * s.adata.n_obs                   # compartment context
     assert tools.run("markers", s, groupby="leiden").status == "success"
 
-    rev = tools.run("fine_annotation_review", s, groupby="leiden")
+    # packaging/parity test → loosen the marker-quality filter so synthetic markers survive
+    rev = tools.run("fine_annotation_review", s, groupby="leiden", min_in_group_fraction=0.0,
+                    max_out_group_fraction=1.0, min_fold_change=1.0)
     assert rev.status == "success"
     art = next(a.path for a in rev.artifacts if a.path.endswith("fine_annotation_evidence.json"))
     data = json.loads(open(art).read())
@@ -682,7 +684,9 @@ def test_phase_b_annotation_evidence(tmp_path):
     assert tools.run("cluster", s, resolution=0.5).status == "success"
     assert tools.run("markers", s, groupby="leiden").status == "success"
 
-    rev = tools.run("annotation_review", s, groupby="leiden")
+    # packaging/exposure test → loosen the marker-quality filter so synthetic markers survive
+    rev = tools.run("annotation_review", s, groupby="leiden", min_in_group_fraction=0.0,
+                    max_out_group_fraction=1.0, min_fold_change=1.0)
     assert rev.status == "success"
     art = next(a.path for a in rev.artifacts if a.path.endswith("annotation_review.json"))
     data = json.loads(open(art).read())

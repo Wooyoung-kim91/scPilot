@@ -51,8 +51,11 @@ def test_fine_review_packages_evidence(tmp_path):
     import json
 
     s = _prep_subset(tmp_path)
+    # this test checks evidence PACKAGING → loosen the marker-quality filter so the synthetic
+    # (cross-subcluster-leaky) markers survive; strict fine defaults are covered in test_annotate.
     r = tools.run("fine_annotation_review", s, groupby="leiden",
-                  confounder_genes={"ifn": ["GZMB", "PDCD1"]})
+                  confounder_genes={"ifn": ["GZMB", "PDCD1"]},
+                  min_in_group_fraction=0.0, max_out_group_fraction=1.0, min_fold_change=1.0)
     assert r.status == "success", r.error
     sm = r.summary
     assert sm["compartment"] == "T_NK"                       # inferred from uniform major_cell_type

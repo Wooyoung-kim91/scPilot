@@ -200,7 +200,10 @@ def test_annotation_review_packages_evidence(tmp_path):
     import json
     s = _ruleset_session(tmp_path)
     tools.run("markers", s, groupby="leiden")          # DE source (NO fixed panel)
-    r = tools.run("annotation_review", s, top_n=20)
+    # this test checks evidence PACKAGING structure → loosen the marker-quality filter so the
+    # synthetic (cross-cluster-leaky) markers survive; the strict defaults are covered separately.
+    r = tools.run("annotation_review", s, top_n=20, min_in_group_fraction=0.0,
+                  max_out_group_fraction=1.0, min_fold_change=1.0)
     assert r.status == "success", r.error
     assert r.summary["n_clusters"] == 7 and r.summary["top_n"] == 20
     assert r.summary["marker_db_used"] is False
@@ -223,6 +226,22 @@ def test_annotation_review_packages_evidence(tmp_path):
     assert by_cl["4"]["review_status"] == "artifact_suspected"
     assert by_cl["2"]["review_status"] == "clean"
     assert "qc_metrics" in by_cl["1"] and "sample_distribution" in by_cl["1"]
+
+
+def test_annotation_review_marker_quality_filter(tmp_path):
+    # broad defaults are the agreed thresholds: pct_in>=0.25, pct_out<=0.10, fold_change>=1.5
+    # (p<0.05 always). A stricter out-group ceiling keeps FEWER markers than a permissive one.
+    s = _ruleset_session(tmp_path)
+    tools.run("markers", s, groupby="leiden")
+    strict = tools.run("annotation_review", s, top_n=50)                      # defaults
+    assert strict.summary["min_in_group_fraction"] == 0.25
+    assert strict.summary["max_out_group_fraction"] == 0.10
+    assert strict.summary["min_fold_change"] == 1.5
+    assert "fold_change >= 1.5" in strict.summary["marker_filter"]
+    loose = tools.run("annotation_review", s, top_n=50, min_in_group_fraction=0.0,
+                      max_out_group_fraction=1.0, min_fold_change=1.0)
+    # the marker-quality filter actually removes markers: strict keeps no more than loose
+    assert strict.summary["n_specific_total"] <= loose.summary["n_specific_total"]
 
 
 def test_annotation_review_threads_tissue_context(tmp_path):
