@@ -214,43 +214,58 @@ def _notebook_cell(cid: str, stage: str, params: dict, seed: int = 0,
 
 
 def _step_script(idx: int, cid: str, stage: str, params: dict, seed: int, snapshot_rel: str,
-                 input_lit: str, reasoning: str | None = None, is_first: bool = False) -> str:
-    """One STANDALONE numbered step script (``code/NN_<stage>.py``) — the per-step tutorial form:
-    shebang + docstring (name / why / parameters / outputs / run-command), pinned-source setup, the
-    single tool call with EXPLICIT params, then status/summary/plot-paths. Run the NN_*.py files IN
-    ORDER: step 00 opens the repro session and loads the input; later steps open the same session so
-    its latest checkpoint auto-loads (state flows through checkpoints, one process per step)."""
+                 in_expr: str, reasoning: str | None = None, is_first: bool = False) -> str:
+    """One numbered step script (``code/NN_<stage>.py``) in the per-step tutorial chain.
+
+    Each step reads the previous step's ``standalone_data/NN_<stage>.h5ad`` and writes its own, so
+    the files chain when run IN ORDER. Stages that have been transpiled (``scriptgen.EMITTERS``)
+    emit STANDALONE plain-scanpy code (no scpilot import); stages not yet transpiled fall back to a
+    thin scpilot-backed step that reads/writes the SAME h5ad chain — so converting a tool to
+    standalone is a drop-in replacement and the chain never breaks mid-rollout."""
+    from . import scriptgen
+
+    standalone = scriptgen.build(idx, cid, stage, params, in_expr, reasoning=reasoning)
+    if standalone is not None:
+        return standalone
+
+    # ---- fallback: not-yet-transpiled stage, still scpilot-backed (h5ad-chained) ----
     if params:
-        md = "\n".join(f"#   - {k} = {v!r}" for k, v in params.items())
+        md = "\n".join(f"  - {k} = {v!r}" for k, v in params.items())
         kw = "".join(f"    {k}={v!r},\n" for k, v in params.items())
         call = f'_res = tools.run("{stage}", sess,\n{kw})'
     else:
-        md = "#   - (no parameters — tool defaults)"
+        md = "  - (no parameters — tool defaults)"
         call = f'_res = tools.run("{stage}", sess)'
     why = ("why: " + " ".join(str(reasoning).split())[:400]) if reasoning else \
         "scpilot deterministic step (re-pins its recorded seed → reproducible)."
-    load = ("sess.load_input()                       # step 00 loads the input\n" if is_first
-            else "# (steps after 00 open the existing session → its latest checkpoint auto-loads)\n")
     return (
         f'#!/usr/bin/env python\n"""\n'
-        f'{cid}_{stage}.py — scpilot pipeline step {idx} (AUTO-GENERATED tutorial; run the NN_*.py files IN ORDER)\n'
+        f'{cid}_{stage}.py — scpilot pipeline step {idx} (NOT YET TRANSPILED — still uses scpilot; '
+        f'will become standalone scanpy). Run the NN_*.py files IN ORDER.\n'
         f'{why}\n'
         f'parameters:\n{md}\n'
-        f'산출: checkpoints/ (mutating step) + any artifacts/\n'
-        f'실행: <scpilot-env>/bin/python {cid}_{stage}.py\n"""\n'
+        f'outputs: standalone_data/{cid}_{stage}.h5ad\n"""\n'
         f'import json, sys\n'
         f'from pathlib import Path\n'
         f'_HERE = Path(__file__).resolve().parent\n'
         f'sys.path.insert(0, str(_HERE / "{snapshot_rel}"))   # pinned scpilot source\n'
-        f'_RUN_DIR = _HERE.parent\n'
+        f'_DATA = _HERE.parent / "standalone_data"\n'
+        f'_DATA.mkdir(exist_ok=True)\n'
         f'from scpilot import tools\n'
         f'from scpilot.repro import set_global_seed\n'
         f'from scpilot.session import Session\n'
         f'from scpilot.core.autoplot import auto_plots\n\n'
         f'set_global_seed({seed})\n'
-        f'sess = Session.create(str(_RUN_DIR / "repro_pipeline"), input_path={input_lit}, exist_ok=True)\n'
-        f'{load}{call}\n'
-        f'print("[{cid}] {stage}:", _res.status, _res.determinism_grade or "")\n'
+        f'IN  = {in_expr}\n'
+        f'OUT = _DATA / "{cid}_{stage}.h5ad"\n'
+        f'sess = Session.create(str(_DATA / "_sess_{cid}_{stage}"), input_path=str(IN), exist_ok=True)\n'
+        # step 0 reads the raw session input (e.g. a profile YAML) — the ingest/load tool loads it
+        # itself; later steps explicitly load the previous step's h5ad as the chain input.
+        + ("" if is_first
+           else f'sess.load_input(path=str(IN))            # read the previous step\'s h5ad (chain input)\n')
+        + f'{call}\n'
+        f'sess.adata.write_h5ad(OUT)               # hand off to the next step\n'
+        f'print("[{cid}] {stage}:", _res.status, _res.determinism_grade or "", "->", OUT.name)\n'
         f'for _w in (_res.warnings or []):\n'
         f'    print("    warn:", _w)\n'
         f'if _res.error:\n'
@@ -699,15 +714,19 @@ class Session:
                 if o.get("reasoning"):
                     reason_by_hash[o.get("recipe_hash")] = o.get("reasoning")
         written: list[str] = []
+        prev_cid_stage: str | None = None       # previous step's h5ad basename (chain input)
         for i, r in enumerate(runs):
             stage, params = r.get("tool"), r.get("params", {}) or {}
             step_seed = r.get("seed")
             if step_seed is None:
                 step_seed = int(params["seed"]) if "seed" in params else 0
             cid = f"{i:02d}"
-            text = _step_script(i, cid, stage, params, int(step_seed), snapshot_rel, repr(inp),
+            # chain input: step 0 reads the raw session input; later steps read the prior step's h5ad
+            in_expr = repr(inp) if prev_cid_stage is None else f'_DATA / "{prev_cid_stage}.h5ad"'
+            text = _step_script(i, cid, stage, params, int(step_seed), snapshot_rel, in_expr,
                                 reasoning=reason_by_hash.get(r.get("recipe_hash")), is_first=(i == 0))
             path = self.code_dir / f"{cid}_{stage}.py"
+            prev_cid_stage = f"{cid}_{stage}"
             with atomic_path(path) as tmp:
                 tmp.write_text(text)
             written.append(str(path))

@@ -31,9 +31,9 @@ DE_METHOD = "wilcoxon"   # FIXED for cell-type marker DE — not a parameter (se
 def markers(session, *, groupby: str = "leiden", n_genes: int = 25, layer: str | None = "scale.data",
             sample_key: str = "sample_id",
             max_genes_ranked: int | None = DEFAULT_MAX_GENES_RANKED, **params) -> S.ToolResult:
-    import numpy as np
     import pandas as pd
-    import scanpy as sc
+
+    from .. import recipes
 
     t0 = time.time()
     if max_genes_ranked is not None and max_genes_ranked < 1:
@@ -50,15 +50,13 @@ def markers(session, *, groupby: str = "leiden", n_genes: int = 25, layer: str |
 
     # Codex review 1.5 requested full-rank artifacts; keep that path available when
     # max_genes_ranked=None, but default to a bounded ranking for large datasets.
-    rank_n = int(adata.n_vars if max_genes_ranked is None else min(max_genes_ranked, adata.n_vars))
+    # The Wilcoxon rank_genes_groups call lives in scpilot.recipes (scpilot-free) so the generated
+    # standalone tutorial script inlines the SAME source — logic-identical by construction.
+    adata, rank_n = recipes.markers_rank(adata, groupby=groupby, layer=use_layer,
+                                         max_genes_ranked=max_genes_ranked)
     csv_is_full = rank_n == int(adata.n_vars)
     if not csv_is_full:
         warnings.append(f"ranking capped to top {rank_n} genes per cluster (of {adata.n_vars})")
-    # The inline preview is capped separately by n_genes.
-    # pts=True → per-cluster expressed fractions (pct_in / pct_out), consumed by
-    # annotation_review as DE evidence for the marker-DB-free LLM annotation.
-    sc.tl.rank_genes_groups(adata, groupby=groupby, method=DE_METHOD, layer=use_layer,
-                            use_raw=False, n_genes=rank_n, pts=True)
     rg = adata.uns["rank_genes_groups"]
     groups = list(rg["names"].dtype.names)
     preview_n = min(n_genes, adata.n_vars)

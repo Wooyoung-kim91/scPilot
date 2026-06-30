@@ -269,6 +269,7 @@ def qc_filter(session, *, min_genes: int = 200, max_pct_mt: float = 20.0,
               drop_predicted_doublets: bool = False, sample_key: str = "sample_id",
               **params) -> S.ToolResult:
     import numpy as np
+    from .. import recipes
 
     t0 = time.time()
     adata = session.adata
@@ -278,18 +279,15 @@ def qc_filter(session, *, min_genes: int = 200, max_pct_mt: float = 20.0,
                        suggested_next_tools=["qc_metrics"])
 
     n0 = adata.n_obs
-    keep = (adata.obs["n_genes_by_counts"] >= min_genes) & (adata.obs["pct_counts_mt"] <= max_pct_mt)
-    if min_counts > 0 and "total_counts" in adata.obs:
-        keep &= adata.obs["total_counts"] >= min_counts
-    if max_doublet_score is not None and "doublet_score" in adata.obs:
-        ds = adata.obs["doublet_score"]
-        keep &= (ds <= max_doublet_score) | ds.isna()      # keep cells with no score
-    if drop_predicted_doublets and "predicted_doublet" in adata.obs:
-        keep &= ~adata.obs["predicted_doublet"].fillna(False).astype(bool)
+    # core keep-mask logic lives in scpilot.recipes (scpilot-free) so the generated standalone
+    # tutorial script inlines the SAME source — tool and script are logic-identical by construction.
+    keep = recipes.qc_filter_mask(
+        adata, min_genes=min_genes, max_pct_mt=max_pct_mt, min_counts=min_counts,
+        max_doublet_score=max_doublet_score, drop_predicted_doublets=drop_predicted_doublets)
 
     # guard: cutoffs that remove EVERYTHING must not checkpoint an empty object
     # (downstream PCA/clustering would fail opaquely) — Codex review 2.3
-    if not bool(keep.values.any()):
+    if not bool(keep.any()):
         return S.error("qc_filter", "convergence_failed",
                        "all cells removed by cutoffs — relax thresholds", recoverable=True,
                        summary={"n_cells_before": int(n0),
@@ -302,11 +300,11 @@ def qc_filter(session, *, min_genes: int = 200, max_pct_mt: float = 20.0,
     per_sample = {}
     if sample_key in adata.obs.columns:
         before = adata.obs[sample_key].astype(str).value_counts().to_dict()
-        after = adata.obs[sample_key].astype(str)[keep.values].value_counts().to_dict()
+        after = adata.obs[sample_key].astype(str)[keep].value_counts().to_dict()
         per_sample = {s: {"before": int(before.get(s, 0)), "after": int(after.get(s, 0))}
                       for s in before}
 
-    adata._inplace_subset_obs(keep.values)
+    adata._inplace_subset_obs(keep)
     # invariants are now enforced centrally in session.checkpoint() (plan B1) — no per-tool call.
 
     summary = {

@@ -19,17 +19,6 @@ from scpilot import schemas as S
 from scpilot.tools import register
 
 
-def _suggest_n_pcs(variance_ratio, *, floor: float = 0.01) -> int:
-    """Simple elbow: last PC whose individual variance ratio exceeds ``floor``."""
-    import numpy as np
-    vr = np.asarray(variance_ratio, dtype=float)
-    above = np.where(vr >= floor)[0]
-    return int(above[-1] + 1) if above.size else min(10, len(vr))
-
-
-_BATCH_OFF = {"none", "", "off", "false", "no"}   # explicit "disable batch-aware HVG" tokens
-
-
 @register("preprocess", mutating=True, long_running=False,
           description="normalize_total → log1p → HVG(seurat_v3, batch-aware) → PCA from the counts layer; "
                       "returns variance-ratio + HVG/elbow summary for choosing n_pcs (plan B4).")
@@ -37,81 +26,29 @@ def preprocess(session, *, target_sum: float = 1e4, n_top_genes: int = 2000,
                hvg_batch_key: str | None = None, min_cells_per_batch: int = 1000,
                n_pcs: int = 50, seed: int = 0, **params) -> S.ToolResult:
     import numpy as np
-    import scanpy as sc
+
+    from .. import recipes
 
     t0 = time.time()
     adata = session.adata
-    warnings: list[str] = []
 
     if "counts" not in adata.layers:
         return S.error("preprocess", "invalid_state",
                        "no 'counts' layer — seurat_v3 HVG + reproducible normalize need raw counts",
                        recoverable=False)
 
-    # --- normalize + log1p from counts (reproducible regardless of current X) ---
-    adata.X = adata.layers["counts"].copy()
-    sc.pp.normalize_total(adata, target_sum=target_sum)
-    sc.pp.log1p(adata)
-    # project convention (matches scqc merged): raw counts stay in `counts`,
-    # normalize_total+log1p values are stored in `scale.data` (kept for markers/annotation)
-    adata.layers["scale.data"] = adata.X.copy()
-
-    # --- HVG (seurat_v3, counts-based; batch-aware) ---
-    # Explicit OFF token disables batch-aware HVG outright (no auto-detect fallthrough) —
-    # the only way to truly turn it off (fixes the "can't disable batch HVG" trap).
-    batch_off = isinstance(hvg_batch_key, str) and hvg_batch_key.strip().lower() in _BATCH_OFF
-    batch_key = None if batch_off else hvg_batch_key
-    if batch_off:
-        warnings.append("hvg_batch_key disabled — global (non-batch-aware) HVG")
-    if batch_key and batch_key not in adata.obs.columns:
-        warnings.append(f"hvg_batch_key '{batch_key}' absent — HVG computed without batch")
-        batch_key = None
-    if batch_key is None and not batch_off:
-        # auto-detect a sample-like batch column so HVG is batch-aware by default (the
-        # caller/LLM may still override via hvg_batch_key). Skip degenerate/huge cardinality.
-        for cand in ("sample_id", "sample", "batch", "donor", "patient"):
-            if cand in adata.obs.columns:
-                try:
-                    nu = int(adata.obs[cand].nunique(dropna=True))
-                except Exception:  # noqa: BLE001
-                    continue
-                if 2 <= nu <= 200:
-                    batch_key = cand
-                    warnings.append(f"hvg_batch_key auto-detected: '{cand}' (n={nu}); "
-                                    "pass hvg_batch_key to override")
-                    break
-    # Tiny-batch guard: seurat_v3 fits a per-batch loess; batches with too few cells make
-    # the design singular ("reciprocal condition number" error). If any batch is below
-    # min_cells_per_batch, fall back to global HVG rather than crash.
-    if batch_key is not None:
-        vc = adata.obs[batch_key].value_counts()
-        tiny = vc[vc < min_cells_per_batch]
-        if len(tiny):
-            warnings.append(
-                f"hvg_batch_key '{batch_key}' has {len(tiny)} batch(es) < {min_cells_per_batch} cells "
-                f"(smallest={int(vc.min())}: {list(tiny.index[:3])}) — batch-aware HVG disabled to "
-                "avoid a singular per-batch loess; sample effects are corrected at integration")
-            batch_key = None
-    n_top = min(n_top_genes, adata.n_vars)
-    try:
-        sc.pp.highly_variable_genes(adata, flavor="seurat_v3", n_top_genes=n_top,
-                                    layer="counts", batch_key=batch_key)
-    except (ValueError, np.linalg.LinAlgError) as exc:
-        # last-resort auto-recovery: a singular per-batch loess (or similar) → retry global
-        if batch_key is None:
-            raise
-        warnings.append(f"batch-aware HVG failed ({type(exc).__name__}: {exc}); retried without batch")
-        batch_key = None
-        sc.pp.highly_variable_genes(adata, flavor="seurat_v3", n_top_genes=n_top,
-                                    layer="counts", batch_key=None)
-    n_hvg = int(adata.var["highly_variable"].sum())
-
-    # --- PCA on HVGs (no global scale; svd centers) ---
-    max_comps = max(1, min(n_pcs, adata.n_vars - 1, adata.n_obs - 1))
-    sc.pp.pca(adata, n_comps=max_comps, mask_var="highly_variable", random_state=seed)
-    vr = [round(float(x), 5) for x in adata.uns["pca"]["variance_ratio"]]
-    cum = float(np.cumsum(vr)[-1])
-    suggested = _suggest_n_pcs(vr)
+    # core transform (normalize → log1p → HVG → PCA) lives in scpilot.recipes (scpilot-free) so the
+    # generated standalone tutorial script inlines the SAME source — logic-identical by construction.
+    adata, info = recipes.preprocess(
+        adata, target_sum=target_sum, n_top_genes=n_top_genes, hvg_batch_key=hvg_batch_key,
+        min_cells_per_batch=min_cells_per_batch, n_pcs=n_pcs, seed=seed)
+    warnings = info["warnings"]
+    batch_key = info["batch_key"]
+    n_hvg = info["n_hvg"]
+    max_comps = info["n_pcs"]
+    vr = info["variance_ratio"]
+    cum = float(np.cumsum(vr)[-1]) if vr else 0.0
+    suggested = info["suggested_n_pcs_elbow"]
 
     session.manifest.x_state = "log1p"
     summary = {
@@ -124,7 +61,8 @@ def preprocess(session, *, target_sum: float = 1e4, n_top_genes: int = 2000,
         "x_state": "log1p", "normalized_layer": "scale.data",
     }
     cp = session.checkpoint("preprocess", x_state="log1p",
-                            params={"target_sum": target_sum, "n_top_genes": n_top,
+                            params={"target_sum": target_sum,
+                                    "n_top_genes": min(n_top_genes, adata.n_vars),
                                     "hvg_batch_key": batch_key, "n_pcs": max_comps, "seed": seed})
     return S.success("preprocess", summary=summary, warnings=warnings, checkpoint=cp.path,
                      determinism_grade="B", duration_s=round(time.time() - t0, 3),

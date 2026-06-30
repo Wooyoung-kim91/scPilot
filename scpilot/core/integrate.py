@@ -168,8 +168,7 @@ def integrate_harmony(session, *, batch_key: str = "GSM", use_rep: str = "X_pca"
                       out_key: str = "X_harmony", seed: int = 0, **params) -> S.ToolResult:
     if (err := require_capability("integrate_harmony")) is not None:
         return err
-    import numpy as np
-    import harmonypy
+    from .. import recipes
 
     t0 = time.time()
     adata = session.adata
@@ -181,10 +180,11 @@ def integrate_harmony(session, *, batch_key: str = "GSM", use_rep: str = "X_pca"
         return S.error("integrate_harmony", "data_gate_failed", f"batch_key '{batch_key}' absent in obs",
                        recoverable=False)
 
-    ho = harmonypy.run_harmony(adata.obsm[use_rep], adata.obs, [batch_key], random_state=seed)
-    Z = np.asarray(ho.Z_corr)                      # harmonypy 0.2.0 torch → numpy
-    Z = Z.T if Z.shape[0] == adata.obsm[use_rep].shape[1] else Z   # (cells × dims)
-    adata.obsm[out_key] = Z
+    # the harmonypy call lives in scpilot.recipes (scpilot-free) so the generated standalone tutorial
+    # script inlines the SAME logic — logic-identical by construction.
+    adata, hinfo = recipes.integrate_harmony(adata, batch_key=batch_key, use_rep=use_rep,
+                                             out_key=out_key, seed=seed)
+    Z = adata.obsm[out_key]
 
     summary = {
         "method": "harmony", "out_key": out_key, "batch_key": batch_key,
