@@ -375,6 +375,427 @@ print("    suggested cutoffs (MAD, choose qc_filter thresholds from these):", _c
 '''
 
 
+def _annotation_audit(cid: str, params: dict) -> str:
+    return f'''import json
+adata = sc.read_h5ad(IN)
+
+# parameters (edit freely) — marker-criteria bar + flag thresholds
+groupby = {_g(params, "groupby", "leiden")!r}
+label_key = {_g(params, "label_key", "major_cell_type")!r}
+fine_key, facs_key, final_key = {_g(params, "fine_key", "fine_cell_type")!r}, {_g(params, "facs_key", "facs_style_label")!r}, {_g(params, "final_key", "final_annotation")!r}
+malignancy_key, cnv_status_key, cnv_score_key = {_g(params, "malignancy_key", "malignancy")!r}, {_g(params, "cnv_status_key", "cnv_status")!r}, {_g(params, "cnv_score_key", "cnv_score")!r}
+sample_key, batch_key = {_g(params, "sample_key", "sample_id")!r}, {_g(params, "batch_key", "GSE")!r}
+doublet_key, stress_key, mt_key = {_g(params, "doublet_key", "predicted_doublet")!r}, {_g(params, "stress_key", "stress_score")!r}, {_g(params, "mt_key", "pct_counts_mt")!r}
+min_pct, min_lfc, padj_max = {_g(params, "min_pct", 0.25)!r}, {_g(params, "min_lfc", 1.0)!r}, {_g(params, "padj_max", 0.05)!r}
+min_specificity, max_pct_out, top_k_markers = {_g(params, "min_specificity", 0.1)!r}, {_g(params, "max_pct_out", 0.5)!r}, {_g(params, "top_k_markers", 15)!r}
+profile_similarity, single_source_frac = {_g(params, "profile_similarity", 0.5)!r}, {_g(params, "single_source_frac", 0.8)!r}
+doublet_frac, max_pct_mt, min_marker_support = {_g(params, "doublet_frac", 0.5)!r}, {_g(params, "max_pct_mt", 25.0)!r}, {_g(params, "min_marker_support", 0.5)!r}
+
+# case-insensitive symbol index; the LLM's OWN recorded marker-sets (no marker DB we own)
+_sidx = {{}}
+for _n in adata.var_names:
+    _sidx.setdefault(str(_n).upper(), _n)
+_msets_raw = (adata.uns.get("scpilot_annotation", {{}}).get("tier1_llm", {{}}) or {{}}).get("marker_sets", {{}}) or {{}}
+marker_sets = {{str(ct): [_sidx[str(g).upper()] for g in gs if str(g).upper() in _sidx] for ct, gs in _msets_raw.items()}}
+
+obs_g = adata.obs[groupby].astype(str)
+clusters = list(obs_g.cat.categories) if hasattr(obs_g, "cat") else sorted(obs_g.unique())
+
+# per-cluster DE: top specific markers + per-gene stats (the marker-criteria check)
+de_by_cluster, de_stats_by_cluster = {{}}, {{}}
+_rg = adata.uns.get("rank_genes_groups")
+if _rg and _rg.get("params", {{}}).get("groupby") == groupby:
+    _de = sc.get.rank_genes_groups_df(adata, group=None)
+    for _cl, _sub in _de.groupby("group", observed=True):
+        _s = _sub[_sub["pvals_adj"] < padj_max] if "pvals_adj" in _sub.columns else _sub
+        if {{"pct_nz_group", "pct_nz_reference"}}.issubset(_s.columns):
+            _spec = _s["pct_nz_group"] - _s["pct_nz_reference"]
+            _s2 = _s.assign(_spec=_spec)
+            _s2 = _s2[(_s2["_spec"] >= min_specificity) & (_s2["pct_nz_reference"] <= max_pct_out)].sort_values("_spec", ascending=False)
+            de_by_cluster[str(_cl)] = [str(g) for g in _s2["names"].head(top_k_markers)]
+        else:
+            de_by_cluster[str(_cl)] = [str(g) for g in _s["names"].head(top_k_markers)]
+        _stats = {{}}
+        _haspct = {{"pct_nz_group", "pct_nz_reference"}}.issubset(_sub.columns)
+        for _, _r in _sub.iterrows():
+            _pin = float(_r["pct_nz_group"]) if _haspct else float("nan")
+            _pout = float(_r["pct_nz_reference"]) if _haspct else float("nan")
+            _stats[str(_r["names"])] = {{
+                "logFC": round(float(_r["logfoldchanges"]), 3) if "logfoldchanges" in _sub.columns else None,
+                "padj": float(_r["pvals_adj"]) if "pvals_adj" in _sub.columns else None,
+                "pct_in": round(_pin, 3) if _haspct else None, "pct_out": round(_pout, 3) if _haspct else None,
+                "spec": round(_pin - _pout, 3) if (_haspct and not np.isnan(_pin)) else None}}
+        de_stats_by_cluster[str(_cl)] = _stats
+
+def _check_marker(st):
+    f = []
+    if st.get("pct_in") is not None and st["pct_in"] < min_pct: f.append("pct")
+    if st.get("logFC") is not None and st["logFC"] < min_lfc: f.append("lfc")
+    if st.get("padj") is not None and st["padj"] >= padj_max: f.append("pvalue")
+    return (not f), f
+
+def _col(k): return adata.obs[k].astype(str) if k in adata.obs.columns else None
+def _mode(s, m):
+    vc = s[m].value_counts()
+    return str(vc.index[0]) if len(vc) else ""
+
+fine_c, facs_c, final_c = _col(fine_key), _col(facs_key), _col(final_key)
+malig_c, cnvst_c = _col(malignancy_key), _col(cnv_status_key)
+has_cnv = cnv_score_key in adata.obs.columns
+cnv_score = adata.obs[cnv_score_key].astype(float) if has_cnv else None
+
+per_cluster, status_counts, label_to_clusters = [], {{"clean": 0, "flagged": 0}}, {{}}
+for cl in [str(c) for c in clusters]:
+    mask = (obs_g == cl).values
+    n_cells = int(mask.sum())
+    if not n_cells: continue
+    label = _mode(adata.obs[label_key].astype(str), mask)
+    label_to_clusters.setdefault(label, []).append(cl)
+    claimed = marker_sets.get(label, [])
+    cl_stats = de_stats_by_cluster.get(cl, {{}})
+    support_frac, marker_eval = None, []
+    if claimed and cl_stats:
+        n_pass = 0
+        for g in claimed:
+            st = cl_stats.get(g)
+            if st is None:
+                marker_eval.append({{"gene": g, "in_de": False, "passes": False, "failed_criteria": ["absent"]}}); continue
+            ok, failed = _check_marker(st); n_pass += int(ok)
+            marker_eval.append({{"gene": g, "in_de": True, "passes": ok, "failed_criteria": failed, **st}})
+        support_frac = round(n_pass / len(claimed), 3)
+    triple = {{"major": label, "fine": _mode(fine_c, mask) if fine_c is not None else None,
+              "facs": _mode(facs_c, mask) if facs_c is not None else None,
+              "final": _mode(final_c, mask) if final_c is not None else None}}
+    prov = {{}}
+    if sample_key in adata.obs.columns:
+        sv = adata.obs[sample_key].astype(str)[mask].value_counts(normalize=True)
+        prov["top_sample_frac"] = round(float(sv.iloc[0]), 3); prov["n_samples"] = int(adata.obs[sample_key].astype(str)[mask].nunique())
+    if batch_key in adata.obs.columns:
+        bv = adata.obs[batch_key].astype(str)[mask].value_counts(normalize=True)
+        prov["top_batch_frac"] = round(float(bv.iloc[0]), 3)
+        _p = bv.values; prov["batch_entropy"] = round(float(-(_p * np.log2(_p + 1e-12)).sum()), 3)
+    qc = {{}}
+    if doublet_key in adata.obs.columns:
+        qc["doublet_frac"] = round(float(np.asarray(adata.obs[doublet_key].values[mask], dtype=float).mean()), 3)
+    if mt_key in adata.obs.columns:
+        qc["median_pct_mt"] = round(float(np.median(adata.obs[mt_key].values[mask])), 2)
+    if stress_key in adata.obs.columns:
+        qc["median_stress"] = round(float(np.median(adata.obs[stress_key].astype(float).values[mask])), 3)
+    is_malignant = (_mode(malig_c, mask) == "malignant") if malig_c is not None else ((_mode(cnvst_c, mask) == "tumor") if cnvst_c is not None else False)
+    cnv_burden = round(float(cnv_score[mask].mean()), 4) if has_cnv else None
+    flags = []
+    if support_frac is not None and support_frac < min_marker_support: flags.append("weak_marker_support")
+    if prov.get("top_sample_frac", 0.0) >= single_source_frac: flags.append("single_patient_dominant")
+    if prov.get("top_batch_frac", 0.0) >= single_source_frac: flags.append("batch_dominant")
+    if qc.get("doublet_frac", 0.0) >= doublet_frac: flags.append("doublet_dominated")
+    if qc.get("median_pct_mt", 0.0) > max_pct_mt: flags.append("high_mt")
+    if is_malignant and not has_cnv: flags.append("malignant_without_cnv")
+    status = "flagged" if flags else "clean"; status_counts[status] += 1
+    per_cluster.append({{"cluster_id": cl, "n_cells": n_cells, "label": label, "hierarchy": triple,
+        "marker_set_claimed": claimed, "marker_set_support_frac": support_frac, "marker_criteria_check": marker_eval,
+        "top_specific_markers": de_by_cluster.get(cl, [])[:top_k_markers], "provenance": prov, "qc": qc,
+        "is_malignant": bool(is_malignant), "cnv_burden": cnv_burden, "flags": flags, "review_status": status}})
+
+# check 1: marker-profile collisions (high top-marker Jaccard, different label)
+collisions = []
+cl_sets = {{c["cluster_id"]: set(c["top_specific_markers"]) for c in per_cluster if c["top_specific_markers"]}}
+ids = list(cl_sets)
+for i in range(len(ids)):
+    for j in range(i + 1, len(ids)):
+        a, b = ids[i], ids[j]
+        la = next(c["label"] for c in per_cluster if c["cluster_id"] == a)
+        lb = next(c["label"] for c in per_cluster if c["cluster_id"] == b)
+        if la == lb: continue
+        inter = len(cl_sets[a] & cl_sets[b]); union = len(cl_sets[a] | cl_sets[b]) or 1
+        if inter / union >= profile_similarity:
+            collisions.append({{"clusters": [a, b], "labels": [la, lb], "marker_jaccard": round(inter / union, 3),
+                               "shared_markers": sorted(cl_sets[a] & cl_sets[b])[:10]}})
+
+flagged = [c["cluster_id"] for c in per_cluster if c["review_status"] == "flagged"]
+_audit = {{"groupby": groupby, "label_key": label_key, "clusters": per_cluster,
+          "marker_profile_collisions": collisions, "status_counts": status_counts, "flagged_clusters": flagged,
+          "n_marker_profile_collisions": len(collisions)}}
+(_DATA / (OUT.stem + "_audit.json")).write_text(json.dumps(_audit, indent=2, default=str))
+adata.write_h5ad(OUT)                                   # non-mutating: pass-through for the chain
+print("[{cid}] annotation_audit: %d clusters, flagged %s, %d collisions -> %s"
+      % (len(per_cluster), flagged, len(collisions), OUT.name))
+'''
+
+
+def _apply_annotation_audit(cid: str, params: dict) -> str:
+    return f'''adata = sc.read_h5ad(IN)
+
+# the INDEPENDENT reviewer's Tier-4 verdicts (edit freely)
+groupby = {_g(params, "groupby", "leiden")!r}
+label_key = {_g(params, "label_key", "major_cell_type")!r}
+status_key = {_g(params, "status_key", "annotation_audit_status")!r}
+review_required_key = {_g(params, "review_required_key", "annotation_review_required")!r}
+reviewer_model = {_g(params, "reviewer_model", None)!r}
+verdicts = {_g(params, "verdicts", {}) !r}
+
+obs_g = adata.obs[groupby].astype(str)
+vd = {{str(k): (v if isinstance(v, dict) else {{"status": str(v)}}) for k, v in verdicts.items()}}
+status_map = {{c: v.get("status", "confirmed") for c, v in vd.items()}}
+review_map = {{c: bool(v.get("review_required", v.get("status") != "confirmed")) for c, v in vd.items()}}
+adata.obs[status_key] = obs_g.map(lambda c: status_map.get(c, "confirmed")).astype("category")
+adata.obs[review_required_key] = obs_g.map(lambda c: review_map.get(c, False)).astype(bool)
+refuted_clusters = sorted(c for c, s in status_map.items() if s == "refuted")
+suspect_clusters = sorted(c for c, s in status_map.items() if s == "suspect")
+adata.uns.setdefault("scpilot_annotation", {{}})
+adata.uns["scpilot_annotation"]["tier4_audit"] = {{
+    "groupby": groupby, "label_key": label_key, "reviewer_model": reviewer_model, "verdicts": vd,
+    "n_refuted": len(refuted_clusters), "n_suspect": len(suspect_clusters),
+    "refuted_clusters": refuted_clusters,
+    "refuted_reasons": {{c: str(vd[c].get("note", "")) for c in refuted_clusters}},
+    "suspect_clusters": suspect_clusters,
+    "suspect_reasons": {{c: str(vd[c].get("note", "")) for c in suspect_clusters}},
+}}
+adata.write_h5ad(OUT)
+print("[{cid}] apply_annotation_audit: %d refuted, %d suspect -> %s"
+      % (len(refuted_clusters), len(suspect_clusters), OUT.name))
+'''
+
+
+def _annotation_review(cid: str, params: dict) -> str:
+    return f'''import json
+adata = sc.read_h5ad(IN)
+
+# parameters (edit freely) — marker-quality + significance thresholds
+groupby = {_g(params, "groupby", "leiden")!r}
+top_n = {_g(params, "top_n", 50)!r}
+padj_max = {_g(params, "padj_max", 0.05)!r}
+min_in_group_fraction = {_g(params, "min_in_group_fraction", 0.25)!r}
+max_out_group_fraction = {_g(params, "max_out_group_fraction", 0.10)!r}
+min_fold_change = {_g(params, "min_fold_change", 1.5)!r}
+min_specific_markers = {_g(params, "min_specific_markers", 3)!r}
+sample_key = {_g(params, "sample_key", "sample_id")!r}
+tissue = {_g(params, "tissue", None)!r}
+max_samples_reported = {_g(params, "max_samples_reported", 8)!r}
+single_source_frac = {_g(params, "single_source_frac", 0.8)!r}
+mt_key, max_pct_mt = {_g(params, "mt_key", "pct_counts_mt")!r}, {_g(params, "max_pct_mt", 25.0)!r}
+genes_key, min_genes = {_g(params, "genes_key", "n_genes_by_counts")!r}, {_g(params, "min_genes", 300.0)!r}
+doublet_key, doublet_frac = {_g(params, "doublet_key", "predicted_doublet")!r}, {_g(params, "doublet_frac", 0.5)!r}
+min_cells = {_g(params, "min_cells", 20)!r}
+
+# reuse the per-cluster DE that `markers` computed (with pts); keep only SIGNIFICANT up-markers
+de = sc.get.rank_genes_groups_df(adata, group=None)
+de = de[de["pvals_adj"] < padj_max]
+# marker-quality filter — scanpy's canonical filter_rank_genes_groups (pct_in/pct_out/fold-change)
+sc.tl.filter_rank_genes_groups(adata, key="rank_genes_groups", key_added="_rgg_filt",
+                               min_in_group_fraction=min_in_group_fraction,
+                               max_out_group_fraction=max_out_group_fraction,
+                               min_fold_change=min_fold_change)
+_q = sc.get.rank_genes_groups_df(adata, group=None, key="_rgg_filt")
+_qpairs = set(zip(_q["group"].astype(str), _q["names"].astype(str)))
+adata.uns.pop("_rgg_filt", None)
+de = de.assign(spec=(de["pct_nz_group"] - de["pct_nz_reference"]).round(4))
+de_q = de[[(g, n) in _qpairs for g, n in zip(de["group"].astype(str), de["names"].astype(str))]]
+
+obs_g = adata.obs[groupby].astype(str)
+_cols = {{"names": "gene", "logfoldchanges": "logFC", "pvals_adj": "padj",
+          "pct_nz_group": "pct_in", "pct_nz_reference": "pct_out", "spec": "spec", "scores": "score"}}
+payloads = []
+status_counts = {{"clean": 0, "review": 0, "artifact_suspected": 0}}
+for cl, sub in de.groupby("group", observed=True):
+    cl = str(cl)
+    n_sig = int(len(sub))
+    spec_sub = de_q[de_q["group"].astype(str) == cl].sort_values("spec", ascending=False)
+    n_specific = int(len(spec_sub))
+    top = spec_sub.head(top_n)
+    mask = (obs_g == cl).values
+    n_cells = int(mask.sum())
+    _genes = [str(g) for g in top["names"] if str(g) in adata.var_names]
+    _mean = {{}}
+    if _genes and n_cells:
+        _vals = np.asarray(adata[:, _genes].X[mask].mean(axis=0)).ravel()
+        _mean = {{_genes[k]: round(float(_vals[k]), 4) for k in range(len(_genes))}}
+    de_table = [{{**{{_cols[c]: (round(float(r[c]), 4) if c != "names" else str(r[c]))
+                     for c in _cols if c in de.columns}}, "mean_in": _mean.get(str(r["names"]))}}
+                for _, r in top.iterrows()]
+    sample_dist, single_source = {{}}, False
+    if sample_key in adata.obs.columns:
+        sv = adata.obs[sample_key].astype(str)[mask].value_counts(normalize=True)
+        sample_dist = {{str(k): round(float(v), 3) for k, v in sv.head(max_samples_reported).items()}}
+        single_source = bool(sv.iloc[0] >= single_source_frac)
+    qc = {{}}
+    if mt_key in adata.obs.columns:
+        qc["median_pct_mt"] = round(float(np.median(adata.obs[mt_key].values[mask])), 2)
+    if genes_key in adata.obs.columns:
+        qc["median_n_genes"] = round(float(np.median(adata.obs[genes_key].values[mask])), 1)
+    if doublet_key in adata.obs.columns:
+        qc["doublet_frac"] = round(float(np.asarray(adata.obs[doublet_key].values[mask], dtype=float).mean()), 3)
+    doublet_dominated = doublet_key in adata.obs.columns and qc.get("doublet_frac", 0.0) >= doublet_frac
+    low_quality = (mt_key in adata.obs.columns and qc.get("median_pct_mt", 0) > max_pct_mt) or \\
+                  (genes_key in adata.obs.columns and qc.get("median_n_genes", 1e9) < min_genes)
+    risk = []
+    if doublet_dominated or low_quality:
+        status = "artifact_suspected"
+        if doublet_dominated: risk.append("doublet_dominated")
+        if low_quality: risk.append("low_quality_qc")
+    elif single_source or n_cells < min_cells or n_specific < min_specific_markers:
+        status = "review"
+        if single_source: risk.append("single_source")
+        if n_cells < min_cells: risk.append("tiny_cluster")
+        if n_specific < min_specific_markers: risk.append("few_specific_markers")
+    else:
+        status = "clean"
+    status_counts[status] += 1
+    payloads.append({{"cluster_id": cl, "cluster_size": n_cells, "n_significant_markers": n_sig,
+                      "n_specific_markers": n_specific, "review_status": status, "risk_signals": risk,
+                      "sample_distribution": sample_dist, "qc_metrics": qc, "de_table": de_table}})
+
+flagged = [p["cluster_id"] for p in payloads if p["review_status"] != "clean"]
+_review = {{"groupby": groupby, "top_n": top_n, "tissue_context": tissue,
+           "significance_filter": "pvals_adj < %s" % padj_max,
+           "status_counts": status_counts, "flagged_clusters": flagged, "clusters": payloads}}
+(_DATA / (OUT.stem + "_review.json")).write_text(json.dumps(_review, indent=2, default=str))
+adata.write_h5ad(OUT)                                   # non-mutating: pass-through for the chain
+print("[{cid}] annotation_review: %d clusters, flagged %s -> %s"
+      % (len(payloads), flagged, OUT.name))
+'''
+
+
+def _detect_state(cid: str, params: dict) -> str:
+    # non-mutating: classify how far the h5ad has been processed; pass adata through
+    return f'''adata = sc.read_h5ad(IN)
+
+_layers = set(adata.layers.keys()); _obsm = set(adata.obsm.keys())
+_obsp = set(adata.obsp.keys()); _obs = set(adata.obs.columns); _uns = set(adata.uns.keys())
+# best-effort guess of what .X holds
+try:
+    _a = adata.X[:50]; _a = _a.toarray() if hasattr(_a, "toarray") else np.asarray(_a)
+    x_state = "raw_counts" if (_a.size and np.allclose(_a, np.round(_a)) and _a.min() >= 0) else "normalized"
+except Exception:
+    x_state = "raw_counts" if "counts" in _layers else "unknown"
+flags = {{
+    "has_counts": "counts" in _layers,
+    "normalized": x_state in ("normalized", "log1p") or "scale.data" in _layers,
+    "hvg": "highly_variable" in adata.var.columns,
+    "pca": "X_pca" in _obsm,
+    "neighbors": ("neighbors" in _uns) or ("distances" in _obsp) or ("connectivities" in _obsp),
+    "clustered": any(c in _obs for c in ("leiden", "louvain")),
+    "umap": "X_umap" in _obsm,
+    "annotated": any(c in _obs for c in ("major_cell_type", "fine_cell_type", "facs_style_label", "malignancy")),
+}}
+_order = ["raw", "normalized", "hvg", "pca", "neighbors", "clustered", "umap", "annotated"]
+_sat = [s for s in _order if (s == "raw" and flags["has_counts"]) or flags.get(s)]
+stage = _sat[-1] if _sat else "raw"
+(_DATA / (OUT.stem + "_state.txt")).write_text(stage)
+adata.write_h5ad(OUT)
+print("[{cid}] detect_state: stage=%s x_state=%s -> %s" % (stage, x_state, OUT.name))
+'''
+
+
+def _compartment_plan(cid: str, params: dict) -> str:
+    # non-mutating Tier-1->Tier-2 bridge evidence; pass adata through
+    return f'''import json
+adata = sc.read_h5ad(IN)
+
+# parameters (edit freely)
+groupby = {_g(params, "groupby", None)!r}
+batch_key = {_g(params, "batch_key", None)!r}
+sample_key = {_g(params, "sample_key", "sample_id")!r}
+min_cells = {_g(params, "min_cells", 50)!r}
+min_samples = {_g(params, "min_samples", 2)!r}
+single_source_frac = {_g(params, "single_source_frac", 0.8)!r}
+
+def _resolve(key, cands):
+    if key is not None:
+        return key if key in adata.obs.columns else None
+    for c in cands:
+        if c in adata.obs.columns:
+            return c
+    return None
+def _norm_entropy(counts, n_global):
+    p = np.asarray(counts, dtype=float); p = p[p > 0]; total = p.sum()
+    if total <= 0 or n_global <= 1: return 0.0
+    p = p / total
+    return round(float(-(p * np.log(p)).sum()) / np.log(n_global), 4)
+
+gkey = _resolve(groupby, ("major_cell_type", "celltype_consensus", "leiden"))
+bkey = _resolve(batch_key, ("GSE", "batch", "sample_id"))
+has_sample = sample_key in adata.obs.columns
+obs_g = adata.obs[gkey].astype(str)
+n_batches_global = int(adata.obs[bkey].astype(str).nunique()) if bkey else 0
+n_samples_global = int(adata.obs[sample_key].astype(str).nunique()) if has_sample else 0
+
+rows, branchable, blocked = [], [], []
+for comp in sorted(obs_g.unique()):
+    comp = str(comp); mask = (obs_g == comp).values; n_cells = int(mask.sum())
+    reasons = []; n_samples = 0; top_sample_frac = None; ent = None
+    if has_sample:
+        sv = adata.obs[sample_key].astype(str)[mask].value_counts(normalize=True)
+        n_samples = int(sv.size); top_sample_frac = round(float(sv.iloc[0]), 3)
+    if bkey:
+        bv = adata.obs[bkey].astype(str)[mask].value_counts()
+        ent = _norm_entropy(bv.values, n_batches_global)
+        if int(bv.size) == 1 and n_batches_global > 1: reasons.append("single_batch")
+        elif ent < 0.3 and int(bv.size) > 1: reasons.append("low_batch_mixing")
+    powered = n_cells >= min_cells and (n_samples >= min_samples if has_sample else True)
+    if n_cells < min_cells: reasons.append("below_min_cells(<%d)" % min_cells)
+    if has_sample and n_samples < min_samples: reasons.append("below_min_samples(<%d)" % min_samples)
+    (branchable if powered else blocked).append(comp)
+    rows.append({{"compartment": comp, "n_cells": n_cells, "n_samples": n_samples,
+                 "top_sample_frac": top_sample_frac, "batch_entropy_norm": ent,
+                 "branch_recommended": bool(powered), "block_reasons": reasons}})
+
+(_DATA / (OUT.stem + "_plan.json")).write_text(json.dumps(
+    {{"groupby": gkey, "batch_key": bkey, "branchable": branchable, "blocked": blocked, "compartments": rows}},
+    indent=2, default=str))
+adata.write_h5ad(OUT)                                   # non-mutating: pass-through for the chain
+print("[{cid}] compartment_plan: branchable=%s blocked=%s -> %s" % (branchable, blocked, OUT.name))
+'''
+
+
+def _benchmark(cid: str, params: dict) -> str:
+    # non-mutating scib comparison of integration embeddings; writes scib results CSV
+    return f'''from scib_metrics.benchmark import Benchmarker
+adata = sc.read_h5ad(IN)
+
+# parameters (edit freely)
+label_key = {_g(params, "label_key", "major_cell_type")!r}
+batch_key = {_g(params, "batch_key", "sample_id")!r}
+embeddings = {_g(params, "embeddings", None)!r} or ["X_pca", "X_harmony", "X_scVI"]
+drop_labels = {_g(params, "drop_labels", None)!r}
+if drop_labels is None:
+    drop_labels = ["Unknown", "Mixed/Artifact", "Low_quality", "ambiguous"]   # non-biological labels
+min_label_cells = {_g(params, "min_label_cells", 10)!r}
+subsample = {_g(params, "subsample", 60000)!r}
+seed = {_g(params, "seed", 0)!r}
+
+embs = [e for e in embeddings if e in adata.obsm]
+lab = adata.obs[label_key].astype(str)
+keep = ~lab.isin([str(x) for x in drop_labels])
+vc = lab[keep].value_counts()
+small = sorted(vc[vc < min_label_cells].index)
+if small:
+    keep = keep & ~lab.isin(small)
+idx = np.where(keep.values)[0]
+# stratified subsample (by label) for tractability
+rng = np.random.default_rng(seed); n_kept = int(idx.size)
+if subsample and n_kept > subsample:
+    labs = lab.values[idx]; sel = []
+    for L in np.unique(labs):
+        li = idx[labs == L]; take = min(li.size, max(1, int(round(subsample * li.size / n_kept))))
+        sel.append(rng.choice(li, size=take, replace=False))
+    idx = np.sort(np.concatenate(sel))
+bdata = adata[idx].copy()
+bdata.obs[label_key] = bdata.obs[label_key].astype(str).astype("category")
+bdata.obs[batch_key] = bdata.obs[batch_key].astype(str).astype("category")
+pre = "X_pca" if "X_pca" in embs else None
+bm = Benchmarker(bdata, batch_key=batch_key, label_key=label_key, embedding_obsm_keys=embs,
+                 pre_integrated_embedding_obsm_key=pre, n_jobs=-1, progress_bar=False)
+bm.benchmark()
+res = bm.get_results(min_max_scale=False, clean_names=False)
+res.to_csv(_DATA / (OUT.stem + "_scib.csv"))
+res_num = res.drop(index="Metric Type", errors="ignore")
+ranked = sorted((e for e in res_num.index if res_num.loc[e].get("Total") == res_num.loc[e].get("Total")),
+                key=lambda e: float(res_num.loc[e]["Total"]), reverse=True)
+adata.write_h5ad(OUT)                                   # non-mutating: pass-through for the chain
+print("[{cid}] benchmark: embeddings=%s best=%s -> %s" % (embs, ranked[0] if ranked else None, OUT.name))
+'''
+
+
 def _load(cid: str, params: dict) -> str:
     # entry step: read the input h5ad and pass it on as the chain's first checkpoint
     return (
@@ -417,6 +838,9 @@ def _harmonize_annotations(cid: str, params: dict) -> str:
 
 EMITTERS: dict = {
     "load": _load,
+    "detect_state": _detect_state,
+    "compartment_plan": _compartment_plan,
+    "benchmark": _benchmark,
     "qc_metrics": _qc_metrics,
     "qc_filter": _qc_filter,
     "preprocess": _preprocess,
@@ -424,6 +848,9 @@ EMITTERS: dict = {
     "cluster_sweep": _cluster_sweep,
     "markers": _markers,
     "integrate_harmony": _integrate_harmony,
+    "annotation_review": _annotation_review,
+    "annotation_audit": _annotation_audit,
+    "apply_annotation_audit": _apply_annotation_audit,
     "apply_annotation": _apply_annotation,
     "consensus_annotation": _consensus_annotation,
     "harmonize_annotations": _harmonize_annotations,

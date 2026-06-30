@@ -6,6 +6,7 @@ round-trips — executed as a real subprocess — to the identical result the sc
 
 import subprocess
 import sys
+from pathlib import Path
 
 import anndata as ad
 import numpy as np
@@ -134,6 +135,62 @@ def test_qc_metrics_standalone_matches_tool(tmp_path):
         assert (o["predicted_doublet"].to_numpy() == tool["predicted_doublet"].to_numpy()).all()
 
 
+def test_detect_state_standalone_matches_tool(tmp_path):
+    s = _session(tmp_path)
+    tools.run("preprocess", s, n_top_genes=30, n_pcs=15, seed=0)
+    tools.run("cluster", s, resolution=0.5, seed=0)
+    snap = tmp_path / "snap.h5ad"
+    s.adata.write_h5ad(snap)
+    r = tools.run("detect_state", s, path=str(snap))
+
+    _run_standalone(tmp_path, "02", "detect_state", {}, snap)
+    stage = (tmp_path / "standalone_data" / "02_detect_state_state.txt").read_text()
+    assert stage == r.summary["stage"]
+
+
+def test_compartment_plan_standalone_matches_tool(tmp_path):
+    import json
+    params = {"min_cells": 5, "min_samples": 1}
+    s, _ = _annotated_state(tmp_path)               # has major_cell_type
+    snap = tmp_path / "snap.h5ad"
+    s.adata.write_h5ad(snap)
+    r = tools.run("compartment_plan", s, **params)
+
+    _run_standalone(tmp_path, "07", "compartment_plan", params, snap)
+    plan = json.loads((tmp_path / "standalone_data" / "07_compartment_plan_plan.json").read_text())
+    assert sorted(map(str, plan["branchable"])) == sorted(map(str, r.summary["branchable"]))
+    assert sorted(map(str, plan["blocked"])) == sorted(map(str, r.summary["blocked"]))
+
+
+def test_benchmark_standalone_matches_tool(tmp_path):
+    import pytest
+    pytest.importorskip("scib_metrics")
+    pytest.importorskip("harmonypy")
+    s = _session(tmp_path)
+    tools.run("preprocess", s, n_top_genes=30, n_pcs=15, seed=0)
+    rh = tools.run("integrate_harmony", s, batch_key="sample_id", use_rep="X_pca", seed=0)
+    if rh.status != "success":
+        pytest.skip("harmony unavailable")
+    s.adata.obs["major_cell_type"] = np.where(np.arange(s.adata.n_obs) % 2 == 0, "A", "B")
+    params = {"label_key": "major_cell_type", "batch_key": "sample_id",
+              "embeddings": ["X_pca", "X_harmony"], "min_label_cells": 5, "subsample": None, "seed": 0}
+    snap = tmp_path / "snap.h5ad"
+    s.adata.write_h5ad(snap)
+    try:                                            # scib needs a sizable dataset; tiny fixture may not
+        r = tools.run("benchmark", s, **params)     # support kNN/LISI — skip rather than assert on noise
+    except Exception as exc:                        # noqa: BLE001
+        pytest.skip(f"scib Benchmarker cannot run on the tiny fixture: {type(exc).__name__}: {exc}")
+    if r.status != "success":
+        pytest.skip(f"benchmark unavailable on fixture: {r.error}")
+
+    import pandas as pd
+    _run_standalone(tmp_path, "08", "benchmark", params, snap)
+    std = pd.read_csv(tmp_path / "standalone_data" / "08_benchmark_scib.csv", index_col=0)
+    # the standalone scores the same embeddings the tool did (scib seed-pinned on identical inputs)
+    assert {"X_pca", "X_harmony"}.issubset(set(std.index))
+    assert set(r.summary["scores"].keys()).issubset(set(map(str, std.index)))
+
+
 def test_load_standalone_matches_tool(tmp_path):
     p = tmp_path / "in.h5ad"
     _fixture().write_h5ad(p)
@@ -216,6 +273,87 @@ def test_harmonize_annotations_standalone_matches_tool(tmp_path):
 
     out = _run_standalone(tmp_path, "04", "harmonize_annotations", params, snap)
     assert (out.obs["celltype_harmonized"].astype(str).to_numpy() == tool_lab).all()
+
+
+def test_annotation_review_standalone_matches_tool(tmp_path):
+    import json
+    params = {"groupby": "leiden", "min_in_group_fraction": 0.1, "max_out_group_fraction": 0.5,
+              "min_fold_change": 1.0}      # loose filter so the tiny fixture yields markers
+    s = _session(tmp_path)
+    tools.run("preprocess", s, n_top_genes=30, n_pcs=15, seed=0)
+    tools.run("cluster", s, resolution=0.5, seed=0)
+    tools.run("markers", s, groupby="leiden", max_genes_ranked=None)
+    snap = tmp_path / "snap.h5ad"
+    s.adata.write_h5ad(snap)
+    r = tools.run("annotation_review", s, **params)
+    tool_status = r.summary["status_counts"]
+    tool_flagged = sorted(map(str, r.summary["flagged_clusters"]))
+
+    _run_standalone(tmp_path, "07", "annotation_review", params, snap)
+    review = json.loads((tmp_path / "standalone_data" / "07_annotation_review_review.json").read_text())
+    assert review["status_counts"] == tool_status
+    assert sorted(map(str, review["flagged_clusters"])) == tool_flagged
+    # per-cluster specific-marker counts identical
+    tool_json = json.loads(Path(r.summary["review_input"]).read_text())
+    std_spec = {p["cluster_id"]: p["n_specific_markers"] for p in review["clusters"]}
+    assert {p["cluster_id"]: p["n_specific_markers"] for p in tool_json["clusters"]} == std_spec
+
+
+def _annotated_state(tmp_path):
+    """A post-apply_annotation session (leiden + markers + major_cell_type + marker_sets in uns)."""
+    s = _session(tmp_path)
+    tools.run("preprocess", s, n_top_genes=30, n_pcs=15, seed=0)
+    tools.run("cluster", s, resolution=0.5, seed=0)
+    tools.run("markers", s, groupby="leiden", max_genes_ranked=None)
+    clusters = sorted(s.adata.obs["leiden"].astype(str).unique())
+    labels = {c: f"CellType_{c}" for c in clusters}
+    # give each label a marker_set from its own top DE genes (so audit's check 2 has input)
+    import scanpy as sc
+    de = sc.get.rank_genes_groups_df(s.adata, group=None)
+    msets = {f"CellType_{c}": [str(g) for g in de[de["group"].astype(str) == c]["names"].head(4)]
+             for c in clusters}
+    tools.run("apply_annotation", s, groupby="leiden", labels=labels, marker_sets=msets)
+    return s, clusters
+
+
+def test_annotation_audit_standalone_matches_tool(tmp_path):
+    import json
+    params = {"groupby": "leiden", "label_key": "major_cell_type",
+              "min_specificity": 0.0, "max_pct_out": 1.0}    # loose so the tiny fixture yields markers
+    s, _ = _annotated_state(tmp_path)
+    snap = tmp_path / "snap.h5ad"
+    s.adata.write_h5ad(snap)
+    r = tools.run("annotation_audit", s, **params)
+    tool = json.loads(Path(r.summary["audit_input"]).read_text())
+
+    _run_standalone(tmp_path, "08", "annotation_audit", params, snap)
+    std = json.loads((tmp_path / "standalone_data" / "08_annotation_audit_audit.json").read_text())
+    assert std["status_counts"] == r.summary["status_counts"]
+    assert sorted(map(str, std["flagged_clusters"])) == sorted(map(str, r.summary["flagged_clusters"]))
+    assert std["n_marker_profile_collisions"] == r.summary["n_marker_profile_collisions"]
+    tool_sup = {c["cluster_id"]: c["marker_set_support_frac"] for c in tool["clusters"]}
+    std_sup = {c["cluster_id"]: c["marker_set_support_frac"] for c in std["clusters"]}
+    assert std_sup == tool_sup
+
+
+def test_apply_annotation_audit_standalone_matches_tool(tmp_path):
+    s, clusters = _annotated_state(tmp_path)
+    verdicts = {clusters[0]: {"status": "confirmed"},
+                clusters[1]: {"status": "suspect", "review_required": True, "note": "weak"},
+                clusters[-1]: {"status": "refuted", "note": "wrong lineage"}}
+    params = {"groupby": "leiden", "label_key": "major_cell_type", "verdicts": verdicts,
+              "reviewer_model": "claude-opus-4-8"}
+    snap = tmp_path / "snap.h5ad"
+    s.adata.write_h5ad(snap)
+    tools.run("apply_annotation_audit", s, **params)
+    tool_status = s.adata.obs["annotation_audit_status"].astype(str).to_numpy()
+    tool_t4 = s.adata.uns["scpilot_annotation"]["tier4_audit"]
+
+    out = _run_standalone(tmp_path, "09", "apply_annotation_audit", params, snap)
+    assert (out.obs["annotation_audit_status"].astype(str).to_numpy() == tool_status).all()
+    t4 = out.uns["scpilot_annotation"]["tier4_audit"]
+    assert list(map(str, t4["refuted_clusters"])) == list(map(str, tool_t4["refuted_clusters"]))
+    assert list(map(str, t4["suspect_clusters"])) == list(map(str, tool_t4["suspect_clusters"]))
 
 
 def test_apply_annotation_standalone_matches_tool(tmp_path):
