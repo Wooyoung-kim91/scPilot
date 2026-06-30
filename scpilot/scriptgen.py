@@ -655,6 +655,193 @@ print("[{cid}] annotation_review: %d clusters, flagged %s -> %s"
 '''
 
 
+_INGEST_BODY = r'''import yaml
+import anndata as ad
+from scipy import io, sparse
+
+# ---- read the dataset profile (the entry input) -----------------------------------------------
+prof = yaml.safe_load(open(IN)) or {}
+input_root = Path(prof["input_root"])
+if not input_root.is_absolute():
+    input_root = Path(prof.get("out_dir", ".")) / input_root
+metadata_csv = prof["metadata_csv"]
+sample_id_col = prof.get("sample_id_col", "sample_id")
+matrix_dir_col = prof.get("matrix_dir_col", "matrix_dir")
+batch_col = prof.get("batch_col", "batch")
+min_genes = prof.get("min_genes", 200)
+max_pct_mt = prof.get("max_pct_mt", 20.0)
+min_cells = prof.get("min_cells", 3)
+target_sum = prof.get("target_sum", 1e4)
+mito_prefix = prof.get("mito_prefix", "MT-")
+normalized_layer = prof.get("normalized_layer", "scale.data")
+harmonize = prof.get("harmonize", {}) or {}
+harmonize_overrides = prof.get("harmonize_overrides", {}) or {}
+filters = prof.get("filters", {}) or {}
+derive = prof.get("derive", []) or []
+
+# ---- metadata: load -> harmonize -> filter -> derive (profile-driven) -------------------------
+import re as _re
+def _norm(v):
+    s = "" if v is None else str(v)
+    s = _re.sub(r"[^0-9a-z]+", " ", s.strip().lower())
+    return _re.sub(r"\s+", " ", s).strip()
+def _cond_mask(df, c):
+    col, op, val = c["col"], c.get("op", "eq"), c.get("value")
+    if col not in df.columns:
+        return pd.Series(False, index=df.index)
+    s = df[col].astype(str)
+    if op == "eq": return s == str(val)
+    if op == "ne": return s != str(val)
+    if op == "eq_ci": return s.map(_norm) == _norm(val)
+    if op == "ne_ci": return s.map(_norm) != _norm(val)
+    if op == "in": return s.isin([str(x) for x in val])
+    if op == "not_in": return ~s.isin([str(x) for x in val])
+    if op == "in_ci": return s.map(_norm).isin({_norm(x) for x in val})
+    if op == "notna": return s.str.len() > 0
+    raise ValueError("unknown op: %s" % op)
+def _all(df, conds):
+    m = pd.Series(True, index=df.index)
+    for c in conds: m &= _cond_mask(df, c)
+    return m
+
+df = pd.read_csv(metadata_csv, dtype=str).fillna("")
+# harmonize raw values -> canonical (preserves <field>__raw)
+for field, mapping in harmonize.items():
+    if field not in df.columns: continue
+    syn = {}
+    for canon, raws in mapping.items():
+        for raw in raws: syn[_norm(raw)] = canon
+        syn[_norm(canon)] = canon
+    df["%s__raw" % field] = df[field]
+    out = []
+    for idx, raw in df[field].items():
+        batch = str(df.at[idx, batch_col]) if batch_col in df.columns else ""
+        over = harmonize_overrides.get(batch, {}).get(field, {})
+        osyn = {_norm(r): canon for canon, raws in over.items() for r in raws}
+        out.append(osyn.get(_norm(raw)) or syn.get(_norm(raw)) or raw)
+    df[field] = out
+# filters: include (keep matching ALL) then exclude (drop matching ANY)
+if filters.get("include"):
+    df = df[_all(df, filters["include"])].copy()
+if filters.get("exclude"):
+    drop = pd.Series(False, index=df.index)
+    for c in filters["exclude"]: drop |= _cond_mask(df, c)
+    df = df[~drop].copy()
+# derive: ordered label rules
+for rule in derive:
+    t = rule.get("type")
+    if t == "relabel":
+        m = _all(df, rule.get("where", []))
+        for col, val in rule["set"].items(): df.loc[m, col] = val
+    elif t == "case":
+        df[rule["target"]] = rule.get("default", "")
+        for case in rule.get("cases", []):
+            df.loc[_all(df, case.get("when", [])), rule["target"]] = case["value"]
+    elif t == "alias":
+        src = batch_col if rule["source"] == "__batch__" else rule["source"]
+        df[rule["target"]] = df[src]
+    elif t == "const":
+        df[rule["target"]] = rule["value"]
+    elif t == "isin_flag":
+        present = df[rule["source"]].astype(str).isin([str(x) for x in rule["values"]])
+        df[rule["target"]] = present.map({True: rule.get("true_value", "True"),
+                                          False: rule.get("false_value", "False")})
+
+# ---- per-sample 10x read + cell QC ------------------------------------------------------------
+def _first(paths):
+    return next((Path(p) for p in paths if Path(p).exists()), None)
+def _has_10x(p):
+    p = Path(p)
+    return (p / "matrix.mtx.gz").exists() or (p / "matrix.mtx").exists() or (p / "filtered_feature_bc_matrix.h5").exists()
+def _resolve_matrix_dir(row):
+    local = Path(str(row.get(matrix_dir_col, ""))); sid = str(row.get(sample_id_col, ""))
+    batch = str(row.get(batch_col, "")) if batch_col else ""
+    cands = []
+    def add(p):
+        p = Path(p)
+        if p not in cands: cands.append(p)
+    add(input_root / local)
+    if local.name == "filtered_feature_bc_matrix": add(input_root / local.parent)
+    parts = local.parts
+    if len(parts) >= 2:
+        rp = input_root / parts[0] / "raw" / Path(*parts[1:]); add(rp)
+        if rp.name == "filtered_feature_bc_matrix": add(rp.parent)
+    if batch and (input_root / batch / "raw").exists():
+        for m in sorted((input_root / batch / "raw").glob(sid + "*")):
+            add(m); add(m / "filtered_feature_bc_matrix")
+    for c in cands:
+        if _has_10x(c): return c
+    raise FileNotFoundError("no 10x files for %s; checked %s" % (sid, [str(c) for c in cands[:10]]))
+def _read_10x_robust(d):
+    d = Path(d)
+    mp = _first([d / "matrix.mtx.gz", d / "matrix.mtx"])
+    bp = _first([d / "barcodes.tsv.gz", d / "barcodes.tsv"])
+    fp = _first([d / "features.tsv.gz", d / "features.tsv", d / "genes.tsv.gz", d / "genes.tsv"])
+    X = io.mmread(str(mp)).T.tocsr()
+    bc = pd.read_csv(bp, sep="\t", header=None, compression="infer", dtype=str)[0].astype(str).values
+    ft = pd.read_csv(fp, sep="\t", header=None, compression="infer", dtype=str)
+    syms = (ft.iloc[:, 1] if ft.shape[1] >= 2 else ft.iloc[:, 0]).astype(str).values
+    a = ad.AnnData(X=X); a.obs_names = pd.Index(bc, name="barcode")
+    a.var_names = pd.Index(syms, name="gene_symbols"); a.var_names_make_unique()
+    return a
+
+adatas, keys, per_sample, n_fail = [], [], [], 0
+for _, row in df.iterrows():
+    row = row.to_dict(); sid = str(row[sample_id_col])
+    try:
+        mdir = _resolve_matrix_dir(row)
+        h5 = mdir / "filtered_feature_bc_matrix.h5"
+        has_mtx = (mdir / "matrix.mtx.gz").exists() or (mdir / "matrix.mtx").exists()
+        if h5.exists() and not has_mtx:
+            a = sc.read_10x_h5(str(h5), gex_only=True)
+        else:
+            try:
+                a = sc.read_10x_mtx(str(mdir), var_names="gene_symbols", make_unique=True)
+            except Exception:
+                a = _read_10x_robust(mdir)
+        a.var_names_make_unique(); a.X = a.X.astype(np.float32)
+        a.obs_names = ["%s_%s" % (sid, bc) for bc in a.obs_names.astype(str)]
+        a.obs["sample_id"] = sid
+        for k, v in row.items():
+            a.obs[k] = "" if pd.isna(v) else str(v)
+        a.var["mt"] = a.var_names.str.upper().str.startswith(mito_prefix.upper())
+        sc.pp.calculate_qc_metrics(a, qc_vars=["mt"], percent_top=None, log1p=False, inplace=True)
+        a.layers["counts"] = a.X.copy()
+    except Exception as exc:
+        per_sample.append({"sample": sid, "status": "read_fail:%s" % type(exc).__name__}); n_fail += 1
+        continue
+    raw_n = a.n_obs
+    keep = (a.obs["n_genes_by_counts"] >= min_genes) & (a.obs["pct_counts_mt"] <= max_pct_mt)
+    a = a[keep].copy()
+    per_sample.append({"sample": sid, "n_raw": int(raw_n), "n_kept": int(a.n_obs)})
+    if a.n_obs > 0:
+        adatas.append(a); keys.append(sid)
+
+# ---- merge (deterministic order) + gene filter + normalize ------------------------------------
+merged = ad.concat(adatas, join="outer", label="sample_id_from_concat", keys=keys,
+                   index_unique=None, merge="same", fill_value=0)
+merged.var_names_make_unique()
+if sparse.issparse(merged.X):
+    merged.X = merged.X.tocsr()
+merged.layers["counts"] = merged.X.copy()
+sc.pp.filter_genes(merged, min_cells=min_cells)
+merged.layers["counts"] = merged.X.copy()
+merged.X = merged.layers["counts"].copy()
+sc.pp.normalize_total(merged, target_sum=target_sum)
+sc.pp.log1p(merged)
+merged.layers[normalized_layer] = merged.X.copy()
+
+merged.write_h5ad(OUT)
+print("[__CID__] ingest: %d cells x %d genes from %d samples (%d failed) -> %s"
+      % (merged.n_obs, merged.n_vars, len(keys), n_fail, OUT.name))
+'''
+
+
+def _ingest(cid: str, params: dict) -> str:
+    # ingest reads the profile YAML at runtime; nothing to bake (params come from the profile)
+    return _INGEST_BODY.replace("__CID__", cid)
+
+
 def _detect_state(cid: str, params: dict) -> str:
     # non-mutating: classify how far the h5ad has been processed; pass adata through
     return f'''adata = sc.read_h5ad(IN)
@@ -837,6 +1024,7 @@ def _harmonize_annotations(cid: str, params: dict) -> str:
 
 
 EMITTERS: dict = {
+    "ingest": _ingest,
     "load": _load,
     "detect_state": _detect_state,
     "compartment_plan": _compartment_plan,

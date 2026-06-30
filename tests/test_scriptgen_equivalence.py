@@ -135,6 +135,66 @@ def test_qc_metrics_standalone_matches_tool(tmp_path):
         assert (o["predicted_doublet"].to_numpy() == tool["predicted_doublet"].to_numpy()).all()
 
 
+def _write_10x(dir_path, genes, n_cells, sid, rng):
+    """Write a cellranger-v3 filtered_feature_bc_matrix dir (gzipped mtx/barcodes/features)."""
+    import gzip
+    from scipy import io, sparse
+    dir_path.mkdir(parents=True, exist_ok=True)
+    X = sparse.csr_matrix(rng.poisson(1.0, (n_cells, len(genes))).astype("float32"))
+    with gzip.open(dir_path / "matrix.mtx.gz", "wb") as fh:
+        io.mmwrite(fh, X.T.tocoo())                 # 10x stores genes × cells
+    with gzip.open(dir_path / "barcodes.tsv.gz", "wt") as fh:
+        fh.write("\n".join(f"{sid}_BC{i}" for i in range(n_cells)) + "\n")
+    with gzip.open(dir_path / "features.tsv.gz", "wt") as fh:
+        fh.write("\n".join(f"ENSG{i}\t{g}\tGene Expression" for i, g in enumerate(genes)) + "\n")
+
+
+def _ingest_fixture(tmp_path):
+    """A 2-sample raw-10x dataset + metadata CSV + scpilot ingest profile."""
+    import pandas as pd
+    rng = np.random.default_rng(0)
+    genes = ["MT-CO1", "MT-ND1", "EPCAM", "CD3D", "PTPRC", "COL1A1"]
+    root = tmp_path / "cellranger"
+    rows = []
+    for k, sid in enumerate(["S1", "S2"]):
+        rel = f"{sid}/outs/filtered_feature_bc_matrix"
+        _write_10x(root / rel, genes, 12 + k * 4, sid, rng)
+        # NB: no 'sample_id' column — read_one_sample creates obs['sample_id'] from the library value
+        rows.append({"library": sid, "mtx_dir": rel, "condition": ["ctrl", "trt"][k]})
+    meta_csv = tmp_path / "samples.csv"
+    pd.DataFrame(rows).to_csv(meta_csv, index=False)
+    profile = tmp_path / "profile.yaml"
+    profile.write_text(
+        f"profile_name: testfix\ninput_root: {root}\nmetadata_csv: {meta_csv}\nout_dir: {tmp_path}\n"
+        "sample_id_col: library\nmatrix_dir_col: mtx_dir\nbatch_col: sample_id\n"
+        "min_genes: 0\nmax_pct_mt: 100.0\nmin_cells: 1\ntarget_sum: 10000.0\nmito_prefix: MT-\n"
+        "normalized_layer: scale.data\n")
+    return profile
+
+
+def test_ingest_standalone_matches_tool(tmp_path):
+    profile = _ingest_fixture(tmp_path)
+    s = Session.create(tmp_path / "sess", input_path=str(profile))
+    tools.run("ingest", s)
+    tool = s.adata
+    tool_counts = np.asarray(tool.layers["counts"].todense()) if hasattr(tool.layers["counts"], "todense") \
+        else np.asarray(tool.layers["counts"])
+
+    out = _run_standalone(tmp_path, "00", "ingest", {}, profile)
+    assert (out.n_obs, out.n_vars) == (tool.n_obs, tool.n_vars)
+    assert out.obs["sample_id"].astype(str).value_counts().to_dict() == \
+        tool.obs["sample_id"].astype(str).value_counts().to_dict()
+    assert sorted(out.var_names) == sorted(tool.var_names)
+    assert set(out.layers) >= {"counts", "scale.data"}
+    out_counts = np.asarray(out.layers["counts"].todense()) if hasattr(out.layers["counts"], "todense") \
+        else np.asarray(out.layers["counts"])
+    # align gene/cell order then compare raw counts
+    oo = out[tool.obs_names, tool.var_names]
+    oc = np.asarray(oo.layers["counts"].todense()) if hasattr(oo.layers["counts"], "todense") \
+        else np.asarray(oo.layers["counts"])
+    assert np.allclose(oc, tool_counts)
+
+
 def test_detect_state_standalone_matches_tool(tmp_path):
     s = _session(tmp_path)
     tools.run("preprocess", s, n_top_genes=30, n_pcs=15, seed=0)

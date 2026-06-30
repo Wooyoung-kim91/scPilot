@@ -731,17 +731,20 @@ def test_per_step_tutorial_scripts(tmp_path):
     s._append_jsonl(s.run_log_path, {"tool": "ingest", "status": "success", "seed": 0, "recipe_hash": "h0"})
     s._append_jsonl(s.run_log_path, {"tool": "qc_filter", "status": "success", "seed": 0,
                                      "recipe_hash": "h1", "params": {"min_genes": 500, "max_pct_mt": 15.0}})
+    s._append_jsonl(s.run_log_path, {"tool": "report", "status": "success", "seed": 0,
+                                     "recipe_hash": "h2"})   # no emitter -> exercises the fallback path
 
     written = s._write_step_scripts()
     names = [Path(f).name for f in written]
-    assert names == ["00_ingest.py", "01_qc_filter.py"]            # numbered, one file per step
+    assert names == ["00_ingest.py", "01_qc_filter.py", "02_report.py"]   # numbered, one file per step
     for f in written:                                              # every script is valid Python
         ast.parse(Path(f).read_text())
 
-    # step 0 (ingest): not yet transpiled -> scpilot fallback, but still writes the h5ad chain
+    # step 0 (ingest): transpiled -> STANDALONE (reads the dataset profile, no scpilot)
     ingest = Path(written[0]).read_text()
-    assert 'tools.run("ingest"' in ingest
-    assert 'OUT = _DATA / "00_ingest.h5ad"' in ingest             # produces the chain file
+    assert "import scpilot" not in ingest and "tools.run" not in ingest
+    assert "yaml.safe_load" in ingest                             # reads the profile YAML directly
+    assert 'OUT = _DATA / "00_ingest.h5ad"' in ingest            # produces the chain file
 
     # step 1 (qc_filter): transpiled -> STANDALONE plain scanpy, reads step 0's h5ad
     qc = Path(written[1]).read_text()
@@ -752,3 +755,9 @@ def test_per_step_tutorial_scripts(tmp_path):
     assert ">= 500" in qc and "<= 15.0" in qc                     # actual param values, inline in the ops
     assert "IN ORDER" in qc                                       # run-order guidance
     assert 'IN  = _DATA / "00_ingest.h5ad"' in qc                 # chained to the previous step
+
+    # step 2 (report): no emitter yet -> scpilot-backed FALLBACK, but same h5ad chain
+    rep = Path(written[2]).read_text()
+    assert 'tools.run("report"' in rep                            # fallback still uses the tool
+    assert 'IN  = _DATA / "01_qc_filter.h5ad"' in rep             # chained to the previous step
+    assert 'OUT = _DATA / "02_report.h5ad"' in rep
