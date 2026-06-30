@@ -52,7 +52,7 @@ DEFAULT_TOOLSET = [
     "integrate_scvi", "integrate_harmony", "harmonize_annotations", "benchmark",
     "compartment_plan", "compartment_subset",
     "fine_annotation_review", "apply_fine_annotation", "finalize_annotation",
-    "annotation_audit", "apply_annotation_audit",
+    "annotation_audit", "apply_annotation_audit", "harness_audit",
 ]
 
 # F9: hard ceiling on the autonomous tool-loop iterations (runaway-cost backstop).
@@ -146,6 +146,8 @@ _PARAM_HINTS: dict[str, dict] = {
                      "description": "cluster_id -> {status: confirmed|suspect|refuted, review_required: bool, "
                                     "note: reason} from the INDEPENDENT reviewer (no replacement label)"},
         "reviewer_model": {"type": "string", "description": "which model produced this second opinion (provenance)"}},
+    "harness_audit": {
+        "label_key": {"type": "string", "description": "annotation column to check (default major_cell_type)"}},
     "plots": {"kind": {"type": "string",
                        "enum": ["umap", "qc_violin", "scatter", "qc_thresholds", "resolution_sweep",
                                 "hvg", "pca_variance", "dotplot"],

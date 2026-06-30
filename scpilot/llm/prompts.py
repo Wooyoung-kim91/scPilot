@@ -244,6 +244,17 @@ CANONICAL FLOW (skip steps already satisfied per detect_state; stop when the goa
     (reviewer ≠ annotator) is preferred to complement each model's blind spots. (mode-2 `scpilot run`
     runs this loop automatically via --review / --reviewer-model / --annotator-model / --review-max-rounds.)
 
+12. harness_audit (GOVERNANCE completeness gate — run LAST). It re-reads the run-log + decisions +
+    obs/uns and checks that the harness's OWN action rules & invariants were actually honored (Tier-4
+    ran, flags→action, artifact clusters labeled, marker-DB-free, seeds/decisions/outputs recorded,
+    finalized). Any check that is 'fail'/'warn' is an ACTION ITEM: fix it (e.g. run the missing step,
+    label an artifact cluster, run the Tier-4 review) before declaring the analysis done — do not
+    ignore a violation.
+
+When MULTIPLE models annotated the SAME embedding (model diversification — e.g. major_cell_type from
+two engines), run harmonize_annotations(keys=[...]) to get a per-cell CONSENSUS label; clusters where
+the models DISAGREE are exactly what a human (or a cross-model reviewer) should arbitrate.
+
 When the analysis goal is achieved (or no further safe step exists), STOP calling tools
 and write a short final summary of what was done and the key results.
 """

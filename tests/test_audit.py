@@ -145,7 +145,38 @@ def test_apply_annotation_audit_rejects_bad_status(tmp_path):
 
 def test_audit_tools_registered():
     names = {t["name"] for t in tools.list_tools()}
-    assert {"annotation_audit", "apply_annotation_audit"} <= names
+    assert {"annotation_audit", "apply_annotation_audit", "harness_audit"} <= names
+
+
+def test_harness_audit_governance_scorecard(tmp_path):
+    # the governance/監視 agent: checks the harness's OWN action rules were honored.
+    s = _audit_session(tmp_path)
+    # COMPLIANT pipeline: marker-DB-free annotation + Tier-4 + finalize, all in the run-log
+    for tool in ["markers", "annotation_review", "apply_annotation", "annotation_audit",
+                 "apply_annotation_audit", "finalize_annotation"]:
+        s._append_jsonl(s.run_log_path, {"tool": tool, "status": "success", "seed": 0, "recipe_hash": tool})
+    s.adata.uns[UNS_ANNO]["tier4_audit"] = {"reviewer_model": "rev-model",
+                                            "refuted_clusters": [], "suspect_clusters": ["3"]}
+    s.adata.obs["annotation_review_required"] = (s.adata.obs["leiden"].astype(str) == "3")
+    r = tools.run("harness_audit", s)
+    assert r.status == "success"
+    st = {c["check"]: c["status"] for c in r.summary["checks"]}
+    assert st["tier4_review_ran"] == "pass"          # both audit steps present
+    assert st["marker_db_free"] == "pass"            # no annotate_broad
+    assert st["annotation_present"] == "pass" and st["finalized"] == "pass"
+    assert st["flags_lead_to_action"] == "pass"      # suspect cl3 → review_required set
+    assert r.summary["verdict"] == "complete"        # no hard failures
+
+    # VIOLATION: a run that used the legacy fixed panel and skipped Tier-4
+    (tmp_path / "v2").mkdir(parents=True, exist_ok=True)
+    s2 = _audit_session(tmp_path / "v2")
+    for tool in ["markers", "annotate_broad"]:
+        s2._append_jsonl(s2.run_log_path, {"tool": tool, "status": "success", "seed": 0, "recipe_hash": tool})
+    r2 = tools.run("harness_audit", s2)
+    st2 = {c["check"]: c["status"] for c in r2.summary["checks"]}
+    assert st2["tier4_review_ran"] == "fail"         # no annotation_audit/apply_annotation_audit
+    assert st2["marker_db_free"] == "warn"           # annotate_broad used
+    assert r2.summary["verdict"] == "incomplete" and "tier4_review_ran" in r2.summary["violations"]
 
 
 # ---------------------------------------------------------------------------

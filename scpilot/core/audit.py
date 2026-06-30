@@ -323,6 +323,81 @@ def annotation_audit(session, *, groupby: str = "leiden", label_key: str = "majo
                      suggested_next_tools=["apply_annotation_audit"])
 
 
+@register("harness_audit", mutating=False,
+          description="GOVERNANCE / process-completeness auditor (read-only, no judgment): reads the session's "
+                      "run-log + decisions + obs/uns and checks that the harness's own ACTION RULES & invariants "
+                      "were actually followed — Tier-4 review ran, refuted→re-annotated / suspect→flagged, "
+                      "QC-artifact clusters labeled Low_quality/Doublet (not a cell type), marker-DB-free path, "
+                      "seeds + decisions recorded, run_log↔outputs consistent, pipeline reached finalize. Emits a "
+                      "per-check pass/warn/fail scorecard so 'rules defined but not honored' is caught. Run last.")
+def harness_audit(session, *, label_key: str = "major_cell_type", **params) -> S.ToolResult:
+    import json
+
+    t0 = time.time()
+    adata = session.adata
+    runs = session._read_runs()
+    tools_run = [r.get("tool") for r in runs]
+    n_dec = 0
+    if session.decisions_path.exists():
+        n_dec = sum(1 for ln in session.decisions_path.read_text().splitlines() if ln.strip())
+    anno = adata.uns.get(UNS_ANNO, {}) or {}
+    t4 = anno.get("tier4_audit", {}) or {}
+
+    checks: list[dict] = []
+    def chk(name, ok, detail, sev="fail"):
+        checks.append({"check": name, "status": "pass" if ok else sev, "detail": detail})
+
+    # 1) Tier-4 INDEPENDENT review actually ran
+    chk("tier4_review_ran", ("annotation_audit" in tools_run and "apply_annotation_audit" in tools_run),
+        f"annotation_audit={'annotation_audit' in tools_run}, apply_annotation_audit={'apply_annotation_audit' in tools_run}")
+    # 2) reviewer provenance recorded (cross-model is the goal; at least the model id must be logged)
+    chk("tier4_reviewer_recorded", bool(t4.get("reviewer_model")),
+        f"reviewer_model={t4.get('reviewer_model')}", sev="warn")
+    # 3) FLAGS → ACTION: every refuted/suspect cluster is surfaced + review_required set on cells
+    ref, sus = t4.get("refuted_clusters", []), t4.get("suspect_clusters", [])
+    rr_col = next((c for c in adata.obs.columns if str(c).endswith("review_required")), None)
+    n_rr = int(adata.obs[rr_col].sum()) if rr_col else 0
+    chk("flags_lead_to_action", (not (ref or sus)) or (n_rr > 0),
+        f"refuted={ref}, suspect={sus}, review_required_cells={n_rr}", sev="warn")
+    # 4) QC-artifact clusters get an explicit artifact label (not a biological cell type)
+    lbls = set(adata.obs[label_key].astype(str).unique()) if label_key in adata.obs.columns else set()
+    art_labeled = bool(lbls & {"Low_quality", "Doublet", "Doublet_Mixed", "Mixed/Artifact"})
+    art_flagged = any(r.get("tool") == "annotation_review"
+                      and (r.get("summary", {}).get("status_counts", {}) or {}).get("artifact_suspected", 0) > 0
+                      for r in runs)
+    chk("artifact_clusters_labeled", (not art_flagged) or art_labeled,
+        f"artifact_flagged={art_flagged}, artifact_label_present={art_labeled}", sev="warn")
+    # 5) marker-DB-FREE annotation (no hardcoded fixed panel)
+    chk("marker_db_free", "annotate_broad" not in tools_run,
+        f"annotate_broad_used={'annotate_broad' in tools_run}", sev="warn")
+    # 6) reproducibility invariants: seeds on every run, decisions logged, run_log↔outputs consistent
+    no_seed = [r.get("tool") for r in runs if r.get("seed") is None]
+    chk("seeds_recorded", not no_seed, f"runs_without_seed={no_seed}")
+    chk("decisions_logged", n_dec > 0, f"n_decisions={n_dec}", sev="warn")
+    try:
+        lc = session.log_consistency()
+        chk("run_outputs_consistent", lc.get("consistent", True), str(lc), sev="warn")
+    except Exception:  # noqa: BLE001
+        pass
+    # 7) pipeline completeness
+    chk("annotation_present", "apply_annotation" in tools_run, "apply_annotation in run_log")
+    chk("finalized", "finalize_annotation" in tools_run, "finalize_annotation in run_log", sev="warn")
+
+    n_fail = sum(1 for c in checks if c["status"] == "fail")
+    n_warn = sum(1 for c in checks if c["status"] == "warn")
+    summary = {
+        "n_checks": len(checks), "n_pass": sum(1 for c in checks if c["status"] == "pass"),
+        "n_warn": n_warn, "n_fail": n_fail,
+        "violations": [c["check"] for c in checks if c["status"] != "pass"],
+        "reviewer_model": t4.get("reviewer_model"), "tools_run": tools_run, "checks": checks,
+        "verdict": "complete" if n_fail == 0 else "incomplete",
+    }
+    warnings = [f"{c['check']}: {c['detail']}" for c in checks if c["status"] == "fail"]
+    return S.success("harness_audit", summary=summary, warnings=warnings,
+                     determinism_grade="A", duration_s=round(time.time() - t0, 3),
+                     suggested_next_tools=[])
+
+
 @register("apply_annotation_audit", mutating=True,
           description="Record an INDEPENDENT reviewer's Tier-4 verdicts (from ANNOTATION_AUDIT_PROMPT) into "
                       "obs[status_key] (confirmed/suspect/refuted) + obs[review_required_key]. The reviewer flags "
