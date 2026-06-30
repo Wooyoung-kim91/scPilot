@@ -150,6 +150,17 @@ per-model copy:
   - Prefer a **different model** for the review (mode-2: `--reviewer-model` / `--review-max-rounds`;
     mode-1: the host delegates to a second agent) — annotator↔reviewer disagreement is exactly the
     signal a human should look at.
+- **Model diversification (complement each model's strengths).** Different parts of the pipeline can
+  run on different models. mode-2 `scpilot run` builds a per-ROLE provider: `--model` (analysis loop),
+  `--reviewer-model` (Tier-4 critique), `--annotator-model` (re-annotation of refuted clusters),
+  `--interpretation-model` (final report) — each `…-backend`/`…-base-url` too; any role falls back to
+  the analysis model. The highest-value split is a **cross-engine reviewer** (e.g. Claude annotates,
+  GPT/Codex reviews, or vice-versa). In **plugin** contexts (Claude Code with a Codex plugin, or
+  vice-versa) the host should delegate the Tier-4 review to the *other* engine when one is available.
+- **Every flag leads to an action, never just a flag.** refuted → re-annotate (bounded loop);
+  suspect → recorded in `suspect_clusters` for a targeted Tier-2 subtype pass or human review;
+  QC-artifact clusters (doublet/high-%MT/low-complexity) → explicitly labeled `Low_quality`/`Doublet`,
+  never a biological cell type.
 - Contract for the driver: summary-in → decision-out; state candidates + choice + rationale
   before every non-trivial choice (recorded as a decision event); one tool at a time.
 

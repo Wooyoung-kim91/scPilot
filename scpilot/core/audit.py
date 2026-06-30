@@ -358,15 +358,18 @@ def apply_annotation_audit(session, *, groupby: str = "leiden", verdicts: dict |
     adata.obs[review_required_key] = obs_g.map(lambda c: review_map.get(c, False)).astype(bool)
 
     refuted_clusters = sorted(c for c, s in status_map.items() if s == "refuted")
-    # the rejection REASON for each refuted cluster (the reviewer must give it; the annotator reads
-    # it when re-annotating, but the reviewer never proposes the replacement cell type).
+    suspect_clusters = sorted(c for c, s in status_map.items() if s == "suspect")
+    # the REASON for each refuted/suspect cluster (the reviewer must give it; refuted → re-annotate,
+    # suspect → flagged for targeted action: Tier-2 subtype or human review, not silently kept).
     refuted_reasons = {c: str(vd[c].get("note", "")) for c in refuted_clusters}
-    n_refuted, n_suspect = len(refuted_clusters), sum(1 for s in status_map.values() if s == "suspect")
+    suspect_reasons = {c: str(vd[c].get("note", "")) for c in suspect_clusters}
+    n_refuted, n_suspect = len(refuted_clusters), len(suspect_clusters)
     adata.uns.setdefault(UNS_ANNO, {})
     adata.uns[UNS_ANNO]["tier4_audit"] = {
         "groupby": groupby, "label_key": label_key, "reviewer_model": reviewer_model,
         "verdicts": vd, "n_refuted": n_refuted, "n_suspect": n_suspect,
         "refuted_clusters": refuted_clusters, "refuted_reasons": refuted_reasons,
+        "suspect_clusters": suspect_clusters, "suspect_reasons": suspect_reasons,
     }
     try:
         session.log_decision(S.DecisionEvent(
@@ -385,6 +388,8 @@ def apply_annotation_audit(session, *, groupby: str = "leiden", verdicts: dict |
         "n_confirmed": sum(1 for s in status_map.values() if s == "confirmed"),
         "refuted_clusters": refuted_clusters,          # the annotator re-annotates these
         "refuted_reasons": refuted_reasons,            # WHY each was rejected (for re-annotation + humans)
+        "suspect_clusters": suspect_clusters,          # ACTION: target for Tier-2 subtype / human review
+        "suspect_reasons": suspect_reasons,
         "n_review_required": int(adata.obs[review_required_key].sum()),
         "status_distribution": {str(k): int(v) for k, v in adata.obs[status_key].value_counts().items()},
     }

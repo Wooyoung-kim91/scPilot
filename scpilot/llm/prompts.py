@@ -236,9 +236,13 @@ CANONICAL FLOW (skip steps already satisfied per detect_state; stop when the goa
     c. If any cluster is REFUTED, the ANNOTATOR re-infers ONLY those clusters' labels from the DE
        evidence (annotation_review → emit_annotation_labels → apply_annotation), told the rejection
        reason but NOT a replacement type; then re-run finalize_annotation and loop back to (a).
-    Stop when no label is refuted (converged) or the round cap is reached; leave any still-refuted
-    labels as review_required for a human. (mode-2 `scpilot run` runs this loop automatically via
-    --review / --reviewer-model / --review-max-rounds.)
+    Stop when no label is refuted (converged) or the round cap is reached. EVERY flag must lead to an
+    ACTION, never just a flag: refuted → re-annotate (above); suspect (still-flagged) → record for a
+    targeted Tier-2 subtype pass or human review (apply_annotation_audit surfaces suspect_clusters);
+    QC-artifact clusters (doublet-dominated / high-%MT / low-complexity from annotation_review) →
+    LABEL them 'Low_quality' or 'Doublet' explicitly (NOT a biological cell type). Cross-model review
+    (reviewer ≠ annotator) is preferred to complement each model's blind spots. (mode-2 `scpilot run`
+    runs this loop automatically via --review / --reviewer-model / --annotator-model / --review-max-rounds.)
 
 When the analysis goal is achieved (or no further safe step exists), STOP calling tools
 and write a short final summary of what was done and the key results.

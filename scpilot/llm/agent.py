@@ -436,8 +436,8 @@ def run_agent(session, provider: Provider, *, goal: str | None = None,
               tissue: str | None = None, resolutions: dict | None = None,
               toolset: list[str] | None = None, seed: int = 0,
               max_iters: int = 40, param_overrides: dict | None = None,
-              reviewer_provider: "Provider | None" = None, review: bool = True,
-              review_max_rounds: int = 3) -> AgentResult:
+              reviewer_provider: "Provider | None" = None, annotator_provider: "Provider | None" = None,
+              review: bool = True, review_max_rounds: int = 3) -> AgentResult:
     """Drive the autonomous tool loop until the model stops calling tools (or max_iters).
 
     ``tissue`` (e.g. 'human pancreas, PDAC') is a soft annotation prior. ``resolutions`` is the
@@ -504,9 +504,9 @@ def run_agent(session, provider: Provider, *, goal: str | None = None,
                     if (review and reviewer_provider is not None
                             and call.name in _ANNOTATION_APPLY_TOOLS and result.status == "success"):
                         try:
-                            rv = _run_stage_review(session, provider, reviewer_provider,
-                                                   call_name=call.name, args=call.arguments,
-                                                   max_rounds=review_max_rounds, seed=seed)
+                            rv = _run_stage_review(session, (annotator_provider or provider),
+                                                   reviewer_provider, call_name=call.name,
+                                                   args=call.arguments, max_rounds=review_max_rounds, seed=seed)
                         except Exception as exc:  # noqa: BLE001
                             rv = {"status": "skipped", "error": f"{type(exc).__name__}: {exc}"}
                         content = json.dumps({"tool_result": result.to_dict(),
@@ -581,7 +581,9 @@ def run_annotation_critique(session, reviewer_provider: Provider, *, groupby: st
     sm = getattr(applied, "summary", None) or {}
     return {"status": applied.status, "summary": sm, "reviewer_model": rm,
             "refuted_clusters": sm.get("refuted_clusters", []),
-            "refuted_reasons": sm.get("refuted_reasons", {})}
+            "refuted_reasons": sm.get("refuted_reasons", {}),
+            "suspect_clusters": sm.get("suspect_clusters", []),
+            "suspect_reasons": sm.get("suspect_reasons", {})}
 
 
 def run_annotation_review_loop(session, annotator_provider: Provider, reviewer_provider: Provider, *,
@@ -660,7 +662,9 @@ def run_annotation_review_loop(session, annotator_provider: Provider, reviewer_p
                                    rationale="re-consolidate after re-annotation")
     return {"status": "completed", "converged": converged, "n_rounds": len(rounds),
             "rounds": rounds, "reviewer_model": crit.get("reviewer_model"),
-            "final_refuted": rounds[-1]["refuted_clusters"] if rounds else []}
+            "final_refuted": rounds[-1]["refuted_clusters"] if rounds else [],
+            # ACTION items the loop did NOT auto-fix → surfaced for Tier-2 subtype / human review
+            "final_suspect": crit.get("suspect_clusters", [])}
 
 
 def _run_stage_review(session, annotator: Provider, reviewer: Provider, *, call_name: str,

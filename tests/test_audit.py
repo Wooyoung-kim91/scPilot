@@ -116,6 +116,8 @@ def test_apply_annotation_audit_records_verdicts_and_reasons(tmp_path):
     assert sm["n_refuted"] == 1 and sm["n_suspect"] == 1 and sm["n_confirmed"] == 2
     assert sm["reviewer_model"] == "test-reviewer"
     assert sm["refuted_clusters"] == ["1"]
+    # flags→action: suspect clusters are surfaced (not just counted) for targeted review
+    assert sm["suspect_clusters"] == ["3"] and "malignant without CNV" in sm["suspect_reasons"]["3"]
     # the rejection REASON is recorded (for re-annotation + humans); NO replacement label is given
     assert "fail pct/lfc" in sm["refuted_reasons"]["1"]
     assert "annotation_audit_status" in s.adata.obs and "annotation_review_required" in s.adata.obs
