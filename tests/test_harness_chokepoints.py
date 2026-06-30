@@ -293,8 +293,14 @@ def test_qc_metrics_emits_mad_suggested_cutoffs(tmp_path):
     assert res.status == "success"
     sc = res.summary["suggested_cutoffs"]
     assert {"min_genes", "max_genes", "max_pct_mt"} <= set(sc["global"])    # MAD evidence
-    assert set(sc["per_sample"]) >= {"s1", "s2", "s3"}                      # per-batch
     assert sc["global"]["min_genes"] >= 0
+    # per-sample cutoffs: summary stays O(1) — global + a min/median/max SPREAD + artifact path;
+    # the full per-sample map is in the CSV artifact (token cost fixed regardless of sample count).
+    assert {"min", "median", "max"} <= set(sc["per_sample_spread"]["min_genes"])   # batch-aware spread
+    assert sc["n_samples"] >= 3
+    from pathlib import Path
+    assert Path(sc["per_sample_artifact"]).exists()
+    assert "per_sample" not in sc                                            # full map NOT inline
 
 
 def test_qc_metrics_detects_mouse_and_resolves_mixed_lineage(tmp_path):

@@ -145,8 +145,10 @@ GOLDEN RULES
 CANONICAL FLOW (skip steps already satisfied per detect_state; stop when the goal is met)
 1. detect_state -> find the re-entry point (raw / normalized / hvg / clustered / annotated).
 2. qc_metrics -> read batch-aware distributions (per-sample n_genes/total/%MT, doublet
-   rate). qc_filter -> choose cutoffs that are permissive enough to keep real biology
-   (avoid global cutoffs that erase sample/tissue-specific populations).
+   rate). suggested_cutoffs gives the global cutoffs + a per-sample min/median/max SPREAD;
+   the full per-sample cutoff table is in the qc_suggested_cutoffs_per_sample.csv artifact if
+   you need it. qc_filter -> choose cutoffs permissive enough to keep real biology (avoid global
+   cutoffs that erase sample/tissue-specific populations).
 3. preprocess -> from variance_ratio + suggested_n_pcs_elbow choose n_top_genes and n_pcs.
 4. cluster_sweep (use_rep=X_pca) -> pick resolution at the knee; then cluster (baseline,
    use_rep=X_pca, resolution=<chosen>). markers -> per-cluster ranked DE (Wilcoxon, with pts).

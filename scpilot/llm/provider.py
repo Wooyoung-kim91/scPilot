@@ -189,13 +189,20 @@ class AnthropicProvider(Provider):
 
     def complete(self, messages, *, tools=None, system=None, tool_choice=None,
                  max_tokens=None) -> LLMResponse:
+        msgs = _to_anthropic_messages(messages)
+        # PROMPT CACHING (cost): the agent re-sends the whole prefix (tools + system + growing
+        # history) every turn. Mark the stable system block AND the last message so Anthropic
+        # caches the longest matching prefix (ephemeral, 5-min TTL) → re-sends become cache hits
+        # instead of full-price input. No behaviour change. (OpenAI caches automatically.)
+        _mark_last_cache(msgs)
         kwargs: dict = {
             "model": self.model,
             "max_tokens": max_tokens or self.config.max_tokens,
-            "messages": _to_anthropic_messages(messages),
+            "messages": msgs,
         }
         if system:
-            kwargs["system"] = system
+            # a system breakpoint caches tools+system (tools precede system in the cache prefix)
+            kwargs["system"] = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
         if tools:
             kwargs["tools"] = [_to_anthropic_tool(t) for t in tools]
         if tool_choice is not None:
@@ -328,6 +335,20 @@ def _to_anthropic_tool_choice(choice):
     if choice == "any":
         return {"type": "any"}
     return {"type": "tool", "name": choice}     # force a specific tool by name
+
+
+def _mark_last_cache(msgs: list[dict]) -> None:
+    """Add an ephemeral cache breakpoint to the LAST message's last content block (in place), so
+    the next turn's identical tools+system+history prefix is a cache hit instead of full-price
+    input. Strings are promoted to a text block; block lists get cache_control on the last block."""
+    if not msgs:
+        return
+    cc = {"type": "ephemeral"}
+    content = msgs[-1].get("content")
+    if isinstance(content, str):
+        msgs[-1]["content"] = [{"type": "text", "text": content, "cache_control": cc}]
+    elif isinstance(content, list) and content and isinstance(content[-1], dict):
+        content[-1] = {**content[-1], "cache_control": cc}
 
 
 def _to_anthropic_messages(messages: list[dict]) -> list[dict]:

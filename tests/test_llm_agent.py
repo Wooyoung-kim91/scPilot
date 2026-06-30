@@ -334,3 +334,19 @@ def test_probe_backend_is_nonfatal(monkeypatch):
     assert p["backend"] == "anthropic"
     assert p["ready"] is False           # no key -> not ready, but no exception
     assert "reason" in p
+
+
+def test_anthropic_prompt_caching_shaping():
+    """Cost: the Anthropic backend marks the last message (and system) with an ephemeral cache
+    breakpoint so the re-sent tools+system+history prefix is a cache hit, not full-price input."""
+    from scpilot.llm import provider as P
+
+    # string content -> promoted to a text block carrying cache_control
+    m = [{"role": "user", "content": "hi"}]
+    P._mark_last_cache(m)
+    assert m[-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+    # tool_result block list -> cache_control on the last block
+    m2 = [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "x", "content": "y"}]}]
+    P._mark_last_cache(m2)
+    assert m2[-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+    P._mark_last_cache([])   # empty -> no-op, no crash

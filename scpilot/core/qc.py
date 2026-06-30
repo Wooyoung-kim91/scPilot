@@ -207,11 +207,26 @@ def qc_metrics(session, *, sample_key: str = "sample_id", mito_prefix: str | Non
 
     # MAD-based suggested cutoffs (evidence for the LLM to judge — NOT auto-applied)
     suggested = {"global": _suggest_cutoffs(adata.obs, n_mads=n_mads)}
+    cutoffs_artifact = None
     if have_sample:
-        suggested["per_sample"] = {
-            str(sid): _suggest_cutoffs(sub, n_mads=n_mads)
-            for sid, sub in adata.obs.groupby(sample_key, observed=True)
-        }
+        # Per-sample cutoffs are still computed in FULL (identical analysis); but to keep the tool
+        # SUMMARY O(1) in sample count (it is re-sent every agent turn — token cost), the full
+        # per-sample map goes to a CSV artifact and the summary carries the global cutoffs + a
+        # compact min/median/max SPREAD across samples (the batch-aware signal, descriptive only —
+        # no new threshold/judgment). Full detail remains available via the artifact path.
+        per_sample_cut = {str(sid): _suggest_cutoffs(sub, n_mads=n_mads)
+                          for sid, sub in adata.obs.groupby(sample_key, observed=True)}
+        cut_df = pd.DataFrame(per_sample_cut).T.sort_index()
+        cutoffs_artifact = session.artifact_path("qc_suggested_cutoffs_per_sample.csv")
+        cutoffs_artifact.parent.mkdir(parents=True, exist_ok=True)
+        cut_df.to_csv(cutoffs_artifact)
+        suggested["per_sample_spread"] = {
+            str(k): {"min": round(float(cut_df[k].min()), 3),
+                     "median": round(float(cut_df[k].median()), 3),
+                     "max": round(float(cut_df[k].max()), 3)}
+            for k in cut_df.columns}
+        suggested["per_sample_artifact"] = str(cutoffs_artifact)
+        suggested["n_samples"] = int(cut_df.shape[0])
 
     summary = {
         "n_cells": int(adata.n_obs), "n_genes": int(adata.n_vars),
@@ -230,12 +245,19 @@ def qc_metrics(session, *, sample_key: str = "sample_id", mito_prefix: str | Non
     tables = {}
     if not per_sample_df.empty:
         tables["per_sample_qc"] = S.table_preview(per_sample_df, max_rows=50)
+    artifacts = []
+    if cutoffs_artifact is not None:
+        artifacts.append(S.artifact_csv(str(cutoffs_artifact), n_rows=int(cut_df.shape[0]),
+                                        n_cols=int(cut_df.shape[1]),
+                                        description="per-sample MAD suggested cutoffs (full; "
+                                                    "summary carries global + spread)"))
 
     cp = session.checkpoint("qc_metrics", x_state=session.manifest.x_state,
                             params={"sample_key": sample_key, "mito_prefix": mito_prefix,
                                     "run_scrublet": run_scrublet, "n_mads": n_mads, "seed": seed})
-    return S.success("qc_metrics", summary=summary, tables=tables, warnings=warnings,
-                     checkpoint=cp.path, determinism_grade="B" if run_scrublet else "A",
+    return S.success("qc_metrics", summary=summary, tables=tables, artifacts=artifacts,
+                     warnings=warnings, checkpoint=cp.path,
+                     determinism_grade="B" if run_scrublet else "A",
                      duration_s=round(time.time() - t0, 3),
                      suggested_next_tools=["qc_filter"])
 
