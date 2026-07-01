@@ -142,6 +142,24 @@ GOLDEN RULES
   prerequisite tool first; `capability_unavailable`/`dependency_missing` -> skip that
   optional branch and continue; `data_gate_failed` -> do not retry that path.
 
+TIER-4 IS A UNIVERSAL INVARIANT — VERIFY EVERY ANNOTATION COLUMN, NOT JUST THE FINAL ONE.
+Reliability of the annotation is secured only if EACH label column is independently reviewed.
+Immediately after ANY tool that writes a label column, run a Tier-4 review on THAT column before
+building anything on top of it:
+  apply_annotation      -> review label_key=major_cell_type
+  apply_fine_annotation -> review label_key=fine_cell_type   (on the subset's leiden)
+  apply_malignancy      -> review label_key=malignancy       (groupby=cnv_leiden)
+  consensus/harmonize   -> review label_key=<its out_key>
+  finalize_annotation   -> review label_key=final_annotation
+The review is: annotation_audit(groupby=<that column's clustering>, label_key=<that column>) ->
+adversarially critique each label (emit_annotation_audit; give the REASON, never a replacement) ->
+apply_annotation_audit(label_key=<that column>, reviewer_model=<who>) -> re-infer refuted labels,
+loop until converged or the round cap. Prefer a DIFFERENT engine as the reviewer (delegate the
+critique to a Codex CLI plugin, a second model, or a local LLM API); annotator==reviewer self-review
+is the minimum fallback. In mode-2 `scpilot run` this fires AUTOMATICALLY after every label-writing
+tool via --reviewer-model; as a mode-1 host you run it yourself. harness_audit FAILS if any
+annotation column present in obs was left unreviewed.
+
 CANONICAL FLOW (skip steps already satisfied per detect_state; stop when the goal is met)
 1. detect_state -> find the re-entry point (raw / normalized / hvg / clustered / annotated).
 2. qc_metrics -> read batch-aware distributions (per-sample n_genes/total/%MT, doublet
@@ -199,14 +217,27 @@ CANONICAL FLOW (skip steps already satisfied per detect_state; stop when the goa
    b. For each chosen compartment: compartment_subset(compartment, mode='clustering',
       use_rep=<the BEST integration reduction selected in step 7>) so subtype subclustering runs on
       the SAME best embedding as the final broad call (or mode='markers' to re-derive
-      compartment-relevant HVGs). Then cluster_sweep(use_rep) -> cluster(use_rep, resolution=<chosen>)
-      -> markers(groupby=<subset leiden>) on the SUBSET.
+      compartment-relevant HVGs). This writes the subset into its OWN directory and returns
+      summary.child_session_dir — pass that dir as the `workdir` for ALL subsequent subset steps
+      (cluster/markers/fine_annotation_review/apply_fine_annotation), so each compartment stays in
+      its own session and the parent is untouched (do the next compartment without reloading). Then
+      cluster_sweep(use_rep) -> cluster(use_rep, resolution=<chosen>) -> markers(groupby=<subset
+      leiden>) on the SUBSET (in child_session_dir).
    c. fine_annotation_review(groupby=<subset leiden>) -> read each subcluster's de_table
       (mean_in+pct+spec) + confounders; pick a >=3-gene marker-set and INFER fine_cell_type + a
       FACS-style label (the PRIMARY subtype name — same broad method) from the DE (see FINE_ANNOTATION_PROMPT; keep
       type vs state separate). apply_fine_annotation(groupby, fine_labels, facs_labels, cell_state,
       confidence, review_required, evidence_for) -> writes obs['fine_cell_type','facs_style_label']
       + annotation_tree (tiny clusters merged + no-evidence calls flagged automatically).
+   d. VERIFY the fine labels NOW (Tier-4 is universal — see the invariant above): on the SUBSET
+      session, annotation_audit(groupby=<subset leiden>, label_key=fine_cell_type) -> independent
+      critique (prefer a different engine) -> apply_annotation_audit(label_key=fine_cell_type) ->
+      re-infer any refuted subcluster from its DE. Do this BEFORE merging compartments back, so a
+      wrong subtype is caught before it enters the final table.
+   e. After ALL compartments are annotated+verified, from the PARENT workdir call
+      merge_fine_annotations(compartments_root=<parent>/compartments) -> reassembles every
+      compartment's fine_cell_type/facs_style_label/cell_state onto the parent by cell barcode
+      (cells in no subclustered compartment carry their Tier-1 major_cell_type forward).
 9. Malignancy / CNV (tumor only, not a tier) — AFTER subtype, only if cnv_available AND the goal needs it:
    a. annotate_genomic_positions FIRST (the merged var has only symbols). It fills
       var[chromosome,start,end] from a pinned GENCODE GTF; gate on protein_coding_coverage
@@ -221,6 +252,9 @@ CANONICAL FLOW (skip steps already satisfied per detect_state; stop when the goa
       expansion) — never a CNV-score threshold alone. If cnv_available is false, decide from
       markers+reference+expansion and flag review_required (apply_malignancy enforces this).
       See MALIGNANCY_PROMPT.
+   d. VERIFY the malignancy call NOW (Tier-4 is universal): annotation_audit(groupby=<cnv_leiden>,
+      label_key=malignancy) -> independent critique -> apply_annotation_audit(label_key=malignancy).
+      A 'malignant' verdict without CNV/tumor evidence must be refuted or flagged review_required.
 10. finalize_annotation -> consolidate every label into obs['final_annotation'] (FACS-like): base =
     facs_style_label > fine_cell_type > major_cell_type (most specific), qualified by malignancy
     ('Malignant <base>' for malignant cells). Then DE per the goal and a final report.

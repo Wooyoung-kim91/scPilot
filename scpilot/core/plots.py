@@ -82,7 +82,9 @@ def _artifacts_from_fit(fit, cfg) -> list[S.Artifact]:
                       "dotplot (annotation marker dotplot: groupby=major_cell_type, optional marker_groups; "
                       "cell-type rows ordered as a staircase under their marker brackets, and FAMILY-CONTIGUOUS "
                       "so subtypes stay together — e.g. all Macrophage* in one block (pass family_map to set "
-                      "families explicitly, else derived from the label's leading token); vertical gene labels). "
+                      "families explicitly, else derived from the label's leading token); vertical gene labels. "
+                      "Set include_label_genes=True to also surface genes named in a FACS label (e.g. CD8 in "
+                      "'CD8+ T cells') when the DE gate selected them — default OFF keeps the panel purely DE-derived). "
                       "umap/qc_violin/hvg/pca_variance obey the journal-column size policy; the dotplot "
                       "auto-fits to the SMALLEST 0.5–2.0×0.5–2.0 col size with no text/dot overlap and a "
                       "size/colour legend ≤5% of the figure (many-category umap uses a generous canvas).")
@@ -90,7 +92,7 @@ def plots(session, *, kind: str = "umap", color: str | None = None,
           basis: str = "X_umap", keys: list | None = None, groupby: str | None = None,
           marker_groups: dict | None = None, order: list | None = None,
           family_map: dict | None = None, cluster_key: str | None = None,
-          label_map: dict | None = None,
+          label_map: dict | None = None, include_label_genes: bool = False,
           tag: str | None = None, cutoffs: dict | None = None, **params) -> S.ToolResult:
     import matplotlib
     matplotlib.use("Agg")  # headless (MCP/CLI: no display)
@@ -202,7 +204,8 @@ def plots(session, *, kind: str = "umap", color: str | None = None,
                 try:
                     src = derive_dotplot_markers(adata, cluster_key=cluster_key,
                                                  label_map={str(k): str(v) for k, v in label_map.items()},
-                                                 order=order, family_map=family_map)
+                                                 order=order, family_map=family_map,
+                                                 include_label_genes=include_label_genes)
                 except Exception:  # noqa: BLE001 — fall through to gb-DE / fixed panel
                     src = None
             if src is None:
@@ -214,7 +217,8 @@ def plots(session, *, kind: str = "umap", color: str | None = None,
                         # family, not by abundance; staircase then follows this panel order.
                         src = derive_dotplot_markers(adata, cluster_key=gb,
                                                      label_map={lab: lab for lab in labels},
-                                                     order=order, family_map=family_map)
+                                                     order=order, family_map=family_map,
+                                                     include_label_genes=include_label_genes)
                     except Exception:  # noqa: BLE001 — fall through to the fixed panel
                         src = None
                 if not src:

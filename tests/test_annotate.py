@@ -378,3 +378,16 @@ def test_derive_dotplot_markers_are_the_de_evidence(tmp_path):
                                      order=["TypeC", "TypeB", "TypeA"])
     assert list(ordered) == ["TypeC", "TypeB", "TypeA"]              # layout reordered
     assert all(ordered[ct] == panels[ct] for ct in panels)          # per-type content identical
+
+    # include_label_genes (opt-in): a gene NAMED in the FACS label is surfaced IF the DE gate
+    # selected it — but a label gene the data did NOT select is still excluded (evidence wins).
+    lmap2 = {"0": "A1+ N1+ TypeA", "1": "TypeB", "2": "TypeC"}
+    top1 = derive_dotplot_markers(a, cluster_key="leiden", label_map=lmap2, top_k=1)
+    base = derive_dotplot_markers(a, cluster_key="leiden", label_map=lmap2, top_k=1,
+                                  include_label_genes=True)
+    ta = "A1+ N1+ TypeA"
+    assert "A1" in base[ta]                                          # A1 (gate-passed) forced in
+    assert "A1" == base[ta][0]                                       # label gene ranked first
+    assert "N1" not in base[ta]                                      # N1 failed the gate → excluded
+    # default OFF is unchanged unless the label gene was already top-k
+    assert "N1" not in top1.get(ta, [])

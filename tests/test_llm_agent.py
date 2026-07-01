@@ -178,6 +178,50 @@ def test_agent_drives_tools_logs_and_stats(tmp_path):
     assert payload["method"] == "pseudobulk"
 
 
+def _compartmented_session(tmp_path):
+    import anndata as ad
+    from scipy import sparse
+    rng = np.random.default_rng(0)
+    genes = [f"G{i}" for i in range(40)]
+    a = ad.AnnData(sparse.csr_matrix(rng.poisson(0.5, (300, 40)).astype("float32")))
+    a.var_names = genes
+    a.layers["counts"] = a.X.copy()
+    comp = np.array(["Epithelial"] * 180 + ["T_NK"] * 120)
+    a.obs["major_cell_type"] = comp
+    a.obs["GSE"] = rng.choice(["GSEa", "GSEb"], 300)
+    a.obs["sample_id"] = rng.choice(["s1", "s2", "s3"], 300)
+    a.obsm["X_scVI"] = rng.standard_normal((300, 10)).astype("float32")
+    p = tmp_path / "in.h5ad"; a.write_h5ad(p)
+    s = Session.create(tmp_path / "sess", input_path=str(p)); s.load_input()
+    return s
+
+
+def test_mode2_routes_subset_steps_to_child_session(tmp_path):
+    # mode-2 child-session routing: compartment_subset spawns a child, and the SUBSEQUENT cluster/
+    # markers land in THAT child — not the parent. The parent stays at its broad-annotation state.
+    s = _compartmented_session(tmp_path)
+    script = [
+        _resp(_tc(1, "compartment_subset", {"compartment": "T_NK", "mode": "clustering",
+                                            "use_rep": "X_scVI"})),
+        _resp(_tc(2, "cluster", {"use_rep": "X_scVI", "resolution": 0.5})),
+        _resp(_tc(3, "markers", {"groupby": "leiden_scvi", "n_genes": 10})),
+        LLMResponse(text="done", tool_calls=[], stop_reason="end_turn", usage={}),
+    ]
+    run_agent(s, FakeProvider(script), seed=0, max_iters=20, review=False)
+
+    # parent untouched: full cell count, no clustering written on the parent by the subset steps
+    assert s.adata.n_obs == 300 and "leiden_scvi" not in s.adata.obs
+    # the child session exists and carries the subset + its clustering/markers (X_scVI → _scvi keys)
+    child = Session.open(str(s.out / "compartments" / "T_NK"))
+    assert child.adata.n_obs == 120
+    assert "leiden_scvi" in child.adata.obs and "rank_genes_groups" in child.adata.uns
+    stages = {c["stage"] for c in child.manifest.checkpoints}
+    assert "cluster" in stages                          # cluster ran IN the child session
+    # the child's run-log (not the parent's) recorded the subset steps
+    child_runs = {json.loads(l)["tool"] for l in child.run_log_path.read_text().splitlines() if l.strip()}
+    assert {"cluster", "markers"} <= child_runs
+
+
 def test_mode2_session_replays_deterministically(tmp_path):
     s = _session(tmp_path)
     script = [

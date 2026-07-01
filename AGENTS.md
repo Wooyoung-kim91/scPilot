@@ -141,15 +141,24 @@ per-model copy:
   - The loop runs `audit → critique → re-annotate refuted → re-finalize → re-audit` until nothing
     is refuted (converged) or a **round cap** (default 3) — the cap guarantees termination and
     keeps the run reproducible. Still-refuted labels remain `review_required` for a human.
-  - **Verification fires at EVERY annotation stage, not just the end.** In mode-2 `scpilot run`,
-    `run_agent` runs an independent review right after each annotation-apply tool — broad
-    (`apply_annotation`, auto-corrected by the bounded loop), fine (`apply_fine_annotation`), and
-    final (`finalize_annotation`) (fine/final verify + flag). In mode-1 the host does the same per
-    step 5/step 11 of the workflow. So a wrong broad call is caught before integration/subtype build
-    on it, not only at the final consolidation.
-  - Prefer a **different model** for the review (mode-2: `--reviewer-model` / `--review-max-rounds`;
-    mode-1: the host delegates to a second agent) — annotator↔reviewer disagreement is exactly the
-    signal a human should look at.
+  - **Tier-4 is a UNIVERSAL invariant — EVERY label column is independently reviewed, not just the
+    final one.** Reliability of the annotation is secured only if each label-writing tool's output is
+    verified. The reviewed set (mode-2 `_ANNOTATION_APPLY_TOOLS`): `apply_annotation`→`major_cell_type`,
+    `apply_fine_annotation`→`fine_cell_type`, `apply_malignancy`→`malignancy`,
+    `consensus_annotation`/`harmonize_annotations`→their `out_key`, `annotate_broad`→its key, and
+    `finalize_annotation`→`final_annotation`. In mode-2 `scpilot run`, `run_agent` fires an independent
+    review right after each of these (broad auto-corrects refuted clusters via the bounded loop; every
+    other stage verifies + flags per column). In mode-1 the host does the same per the **universal
+    Tier-4 rule** stated at the top of the canonical flow (referenced at steps 5/8/9/11). So a wrong
+    broad or fine call is caught before anything builds on it, not only at final consolidation. Each
+    review records **per-column coverage + provenance** in `uns[UNS_ANNO]["tier4_reviews"][<label_key>]`,
+    and `harness_audit` **fails** if any annotation column present in obs was left unreviewed.
+  - **The reviewer is a pluggable provider role — self OR a different engine.** It may be the annotator
+    itself (self-review = the minimum fallback), a different API model, a local LLM API
+    (OpenAI-compatible `base_url`: Ollama/vLLM/LM Studio), or Codex/GPT — either via an
+    OpenAI-compatible endpoint (mode-2) or by the **host delegating the critique to a Codex CLI plugin
+    / second engine** (mode-1/plugin). **Cross-engine (annotator≠reviewer) is preferred** —
+    annotator↔reviewer disagreement is exactly the signal a human should look at.
 - **Model diversification (complement each model's strengths).** Different parts of the pipeline can
   run on different models. mode-2 `scpilot run` builds a per-ROLE provider: `--model` (analysis loop),
   `--reviewer-model` (Tier-4 critique), `--annotator-model` (re-annotation of refuted clusters),
@@ -176,7 +185,17 @@ single source — do **not** restate or override it here. The stable cross-cutti
   reduction's own DE + recorded cluster→celltype labels (weight a gene by Σ over its clusters
   of `n_cells·(TOPN − DE_rank)` so the dominant cluster's canonical markers win), deduped
   across types, top-K per type. The y-axis follows the panel declaration order (staircase),
-  and `dot_clipped` + `staircase` invariants are checked on every render.
+  and `dot_clipped` + `staircase` invariants are checked on every render. **A gene named in a
+  FACS label is NOT auto-injected** — the panel shows only what the DE selected, so `CD8` appears
+  for a "CD8+ T cell" row only if the data ranked it high (this avoids circular label→marker→label
+  reasoning). The opt-in `plots(include_label_genes=True)` surfaces a label's namesake genes *only
+  when the DE gate already selected them* (re-ranks them to the front; never overrides the evidence);
+  it is **OFF by default**.
+- **Tier-2 subsets are stored per compartment:** `compartment_subset` (default) writes each
+  compartment into its OWN nested session `<out_dir>/compartments/<compartment>/` and returns
+  `child_session_dir`; run the fine steps against that dir and reassemble with
+  `merge_fine_annotations(compartments_root=…)`. `in_place=True` restores the legacy single-session
+  behaviour. Fine clustering `resolution` uses the SAME default as broad (0.25), caller-overridable.
 
 ---
 

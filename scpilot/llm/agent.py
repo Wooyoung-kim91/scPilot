@@ -297,9 +297,24 @@ _EMIT_SCHEMAS = {
     "emit_annotation_audit":  (prompts.ANNOTATION_AUDIT_SCHEMA, "annotation_audit", "annotation_audit"),
 }
 
-# annotation-apply tools that trigger an automatic INDEPENDENT Tier-4 review right after they run
-# (mode-2 cross-model hook). broad auto-corrects via the bounded loop; fine/final verify + flag.
-_ANNOTATION_APPLY_TOOLS = {"apply_annotation", "apply_fine_annotation", "finalize_annotation"}
+# EVERY tool that writes a label column triggers an automatic INDEPENDENT Tier-4 review right after
+# it runs (mode-2 cross-model hook) — reliability of ALL annotation is secured only if each label
+# column is independently reviewed, not just the final one. broad auto-corrects refuted clusters via
+# the bounded loop; every other stage verifies + flags (refuted/suspect recorded per column; the
+# agent/human re-annotates from the flags). See _run_stage_review for per-tool routing.
+_ANNOTATION_APPLY_TOOLS = {
+    "apply_annotation", "apply_fine_annotation", "apply_malignancy", "finalize_annotation",
+    "annotate_broad", "consensus_annotation", "harmonize_annotations",
+}
+
+# Child-session routing (Tier-2 subsets). The ACTIVE session starts as the root and only becomes a
+# compartment child after compartment_subset. These CHILD-SCOPED tools run on whatever is active — so
+# the SAME cluster/markers calls serve the parent baseline (active==root, before any subset) AND the
+# per-compartment subclustering (active==child, after compartment_subset). Every other tool (subset,
+# merge, integration, CNV, malignancy, finalize, report) runs on the root parent. merge returns the
+# active session to root. This mirrors the mode-1 workdir routing exactly.
+_CHILD_SCOPED_TOOLS = {"cluster", "cluster_sweep", "markers",
+                       "fine_annotation_review", "apply_fine_annotation"}
 
 
 # F4: tool outputs (and dataset-derived strings inside them — cell labels, sample names, warnings)
@@ -448,10 +463,12 @@ def run_agent(session, provider: Provider, *, goal: str | None = None,
     all tool runs are logged for deterministic replay.
 
     Tier-4 verification hook: when ``review`` and a ``reviewer_provider`` are given, an INDEPENDENT
-    review fires right after EVERY annotation-apply tool (broad / fine / final) — the reviewer
-    (possibly a different model) audits + adversarially critiques that stage's labels. Broad
-    annotation additionally auto-corrects refuted clusters via the bounded loop; fine/final verify
-    and flag (the agent re-annotates from the flags). The reviewer never proposes a label."""
+    review fires right after EVERY tool that writes a label column — broad, fine, malignancy,
+    consensus/harmonize, and final — so reliability of ALL annotation is secured, not just the final
+    table. The reviewer (possibly a different model — self is the fallback) audits + adversarially
+    critiques that column's labels and records per-column coverage. Broad annotation additionally
+    auto-corrects refuted clusters via the bounded loop; every other stage verifies and flags (the
+    agent/human re-annotates from the recorded refuted/reason). The reviewer never proposes a label."""
     # F9: clamp the loop bound — a runaway value would drive excessive LLM+tool calls, and a
     # non-positive value would skip the loop and falsely report "max_iters" with no work done.
     max_iters = max(1, min(int(max_iters), MAX_ITERS_CEILING))
@@ -469,6 +486,13 @@ def run_agent(session, provider: Provider, *, goal: str | None = None,
         "prose before the tool call. When the goal is met, stop and summarize."
     )
     messages: list[dict] = [{"role": "user", "content": user_kick}]
+
+    # Session routing for Tier-2 compartment subsets (child-session model): PARENT-scoped tools run
+    # on root_session; after compartment_subset spawns a child, active_session switches to it so the
+    # subset's cluster/markers/fine steps land there. merge/plan return to root.
+    from scpilot.session import Session
+    root_session = session
+    active_session = session
 
     final_text = ""
     stopped_reason = "max_iters"
@@ -493,20 +517,31 @@ def run_agent(session, provider: Provider, *, goal: str | None = None,
             stats.add_call(call.name)
             transcript.append({"role": "tool_call", "name": call.name, "args": call.arguments})
             try:
+                # route to the right session: CHILD-scoped tools on the active (compartment) session,
+                # everything else on the root parent (see _CHILD_SCOPED_TOOLS).
+                target = active_session if call.name in _CHILD_SCOPED_TOOLS else root_session
                 if call.name in _EMIT_SCHEMAS:
-                    payload = _persist_structured(session, call.name, call.arguments, stats)
+                    payload = _persist_structured(target, call.name, call.arguments, stats)
                     content = json.dumps(payload)
                 else:
-                    result = _execute_registry_tool(session, call.name, call.arguments,
+                    result = _execute_registry_tool(target, call.name, call.arguments,
                                                      seed, stats, rationale=resp.text or "",
                                                      param_overrides=param_overrides)
                     content = json.dumps(result.to_dict(), default=str)
-                    # Tier-4 hook: independently verify (and, for broad, auto-correct) the labels
-                    # this annotation-apply tool just wrote — additive, never breaks the main loop.
+                    # switch the active session as compartments open/close (child-session model)
+                    if call.name == "compartment_subset" and result.status == "success":
+                        child_dir = (result.summary or {}).get("child_session_dir")
+                        active_session = Session.open(child_dir) if child_dir else target
+                    elif call.name in ("merge_fine_annotations", "compartment_plan"):
+                        active_session = root_session
+                    # Tier-4 hook: independently verify (and, for broad, auto-correct) the labels this
+                    # annotation-apply tool just wrote — on the SAME session it wrote to (``target``:
+                    # fine review lands in the compartment child, malignancy/broad/final on the root).
+                    # Additive, never breaks the main loop.
                     if (review and reviewer_provider is not None
                             and call.name in _ANNOTATION_APPLY_TOOLS and result.status == "success"):
                         try:
-                            rv = _run_stage_review(session, (annotator_provider or provider),
+                            rv = _run_stage_review(target, (annotator_provider or provider),
                                                    reviewer_provider, call_name=call.name,
                                                    args=call.arguments, max_rounds=review_max_rounds, seed=seed)
                         except Exception as exc:  # noqa: BLE001
@@ -578,8 +613,8 @@ def run_annotation_critique(session, reviewer_provider: Provider, *, groupby: st
     rm = getattr(reviewer_provider, "model", None)
     applied = _execute_registry_tool(
         session, "apply_annotation_audit",
-        {"groupby": groupby, "verdicts": verdicts, "reviewer_model": rm}, seed, stats,
-        rationale=f"record Tier-4 reviewer verdicts (reviewer_model={rm})")
+        {"groupby": groupby, "label_key": label_key, "verdicts": verdicts, "reviewer_model": rm},
+        seed, stats, rationale=f"record Tier-4 reviewer verdicts for '{label_key}' (reviewer_model={rm})")
     sm = getattr(applied, "summary", None) or {}
     return {"status": applied.status, "summary": sm, "reviewer_model": rm,
             "refuted_clusters": sm.get("refuted_clusters", []),
@@ -671,18 +706,29 @@ def run_annotation_review_loop(session, annotator_provider: Provider, reviewer_p
 
 def _run_stage_review(session, annotator: Provider, reviewer: Provider, *, call_name: str,
                       args: dict, max_rounds: int = 3, seed: int = 0) -> dict:
-    """Route the post-apply Tier-4 review to the right stage. BROAD (apply_annotation) auto-corrects
-    via the bounded loop (no premature finalize mid-pipeline); FINE (apply_fine_annotation) and FINAL
-    (finalize_annotation) verify + flag (the agent re-annotates from the recorded refuted/reason)."""
+    """Route the post-apply Tier-4 review to the right label column. EVERY label-writing tool is
+    reviewed (reliability of ALL annotation, not just the final table). BROAD (apply_annotation)
+    auto-corrects refuted clusters via the bounded loop (no premature finalize mid-pipeline); every
+    other stage verifies + flags on its own (groupby, label_key) — the refuted/suspect verdicts and
+    reasons are recorded per column, and the agent/human re-annotates from those flags."""
     cur_gb = (session.adata.uns.get("rank_genes_groups", {}) or {}).get("params", {}).get("groupby", "leiden")
     if call_name == "apply_annotation":
         return run_annotation_review_loop(
             session, annotator, reviewer, groupby=args.get("groupby", cur_gb),
             label_key=args.get("key", "major_cell_type"), max_rounds=max_rounds, seed=seed,
             finalize_after=False)
+    # verify + flag on the column THIS tool wrote (groupby + label_key per tool)
+    gb, label_key = cur_gb, "final_annotation"
     if call_name == "apply_fine_annotation":
-        return run_annotation_critique(session, reviewer, groupby=args.get("groupby", cur_gb),
-                                       label_key=args.get("fine_key", "fine_cell_type"), seed=seed)
-    # finalize_annotation
-    return run_annotation_critique(session, reviewer, groupby=cur_gb,
-                                   label_key=args.get("out_key", "final_annotation"), seed=seed)
+        gb, label_key = args.get("groupby", cur_gb), args.get("fine_key", "fine_cell_type")
+    elif call_name == "apply_malignancy":
+        gb, label_key = args.get("groupby", "cnv_leiden"), args.get("key", "malignancy")
+    elif call_name == "annotate_broad":
+        gb, label_key = args.get("groupby", cur_gb), args.get("key", "major_cell_type")
+    elif call_name in ("consensus_annotation", "harmonize_annotations"):
+        gb, label_key = cur_gb, args.get("out_key",
+                                         "celltype_consensus" if call_name == "consensus_annotation"
+                                         else "celltype_harmonized")
+    elif call_name == "finalize_annotation":
+        gb, label_key = cur_gb, args.get("out_key", "final_annotation")
+    return run_annotation_critique(session, reviewer, groupby=gb, label_key=label_key, seed=seed)

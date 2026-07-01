@@ -86,6 +86,7 @@ def test_compartment_plan_requires_compartment_key(tmp_path):
 # compartment_subset
 # --------------------------------------------------------------------------- #
 def test_compartment_subset_clustering_mode_keeps_embedding(tmp_path):
+    from scpilot.session import Session
     s = _session(_compartmented_adata(), tmp_path)
     n_parent = int(s.adata.n_obs)
     n_genes = int(s.adata.n_vars)
@@ -95,15 +96,23 @@ def test_compartment_subset_clustering_mode_keeps_embedding(tmp_path):
     assert sm["mode"] == "clustering" and sm["n_cells"] == 110
     assert sm["parent_n_cells"] == n_parent and sm["next_use_rep"] == "X_scVI"
     assert sm["recompute_rep"] is None
-    sub = s.adata
-    assert sub.n_obs == 110                               # subset replaced the working adata
+    # DEFAULT: parent is UNTOUCHED; the subset lives in its own child session directory
+    assert s.adata.n_obs == n_parent                     # parent working adata not replaced
+    assert sm["child_session_dir"] and sm["child_session_dir"].endswith("/compartments/T_NK")
+    child = Session.open(sm["child_session_dir"])
+    sub = child.adata                                     # loads the child's subset checkpoint
+    assert sub.n_obs == 110
     assert set(sub.obs["major_cell_type"].unique()) == {"T_NK"}
     assert "X_scVI" in sub.obsm                           # integration embedding preserved
     assert sub.n_vars == n_genes and "counts" in sub.layers  # genes never dropped
+    # provenance pointer back to the parent (reproducibility)
+    assert child.manifest.derived_from["compartment"] == "T_NK"
+    assert child.manifest.derived_from["parent_session_id"] == s.manifest.session_id
     assert r.determinism_grade == "A" and r.checkpoint
 
 
 def test_compartment_subset_markers_mode_recomputes_features(tmp_path):
+    from scpilot.session import Session
     s = _session(_compartmented_adata(), tmp_path)
     r = tools.run("compartment_subset", s, compartment="Epithelial", mode="markers",
                   n_top_genes=20, n_pcs=10)
@@ -111,10 +120,50 @@ def test_compartment_subset_markers_mode_recomputes_features(tmp_path):
     sm = r.summary
     assert sm["mode"] == "markers" and sm["n_cells"] == 180
     assert sm["x_state"] == "log1p" and sm["recompute_rep"] == "X_pca"
-    sub = s.adata
+    sub = Session.open(sm["child_session_dir"]).adata
     assert "highly_variable" in sub.var and int(sub.var["highly_variable"].sum()) == sm["n_hvg"]
     assert "X_pca" in sub.obsm and "scale.data" in sub.layers
     assert r.determinism_grade == "B"
+
+
+def test_compartment_subset_in_place_legacy(tmp_path):
+    # in_place=True keeps the legacy single-session behaviour: subset REPLACES the parent adata.
+    s = _session(_compartmented_adata(), tmp_path)
+    r = tools.run("compartment_subset", s, compartment="T_NK", mode="clustering",
+                  use_rep="X_scVI", in_place=True)
+    assert r.status == "success", r.error
+    assert r.summary["child_session_dir"] is None
+    assert s.adata.n_obs == 110                           # subset replaced the working adata
+    assert set(s.adata.obs["major_cell_type"].unique()) == {"T_NK"}
+
+
+def test_child_session_loop_merges_back_to_parent(tmp_path):
+    # END-TO-END: subset two compartments into their own child sessions, annotate each (fine labels),
+    # then merge_fine_annotations(compartments_root) reassembles them onto the untouched parent.
+    from scpilot.session import Session
+    s = _session(_compartmented_adata(), tmp_path)
+    n_parent = int(s.adata.n_obs)
+    for comp in ("T_NK", "Epithelial"):
+        r = tools.run("compartment_subset", s, compartment=comp, mode="clustering", use_rep="X_scVI")
+        assert r.status == "success", r.error
+        child = Session.open(r.summary["child_session_dir"])
+        sub = child.adata
+        sub.obs["fine_cell_type"] = f"{comp}_subtypeA"
+        sub.obs["facs_style_label"] = f"{comp}+ cells"
+        sub.obs["cell_state"] = "resting"
+        child.set_adata(sub)
+        child.checkpoint("apply_fine_annotation", x_state=child.manifest.x_state, params={})
+    # parent never changed by the subsetting
+    assert s.adata.n_obs == n_parent and "fine_cell_type" not in s.adata.obs
+    m = tools.run("merge_fine_annotations", s, compartments_root=str(tmp_path / "sess" / "compartments"))
+    assert m.status == "success", m.error
+    sm = m.summary
+    assert sm["n_sources"] == 2
+    assert "fine_cell_type" in s.adata.obs
+    fine = set(s.adata.obs["fine_cell_type"].astype(str).unique())
+    assert {"T_NK_subtypeA", "Epithelial_subtypeA"} <= fine
+    # the un-subclustered compartment carries its Tier-1 major_cell_type forward
+    assert sm["n_carried_terminal"] >= 1
 
 
 def test_compartment_subset_unknown_compartment_errors(tmp_path):

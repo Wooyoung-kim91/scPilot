@@ -202,9 +202,23 @@ Example output:
 
 Purpose:
 
-- Audit the final annotation table.
+- Audit **every** annotation result — not only the final table.
 - Detect inconsistent labels.
 - Flag low-confidence or artifact-prone clusters.
+
+Tier 4 is a **universal invariant**: reliability of the annotation is secured only if **each label
+column is independently reviewed** right after it is written — broad (`major_cell_type`), fine
+(`fine_cell_type`), malignancy (`malignancy`), any consensus/harmonized label, and the final
+(`final_annotation`). The review runs `annotation_audit(label_key=<that column>)` → an **independent
+adversarial critique** → `apply_annotation_audit(label_key=<that column>)`; refuted labels are
+re-inferred (broad auto-corrects via a bounded loop; other stages verify + flag). Per-column coverage
+and the reviewer identity are recorded, and the governance gate (`harness_audit`) fails if any label
+column present in the data was left unreviewed.
+
+The reviewer is a **pluggable role**: it can be the annotator itself (self-review, the minimum
+fallback) or — preferably — a **different engine** (another API model, a local LLM API, or Codex via
+an OpenAI-compatible endpoint / a Codex CLI plugin the host delegates to). Cross-engine
+annotator≠reviewer disagreement is exactly what a human should adjudicate.
 
 Checks:
 

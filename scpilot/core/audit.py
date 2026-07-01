@@ -342,14 +342,24 @@ def harness_audit(session, *, label_key: str = "major_cell_type", **params) -> S
         n_dec = sum(1 for ln in session.decisions_path.read_text().splitlines() if ln.strip())
     anno = adata.uns.get(UNS_ANNO, {}) or {}
     t4 = anno.get("tier4_audit", {}) or {}
+    reviews = anno.get("tier4_reviews", {}) or {}          # per-column Tier-4 coverage ledger
 
     checks: list[dict] = []
     def chk(name, ok, detail, sev="fail"):
         checks.append({"check": name, "status": "pass" if ok else sev, "detail": detail})
 
-    # 1) Tier-4 INDEPENDENT review actually ran
-    chk("tier4_review_ran", ("annotation_audit" in tools_run and "apply_annotation_audit" in tools_run),
-        f"annotation_audit={'annotation_audit' in tools_run}, apply_annotation_audit={'apply_annotation_audit' in tools_run}")
+    # 1) Tier-4 INDEPENDENT review ran on EVERY annotation column that exists (broad/fine/
+    #    malignancy/final) — reliability of ALL annotation is secured only if each label column
+    #    was independently reviewed, not just one. A present-but-unreviewed column is a violation.
+    label_cols = [c for c in ("major_cell_type", "fine_cell_type", "malignancy", "final_annotation")
+                  if c in adata.obs.columns]
+    unreviewed = [c for c in label_cols if c not in reviews]
+    chk("tier4_review_ran", ("apply_annotation_audit" in tools_run) and not unreviewed,
+        f"annotation_columns={label_cols}, reviewed={sorted(reviews)}, unreviewed={unreviewed}")
+    # 1b) each reviewed column names its reviewer (cross-model provenance; warn if any missing)
+    no_reviewer = [c for c, r in reviews.items() if not r.get("reviewer_model")]
+    chk("tier4_review_provenance", not no_reviewer,
+        f"columns_missing_reviewer_model={no_reviewer}", sev="warn")
     # 2) reviewer provenance recorded (cross-model is the goal; at least the model id must be logged)
     chk("tier4_reviewer_recorded", bool(t4.get("reviewer_model")),
         f"reviewer_model={t4.get('reviewer_model')}", sev="warn")
@@ -389,7 +399,9 @@ def harness_audit(session, *, label_key: str = "major_cell_type", **params) -> S
         "n_checks": len(checks), "n_pass": sum(1 for c in checks if c["status"] == "pass"),
         "n_warn": n_warn, "n_fail": n_fail,
         "violations": [c["check"] for c in checks if c["status"] != "pass"],
-        "reviewer_model": t4.get("reviewer_model"), "tools_run": tools_run, "checks": checks,
+        "reviewer_model": t4.get("reviewer_model"),
+        "tier4_coverage": {k: v.get("reviewer_model") for k, v in reviews.items()},
+        "tools_run": tools_run, "checks": checks,
         "verdict": "complete" if n_fail == 0 else "incomplete",
     }
     warnings = [f"{c['check']}: {c['detail']}" for c in checks if c["status"] == "fail"]
@@ -440,11 +452,21 @@ def apply_annotation_audit(session, *, groupby: str = "leiden", verdicts: dict |
     suspect_reasons = {c: str(vd[c].get("note", "")) for c in suspect_clusters}
     n_refuted, n_suspect = len(refuted_clusters), len(suspect_clusters)
     adata.uns.setdefault(UNS_ANNO, {})
-    adata.uns[UNS_ANNO]["tier4_audit"] = {
+    record = {
         "groupby": groupby, "label_key": label_key, "reviewer_model": reviewer_model,
         "verdicts": vd, "n_refuted": n_refuted, "n_suspect": n_suspect,
         "refuted_clusters": refuted_clusters, "refuted_reasons": refuted_reasons,
         "suspect_clusters": suspect_clusters, "suspect_reasons": suspect_reasons,
+    }
+    adata.uns[UNS_ANNO]["tier4_audit"] = record          # LAST review (back-compat)
+    # PER-COLUMN coverage ledger: Tier-4 must review EVERY annotation column (broad/fine/
+    # malignancy/final), not just one. harness_audit reads this to prove each label column that
+    # exists in obs was independently reviewed (and by whom). Keyed by label_key.
+    reviews = adata.uns[UNS_ANNO].setdefault("tier4_reviews", {})
+    reviews[str(label_key)] = {
+        "groupby": groupby, "reviewer_model": reviewer_model,
+        "n_reviewed": len(vd), "n_refuted": n_refuted, "n_suspect": n_suspect,
+        "refuted_clusters": refuted_clusters, "suspect_clusters": suspect_clusters,
     }
     try:
         session.log_decision(S.DecisionEvent(

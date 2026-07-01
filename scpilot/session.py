@@ -346,6 +346,7 @@ class Manifest:
     updated_at: str
     out_dir: str
     input: dict = field(default_factory=dict)          # {path, fingerprint}
+    derived_from: dict | None = None                    # child sessions: parent provenance pointer
     x_state: str = "unknown"
     counts_fingerprint: dict | None = None
     stage: str | None = None                            # last completed stage
@@ -428,6 +429,26 @@ class Session:
         (out / ".lock").write_text(json.dumps({"pid": os.getpid(), "at": now}))
         sess.save()
         return sess
+
+    def create_child(self, name: str, *, seed_adata, stage: str, x_state: str | None = None,
+                     params: dict | None = None, derived_from: dict | None = None) -> "Session":
+        """Spawn a nested session under ``<self.out>/compartments/<name>/`` seeded with
+        ``seed_adata`` as its checkpoint 0. Used by compartment_subset so each Tier-2 compartment
+        gets its OWN directory (checkpoints/artifacts/run-log) instead of overwriting the parent's
+        working adata. The child is a full, independently replayable Session; ``derived_from``
+        records the parent pointer (session id, checkpoint, groupby, compartment) for provenance.
+        merge_fine_annotations later globs ``<self.out>/compartments`` to reassemble the parent."""
+        child_out = self.out / "compartments" / name
+        child = Session.create(child_out, input_path=(self.manifest.input or {}).get("path"),
+                               exist_ok=True)
+        child.manifest.derived_from = dict(derived_from or {})
+        child.set_adata(seed_adata)
+        # first checkpoint CREATES this session's counts fingerprint (like ingest/load), so it must
+        # not require a pre-existing one — the subset carries the parent's immutable counts layer.
+        child.checkpoint(stage, adata=seed_adata, x_state=x_state or self.manifest.x_state,
+                         params=params or {}, require_counts=False)
+        child.save()
+        return child
 
     @classmethod
     def open(cls, out_dir: str | Path) -> "Session":

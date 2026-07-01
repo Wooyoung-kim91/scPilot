@@ -220,12 +220,17 @@ def _safe(label: str) -> str:
                       "(compartment-relevant feature space for within-compartment DE). mode='clustering' is "
                       "integration-aware: keeps the use_rep embedding (e.g. X_scVI) subset untouched so batch "
                       "correction is preserved for neighbors→leiden. Counts stay per-cell immutable; genes are "
-                      "never dropped. Writes a subset checkpoint (parent stays as the prior checkpoint); run "
-                      "cluster (then markers/annotation_review) on the subset next.")
+                      "never dropped. By DEFAULT writes the subset into its OWN nested session directory "
+                      "<parent>/compartments/<compartment>/ and returns summary.child_session_dir — run cluster "
+                      "(then markers/fine_annotation_review/apply_fine_annotation) against THAT directory, then "
+                      "reassemble with merge_fine_annotations(compartments_root=<parent>/compartments). The parent "
+                      "is left untouched, so multiple compartments can be subset without reloading. Pass "
+                      "in_place=True for the legacy single-session behaviour (subset replaces the parent adata).")
 def compartment_subset(session, *, compartment: str | None = None, groupby: str | None = None,
                        mode: str = "clustering", use_rep: str = "X_scVI",
                        n_top_genes: int = 2000, n_pcs: int = 30, target_sum: float = 1e4,
-                       hvg_batch_key: str | None = None, seed: int = 0, **params) -> S.ToolResult:
+                       hvg_batch_key: str | None = None, seed: int = 0,
+                       in_place: bool = False, **params) -> S.ToolResult:
     import scanpy as sc
 
     t0 = time.time()
@@ -298,9 +303,31 @@ def compartment_subset(session, *, compartment: str | None = None, groupby: str 
 
     stage = f"compartment_{safe}_{mode}"
     resolved = {"compartment": str(compartment), "groupby": gkey, "mode": mode,
-                "use_rep": next_use_rep, "seed": seed, **reprocess}
-    session.set_adata(sub)
-    cp = session.checkpoint(stage, adata=sub, x_state=x_state, params=resolved)
+                "use_rep": next_use_rep, "seed": seed, "in_place": in_place, **reprocess}
+
+    if in_place:
+        # legacy single-session behaviour: the subset REPLACES the parent's working adata and
+        # checkpoints into the parent session (kept for back-compat / simple one-compartment runs).
+        session.set_adata(sub)
+        cp_path = session.checkpoint(stage, adata=sub, x_state=x_state, params=resolved).path
+        child_dir = None
+    else:
+        # DEFAULT: each compartment gets its OWN session directory under <parent>/compartments/<safe>/
+        # so subsets are stored per representative cell group and the parent is left untouched (no
+        # reload needed between compartments). Run cluster/markers/fine steps against child_session_dir;
+        # reassemble later with merge_fine_annotations(compartments_root=<parent>/compartments).
+        parent_cp = session.latest_checkpoint() or {}
+        derived_from = {
+            "parent_session_id": session.manifest.session_id,
+            "parent_out_dir": str(session.out),
+            "parent_checkpoint_id": parent_cp.get("id"),
+            "parent_checkpoint_fingerprint": parent_cp.get("fingerprint"),
+            "groupby": gkey, "compartment": str(compartment), "n_cells": n_sub,
+        }
+        child = session.create_child(safe, seed_adata=sub, stage=stage, x_state=x_state,
+                                     params=resolved, derived_from=derived_from)
+        cp_path = (child.latest_checkpoint() or {}).get("path")
+        child_dir = str(child.out)
 
     summary = {
         "compartment": str(compartment), "groupby": gkey, "mode": mode,
@@ -308,9 +335,10 @@ def compartment_subset(session, *, compartment: str | None = None, groupby: str 
         "fraction_of_parent": round(n_sub / int(adata.n_obs), 4),
         "n_genes": int(sub.n_vars), "x_state": x_state,
         "next_use_rep": next_use_rep, "stage": stage,
+        "in_place": in_place, "child_session_dir": child_dir,
         **reprocess,
     }
-    return S.success("compartment_subset", summary=summary, checkpoint=cp.path,
+    return S.success("compartment_subset", summary=summary, checkpoint=cp_path,
                      warnings=warnings, determinism_grade=grade, duration_s=round(time.time() - t0, 3),
                      params=resolved,
                      suggested_next_tools=["cluster"] if mode == "clustering" else ["cluster", "markers"])

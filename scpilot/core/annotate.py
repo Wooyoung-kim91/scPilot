@@ -808,9 +808,26 @@ COMPARTMENT_ORDER = [
 ]
 
 
+def _label_genes(label, var_upper):
+    """Gene symbols named inside a FACS-style label (e.g. 'CD8+ PD-1+ T cells' -> ['CD8','PDCD1'?])
+    that ACTUALLY EXIST in the dataset's var_names. Tokens are matched case-insensitively after
+    stripping FACS decorations (trailing +/-, hi/lo/high/low). Never invents genes — only returns
+    var_names that match a token, so nothing outside the data can enter the panel."""
+    import re
+    out = []
+    for raw in re.split(r"[^A-Za-z0-9\-]+", str(label)):
+        for cand in (raw, re.sub(r"(hi|lo|high|low|\+|\-)$", "", raw, flags=re.I)):
+            key = cand.strip().upper()
+            if key and key in var_upper and var_upper[key] not in out:
+                out.append(var_upper[key])
+                break
+    return out
+
+
 def derive_dotplot_markers(adata, *, cluster_key, label_map, top_k=5,
                            min_pct=0.25, min_lfc=1.0, padj_max=0.05, min_specificity=0.1,
-                           max_pct_out=0.5, order=None, family_map=None):
+                           max_pct_out=0.5, order=None, family_map=None,
+                           include_label_genes=False):
     """Per-cell-type dotplot markers that ARE the Tier-1 annotation EVIDENCE — the same DE-selected
     significant markers the LLM read to make the call, shown per assigned cell type. No external
     marker DB, no lineage prior: the marker SELECTION itself is the evidence (that is the point).
@@ -901,9 +918,19 @@ def derive_dotplot_markers(adata, *, cluster_key, label_map, top_k=5,
             fam_size[_family(c)] += ctsize[c]
         ct_iter = sorted(owned, key=lambda c: (-fam_size[_family(c)], _family(c), -ctsize[c]))
 
+    # OPT-IN: also surface genes NAMED in a cell type's FACS label (e.g. CD8 in 'CD8+ T cells') so a
+    # label's namesake marker isn't missing from its own panel — but ONLY if the DE gate actually
+    # SELECTED that gene for this type's clusters (present in best[ct]). A gene the data didn't select
+    # is still excluded, so this never overrides the evidence — it just re-ranks passing label genes
+    # to the front. Default OFF keeps the panel purely DE-derived (no circular label->marker->label).
+    var_upper = {str(v).upper(): str(v) for v in adata.var_names} if include_label_genes else {}
     panels = {}
     for ct in ct_iter:
         genes = [g for g, _ in sorted(owned[ct].items(), key=lambda kv: -kv[1])][:top_k]
+        if include_label_genes:
+            forced = [g for g in _label_genes(ct, var_upper) if g in best[ct] and g not in genes]
+            if forced:
+                genes = forced + genes                    # label genes first, keep DE-ranked rest
         if genes:
             panels[ct] = genes
     return panels

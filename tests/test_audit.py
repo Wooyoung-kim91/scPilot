@@ -148,6 +148,23 @@ def test_audit_tools_registered():
     assert {"annotation_audit", "apply_annotation_audit", "harness_audit"} <= names
 
 
+def test_apply_annotation_audit_records_per_column_ledger(tmp_path):
+    # apply_annotation_audit must record coverage KEYED BY label_key so harness_audit can prove
+    # EVERY annotation column was reviewed. Two reviews on different columns → two ledger entries.
+    from scpilot.core.annotate import UNS_ANNO
+    s = _audit_session(tmp_path)
+    tools.run("apply_annotation_audit", s, groupby="leiden", label_key="major_cell_type",
+              verdicts={"0": {"status": "confirmed"}, "1": {"status": "refuted", "note": "weak"}},
+              reviewer_model="rev-A")
+    tools.run("apply_annotation_audit", s, groupby="leiden", label_key="malignancy",
+              verdicts={"3": {"status": "suspect", "note": "no cnv"}}, reviewer_model="rev-B")
+    ledger = s.adata.uns[UNS_ANNO]["tier4_reviews"]
+    assert set(ledger) == {"major_cell_type", "malignancy"}
+    assert ledger["major_cell_type"]["reviewer_model"] == "rev-A"
+    assert ledger["malignancy"]["reviewer_model"] == "rev-B"
+    assert ledger["major_cell_type"]["refuted_clusters"] == ["1"]
+
+
 def test_harness_audit_governance_scorecard(tmp_path):
     # the governance/監視 agent: checks the harness's OWN action rules were honored.
     s = _audit_session(tmp_path)
@@ -157,11 +174,17 @@ def test_harness_audit_governance_scorecard(tmp_path):
         s._append_jsonl(s.run_log_path, {"tool": tool, "status": "success", "seed": 0, "recipe_hash": tool})
     s.adata.uns[UNS_ANNO]["tier4_audit"] = {"reviewer_model": "rev-model",
                                             "refuted_clusters": [], "suspect_clusters": ["3"]}
+    # PER-COLUMN Tier-4 coverage: EVERY label column present in obs must be independently reviewed
+    # (here major_cell_type + malignancy). harness_audit now gates on this ledger, not one audit call.
+    s.adata.uns[UNS_ANNO]["tier4_reviews"] = {
+        "major_cell_type": {"reviewer_model": "rev-model", "refuted_clusters": [], "suspect_clusters": ["3"]},
+        "malignancy": {"reviewer_model": "rev-model", "refuted_clusters": [], "suspect_clusters": []},
+    }
     s.adata.obs["annotation_review_required"] = (s.adata.obs["leiden"].astype(str) == "3")
     r = tools.run("harness_audit", s)
     assert r.status == "success"
     st = {c["check"]: c["status"] for c in r.summary["checks"]}
-    assert st["tier4_review_ran"] == "pass"          # both audit steps present
+    assert st["tier4_review_ran"] == "pass"          # every annotation column reviewed
     assert st["marker_db_free"] == "pass"            # no annotate_broad
     assert st["annotation_present"] == "pass" and st["finalized"] == "pass"
     assert st["flags_lead_to_action"] == "pass"      # suspect cl3 → review_required set
@@ -177,6 +200,30 @@ def test_harness_audit_governance_scorecard(tmp_path):
     assert st2["tier4_review_ran"] == "fail"         # no annotation_audit/apply_annotation_audit
     assert st2["marker_db_free"] == "warn"           # annotate_broad used
     assert r2.summary["verdict"] == "incomplete" and "tier4_review_ran" in r2.summary["violations"]
+
+
+def test_harness_audit_flags_unreviewed_annotation_column(tmp_path):
+    # The exact reliability gap: a fine (Tier-2) annotation exists but was NEVER independently
+    # reviewed. Even though broad + malignancy were reviewed, the present-but-unreviewed column
+    # must fail the per-column coverage gate (reliability of ALL annotation, not just one).
+    s = _audit_session(tmp_path)
+    for tool in ["markers", "apply_annotation", "annotation_audit", "apply_annotation_audit",
+                 "apply_fine_annotation", "finalize_annotation"]:
+        s._append_jsonl(s.run_log_path, {"tool": tool, "status": "success", "seed": 0, "recipe_hash": tool})
+    # fine_cell_type + final_annotation now exist in obs, but only broad + malignancy were reviewed
+    s.adata.obs["fine_cell_type"] = s.adata.obs["major_cell_type"].astype(str) + "_sub"
+    s.adata.obs["final_annotation"] = s.adata.obs["major_cell_type"]
+    s.adata.uns.setdefault(UNS_ANNO, {})["tier4_reviews"] = {
+        "major_cell_type": {"reviewer_model": "rev-model"},
+        "malignancy": {"reviewer_model": "rev-model"},
+    }
+    r = tools.run("harness_audit", s)
+    st = {c["check"]: c["status"] for c in r.summary["checks"]}
+    assert st["tier4_review_ran"] == "fail"           # fine_cell_type + final_annotation unreviewed
+    # the detail names the unreviewed columns so the action item is actionable
+    detail = next(c["detail"] for c in r.summary["checks"] if c["check"] == "tier4_review_ran")
+    assert "fine_cell_type" in detail and "final_annotation" in detail
+    assert r.summary["verdict"] == "incomplete"
 
 
 # ---------------------------------------------------------------------------
