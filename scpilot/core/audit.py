@@ -289,6 +289,29 @@ def annotation_audit(session, *, groupby: str = "leiden", label_key: str = "majo
                                    "support_min": min(sup), "support_max": max(sup),
                                    "support_spread": round(max(sup) - min(sup), 3)})
 
+    # ---- GRANULARITY assessment: EVIDENCE for a resolution recommendation (over/under-clustering).
+    # NO hardcoded threshold — like cluster_sweep's suggested_resolution or qc's suggested_cutoffs,
+    # the tool emits the raw numbers/ratios and the INDEPENDENT reviewer judges whether the clustering
+    # is too fine (many clusters collapse to the same label + weak-support noise clusters → lower
+    # resolution) or too coarse (distinct profiles fused under one label → raise resolution). ----
+    n_cl = len(per_cluster)
+    n_lab = len(label_to_clusters)
+    n_flagged = sum(1 for c in per_cluster if c["review_status"] == "flagged")
+    weak_ids = [c["cluster_id"] for c in per_cluster if "weak_marker_support" in c["flags"]]
+    collision_ids = sorted({cid for col in collisions for cid in col["clusters"]})
+    granularity = {
+        "n_clusters": n_cl,
+        "n_labels": n_lab,
+        # clusters per distinct label — >1 means the resolution splits populations finer than the
+        # labels distinguish (a high value is the primary over-clustering signal).
+        "collapse_ratio": round(n_cl / n_lab, 3) if n_lab else None,
+        "n_redundant_label_clusters": sum(max(0, len(cls) - 1) for cls in label_to_clusters.values()),
+        "max_clusters_per_label": max((len(cls) for cls in label_to_clusters.values()), default=0),
+        "n_profile_collision_clusters": len(collision_ids),   # cross-label profile ambiguity
+        "n_weak_support_clusters": len(weak_ids),             # low-evidence (noise) clusters
+        "frac_flagged": round(n_flagged / n_cl, 3) if n_cl else 0.0,
+    }
+
     art_dir = session.artifacts_dir
     art_dir.mkdir(parents=True, exist_ok=True)
     json_path = session.artifact_path("annotation_audit.json")
@@ -298,6 +321,7 @@ def annotation_audit(session, *, groupby: str = "leiden", label_key: str = "majo
                    "single_patient", "batch_specific", "doublet_stress_qc", "malignancy_without_cnv"],
         "marker_criteria": marker_criteria,   # pct/logFC/p-value bar each claimed marker is checked against
         "marker_db_used": False, "verdict_vocabulary": list(AUDIT_STATUS),
+        "granularity": granularity,           # resolution-feedback evidence (reviewer decides)
         "clusters": per_cluster,
         "marker_profile_collisions": collisions,
         "label_marker_support": label_support,
@@ -313,8 +337,10 @@ def annotation_audit(session, *, groupby: str = "leiden", label_key: str = "majo
         "status_counts": status_counts,
         "n_marker_profile_collisions": len(collisions),
         "n_malignant_without_cnv": sum(1 for c in per_cluster if "malignant_without_cnv" in c["flags"]),
+        "granularity": granularity,   # resolution-feedback evidence; reviewer recommends raise/lower/none
         "audit_input": str(json_path),
-        "reviewer_action": "critique each flagged label via ANNOTATION_AUDIT_PROMPT, then apply_annotation_audit",
+        "reviewer_action": "critique each flagged label AND assess granularity (recommend a resolution "
+                           "change if over/under-clustered) via ANNOTATION_AUDIT_PROMPT, then apply_annotation_audit",
     }
     tables = {"audit": S.table_preview(pd.DataFrame(rows), max_rows=50)} if rows else {}
     artifacts = [S.artifact_csv(str(json_path), description="Tier-4 annotation consistency audit (evidence)")]
@@ -414,13 +440,15 @@ def harness_audit(session, *, label_key: str = "major_cell_type", **params) -> S
           description="Record an INDEPENDENT reviewer's Tier-4 verdicts (from ANNOTATION_AUDIT_PROMPT) into "
                       "obs[status_key] (confirmed/suspect/refuted) + obs[review_required_key]. The reviewer flags "
                       "WHETHER each label holds; it does NOT relabel — refuted clusters are re-annotated by the "
-                      "annotator. Deterministic given the verdicts, so the critique is replayable. Run after "
-                      "annotation_audit.")
+                      "annotator. Also records the reviewer's optional GRANULARITY recommendation (advisory: "
+                      "resolution down/none/up when over/under-clustered). Deterministic given the verdicts, so "
+                      "the critique is replayable. Run after annotation_audit.")
 def apply_annotation_audit(session, *, groupby: str = "leiden", verdicts: dict | None = None,
                            label_key: str = "major_cell_type",
                            status_key: str = "annotation_audit_status",
                            review_required_key: str = "annotation_review_required",
-                           reviewer_model: str | None = None, **params) -> S.ToolResult:
+                           reviewer_model: str | None = None,
+                           granularity: dict | None = None, **params) -> S.ToolResult:
     t0 = time.time()
     adata = session.adata
     if groupby not in adata.obs.columns:
@@ -452,11 +480,13 @@ def apply_annotation_audit(session, *, groupby: str = "leiden", verdicts: dict |
     suspect_reasons = {c: str(vd[c].get("note", "")) for c in suspect_clusters}
     n_refuted, n_suspect = len(refuted_clusters), len(suspect_clusters)
     adata.uns.setdefault(UNS_ANNO, {})
+    gran = dict(granularity) if isinstance(granularity, dict) else None   # advisory resolution feedback
     record = {
         "groupby": groupby, "label_key": label_key, "reviewer_model": reviewer_model,
         "verdicts": vd, "n_refuted": n_refuted, "n_suspect": n_suspect,
         "refuted_clusters": refuted_clusters, "refuted_reasons": refuted_reasons,
         "suspect_clusters": suspect_clusters, "suspect_reasons": suspect_reasons,
+        "granularity": gran,
     }
     adata.uns[UNS_ANNO]["tier4_audit"] = record          # LAST review (back-compat)
     # PER-COLUMN coverage ledger: Tier-4 must review EVERY annotation column (broad/fine/
@@ -467,6 +497,7 @@ def apply_annotation_audit(session, *, groupby: str = "leiden", verdicts: dict |
         "groupby": groupby, "reviewer_model": reviewer_model,
         "n_reviewed": len(vd), "n_refuted": n_refuted, "n_suspect": n_suspect,
         "refuted_clusters": refuted_clusters, "suspect_clusters": suspect_clusters,
+        "granularity": gran,
     }
     try:
         session.log_decision(S.DecisionEvent(
@@ -489,6 +520,7 @@ def apply_annotation_audit(session, *, groupby: str = "leiden", verdicts: dict |
         "suspect_reasons": suspect_reasons,
         "n_review_required": int(adata.obs[review_required_key].sum()),
         "status_distribution": {str(k): int(v) for k, v in adata.obs[status_key].value_counts().items()},
+        "granularity": gran,   # advisory: reviewer's resolution recommendation (down/none/up)
     }
     cp = session.checkpoint("apply_annotation_audit", x_state=session.manifest.x_state,
                             params={"groupby": groupby, "status_key": status_key,

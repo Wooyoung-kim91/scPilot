@@ -148,6 +148,37 @@ def test_audit_tools_registered():
     assert {"annotation_audit", "apply_annotation_audit", "harness_audit"} <= names
 
 
+def test_annotation_audit_emits_granularity_evidence(tmp_path):
+    # annotation_audit emits granularity EVIDENCE (no hardcoded threshold) so the reviewer can judge
+    # whether the resolution is too fine. The fixture splits one profile (A-markers) across clusters
+    # 0 and 1 → collapse_ratio > 1 and a profile collision are surfaced as over-clustering signals.
+    s = _audit_session(tmp_path)
+    r = tools.run("annotation_audit", s, groupby="leiden", label_key="major_cell_type")
+    g = r.summary["granularity"]
+    assert g["n_clusters"] == 4 and g["n_labels"] >= 1
+    assert g["collapse_ratio"] == round(g["n_clusters"] / g["n_labels"], 3)
+    # TypeA is assigned to clusters 0 and 3 → at least one redundant (same-label) cluster
+    assert g["n_redundant_label_clusters"] >= 1 and g["max_clusters_per_label"] >= 2
+    for k in ("n_profile_collision_clusters", "n_weak_support_clusters", "frac_flagged"):
+        assert k in g
+    # no hardcoded verdict — the tool does NOT decide "over_clustered"; that's the reviewer's call
+    assert "assessment" not in g and "recommend_resolution" not in g
+
+
+def test_apply_annotation_audit_records_granularity_recommendation(tmp_path):
+    # the reviewer's advisory resolution recommendation is recorded (uns + summary) for the human/agent.
+    from scpilot.core.annotate import UNS_ANNO
+    s = _audit_session(tmp_path)
+    gran = {"assessment": "over_clustered", "recommend_resolution": "down",
+            "rationale": "collapse_ratio 4.0; 3 weak-support clusters"}
+    r = tools.run("apply_annotation_audit", s, groupby="leiden", label_key="major_cell_type",
+                  verdicts={"0": {"status": "confirmed"}}, reviewer_model="rev-A", granularity=gran)
+    assert r.summary["granularity"]["recommend_resolution"] == "down"
+    t4 = s.adata.uns[UNS_ANNO]["tier4_audit"]
+    assert t4["granularity"]["assessment"] == "over_clustered"
+    assert s.adata.uns[UNS_ANNO]["tier4_reviews"]["major_cell_type"]["granularity"]["recommend_resolution"] == "down"
+
+
 def test_apply_annotation_audit_records_per_column_ledger(tmp_path):
     # apply_annotation_audit must record coverage KEYED BY label_key so harness_audit can prove
     # EVERY annotation column was reviewed. Two reviews on different columns → two ledger entries.

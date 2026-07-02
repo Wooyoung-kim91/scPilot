@@ -611,16 +611,19 @@ def run_annotation_critique(session, reviewer_provider: Provider, *, groupby: st
     verdicts = {str(v["cluster_id"]): {k: v[k] for k in v if k != "cluster_id"}
                 for v in args.get("verdicts", []) if isinstance(v, dict) and "cluster_id" in v}
     rm = getattr(reviewer_provider, "model", None)
+    gran = args.get("granularity") if isinstance(args.get("granularity"), dict) else None
     applied = _execute_registry_tool(
         session, "apply_annotation_audit",
-        {"groupby": groupby, "label_key": label_key, "verdicts": verdicts, "reviewer_model": rm},
+        {"groupby": groupby, "label_key": label_key, "verdicts": verdicts, "reviewer_model": rm,
+         "granularity": gran},
         seed, stats, rationale=f"record Tier-4 reviewer verdicts for '{label_key}' (reviewer_model={rm})")
     sm = getattr(applied, "summary", None) or {}
     return {"status": applied.status, "summary": sm, "reviewer_model": rm,
             "refuted_clusters": sm.get("refuted_clusters", []),
             "refuted_reasons": sm.get("refuted_reasons", {}),
             "suspect_clusters": sm.get("suspect_clusters", []),
-            "suspect_reasons": sm.get("suspect_reasons", {})}
+            "suspect_reasons": sm.get("suspect_reasons", {}),
+            "granularity": gran}   # advisory resolution feedback (over/under-clustered)
 
 
 def run_annotation_review_loop(session, annotator_provider: Provider, reviewer_provider: Provider, *,

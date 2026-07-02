@@ -277,6 +277,11 @@ CANONICAL FLOW (skip steps already satisfied per detect_state; stop when the goa
     LABEL them 'Low_quality' or 'Doublet' explicitly (NOT a biological cell type). Cross-model review
     (reviewer ≠ annotator) is preferred to complement each model's blind spots. (mode-2 `scpilot run`
     runs this loop automatically via --review / --reviewer-model / --annotator-model / --review-max-rounds.)
+    GRANULARITY (advisory): annotation_audit also emits granularity evidence and the reviewer records a
+    resolution recommendation (summary.granularity: over/under_clustered → down/none/up). If it says
+    `down` (many clusters collapse to the same labels + weak-support noise clusters) or `up` (distinct
+    profiles fused under one label), RE-CLUSTER at the adjusted resolution (cluster_sweep → cluster) and
+    re-annotate. This is advice, not auto-applied — you decide whether to act on it.
 
 12. harness_audit (GOVERNANCE completeness gate — run LAST). It re-reads the run-log + decisions +
     obs/uns and checks that the harness's OWN action rules & invariants were actually honored (Tier-4
@@ -499,6 +504,20 @@ Be skeptical: default to suspect/refuted when evidence is weak, and cite the spe
 ANNOTATION_AUDIT_SCHEMA object, then apply_annotation_audit records it (pass reviewer_model). This
 runs as a BOUNDED loop: refuted clusters are re-annotated and re-audited for up to a few rounds, then
 any still-refuted labels are left flagged for a human.
+
+ALSO assess GRANULARITY (clustering resolution feedback — advisory). Read the audit's `granularity`
+evidence and set the optional `granularity` field:
+- collapse_ratio (clusters per distinct label), n_redundant_label_clusters, max_clusters_per_label —
+  HIGH values mean the resolution splits one population into many clusters that all get the same
+  label (over-clustering).
+- n_weak_support_clusters (low/no-evidence noise clusters) and n_profile_collision_clusters
+  (differently-labeled clusters with near-identical profiles) — many of these also signal too-fine,
+  noisy clustering.
+- assessment=over_clustered + recommend_resolution=down when the above are high (many labels have
+  several near-duplicate/weak clusters); assessment=under_clustered + recommend_resolution=up when
+  distinct marker profiles are being fused under ONE label (few clusters, collisions across a broad
+  label); else appropriate + none. This does NOT relabel anything — it advises RE-CLUSTERING at a
+  different resolution for the human/agent to act on. Cite the granularity numbers in `rationale`.
 """
 
 # ---------------------------------------------------------------------------
@@ -603,6 +622,20 @@ ANNOTATION_AUDIT_SCHEMA = {
             },
         },
         "reviewer_model": {"type": "string"},   # which model produced this second opinion
+        # GRANULARITY feedback (advisory): read annotation_audit's `granularity` evidence
+        # (collapse_ratio, redundant/weak-support/collision cluster counts) and judge whether the
+        # clustering resolution is too fine / too coarse. This does NOT relabel anything — it advises
+        # a re-clustering resolution change for the human/agent to act on.
+        "granularity": {
+            "type": "object",
+            "properties": {
+                "assessment": {"type": "string",
+                               "enum": ["over_clustered", "appropriate", "under_clustered"]},
+                "recommend_resolution": {"type": "string", "enum": ["down", "none", "up"]},
+                "rationale": {"type": "string"},   # cite the granularity evidence
+            },
+            "required": ["assessment", "recommend_resolution"],
+        },
     },
     "required": ["verdicts"],
 }
