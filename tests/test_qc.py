@@ -86,3 +86,54 @@ def test_qc_filter_subsets_cells(tmp_path):
     r2 = tools.run("qc_filter", s2, min_genes=10_000, max_pct_mt=100.0)
     assert r2.status == "error" and r2.error_code == "convergence_failed"
     assert r2.recoverable is True
+
+
+def _mouse_qc_fixture(n_per_sample=30):
+    """Mouse-style Title-case symbols: mt-*/Rp*/Epcam/Cd3d (regression for I-4/I-8)."""
+    rng = np.random.default_rng(0)
+    genes = (["mt-Nd1", "mt-Co1", "Rps6", "Rpl7", "Epcam", "Cd3d"] + [f"Gene{i}" for i in range(14)])
+    n_obs = 2 * n_per_sample
+    X = rng.poisson(1.0, (n_obs, len(genes))).astype("float32")
+    X[:, 0:2] += rng.poisson(3.0, (n_obs, 2)).astype("float32")   # ensure mito counts > 0
+    X[:8, 4] += 5; X[:8, 5] += 5                                  # Epcam+Cd3d co-expression
+    a = ad.AnnData(sparse.csr_matrix(X))
+    a.var_names = genes
+    a.obs_names = [f"c{i}" for i in range(n_obs)]
+    a.layers["counts"] = a.X.copy()
+    a.obs["sample_id"] = (["s1"] * n_per_sample + ["s2"] * n_per_sample)
+    return a
+
+
+def test_qc_metrics_mouse_casing_mito_and_mixed_lineage(tmp_path):
+    # I-8: mito matching is case-insensitive → mouse 'mt-' genes give pct_counts_mt>0 under default MT-.
+    # I-4: mixed-lineage is opt-in and resolves the caller's symbols to the data's casing (EPCAM->Epcam).
+    s = _session_with(_mouse_qc_fixture(), tmp_path)
+    r = tools.run("qc_metrics", s, run_scrublet=False, seed=0,
+                  mixed_lineage_genes=("EPCAM", "CD3D"))
+    assert r.status == "success"
+    assert float(s.adata.obs["pct_counts_mt"].sum()) > 0.0        # mouse mt- matched despite MT- default
+    assert r.summary["mixed_lineage_frac"] is not None and r.summary["mixed_lineage_frac"] > 0
+
+
+def _ensembl_qc_fixture(n_per_sample=30):
+    """Ensembl-ID var_names with NO symbol column → cannot be remapped (regression for I-11 guard)."""
+    rng = np.random.default_rng(0)
+    genes = [f"ENSG{i:011d}" for i in range(20)]
+    n_obs = 2 * n_per_sample
+    X = rng.poisson(1.0, (n_obs, len(genes))).astype("float32")
+    a = ad.AnnData(sparse.csr_matrix(X))
+    a.var_names = genes
+    a.obs_names = [f"c{i}" for i in range(n_obs)]
+    a.layers["counts"] = a.X.copy()
+    a.obs["sample_id"] = (["s1"] * n_per_sample + ["s2"] * n_per_sample)
+    return a
+
+
+def test_qc_metrics_ensembl_var_names_flags_inert_mito(tmp_path):
+    # I-11: Ensembl-ID var_names with no symbol column can't match MT- → pct_counts_mt is 0. qc_metrics
+    # must SURFACE this (never silent) so the operator knows to run the symbol remap first.
+    s = _session_with(_ensembl_qc_fixture(), tmp_path)
+    r = tools.run("qc_metrics", s, run_scrublet=False, seed=0)
+    assert r.status == "success"
+    assert any("Ensembl" in w and "inert" in w for w in r.warnings)
+    assert float(s.adata.obs["pct_counts_mt"].sum()) == 0.0

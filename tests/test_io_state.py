@@ -99,3 +99,49 @@ def test_detect_state_clustered(tmp_path):
     assert s["flags"]["hvg"] and s["flags"]["pca"] and s["flags"]["clustered"]
     assert s["stage"] in ("clustered", "umap")  # umap not run -> clustered
     assert s["annotation_columns_present"] == []
+
+
+def test_detect_state_tool_keys_off_latest_checkpoint(tmp_path):
+    # I-18: the detect_state TOOL must classify the session's CURRENT checkpoint, not the immutable
+    # original raw input (manifest.input) — else a progressed session always reports stage="raw" and
+    # auto-resume restarts from scratch.
+    raw = _raw()
+    raw_path = tmp_path / "raw.h5ad"
+    raw.write_h5ad(raw_path)
+    sess = Session.create(tmp_path / "sess", input_path=str(raw_path))
+
+    clustered = raw.copy()
+    clustered.obs["leiden"] = (["0"] * (clustered.n_obs // 2)
+                               + ["1"] * (clustered.n_obs - clustered.n_obs // 2))
+    sess.set_adata(clustered)
+    sess.checkpoint("cluster", x_state="counts")
+
+    r = tools.run("detect_state", sess)                 # no explicit path → must use latest checkpoint
+    assert r.status == "success"
+    assert r.summary["stage"] == "clustered"            # was "raw" before the I-18 fix
+    assert r.summary["flags"]["clustered"] is True
+    assert r.summary["reentry_point"] == "markers"
+    # the classifier itself is unchanged: the raw file on its own is still raw
+    assert detect_state(str(raw_path)).summary["stage"] == "raw"
+
+
+def test_session_open_sets_numba_cache_dir(tmp_path):
+    # I-6: Session.open / the Session.create resume branch must run init_runtime() so NUMBA_CACHE_DIR
+    # is set even when open is the FIRST op in a fresh process (replay/resume) — else scanpy import can
+    # fail on numba cache permissions. init_runtime is process-idempotent, so verify in a subprocess.
+    import os
+    import subprocess
+    import sys
+
+    sess = Session.create(tmp_path / "sess")            # write a manifest to open
+    code = (
+        "import os; os.environ.pop('NUMBA_CACHE_DIR', None);"
+        "from scpilot.session import Session;"
+        f"Session.open({str(sess.out)!r});"
+        "assert os.environ.get('NUMBA_CACHE_DIR'), 'NUMBA_CACHE_DIR not set by Session.open';"
+        "print('numba-ok')"
+    )
+    env = {k: v for k, v in os.environ.items() if k != "NUMBA_CACHE_DIR"}
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env)
+    assert r.returncode == 0, r.stderr
+    assert "numba-ok" in r.stdout

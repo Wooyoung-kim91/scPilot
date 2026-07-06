@@ -422,6 +422,8 @@ class Session:
     def create(cls, out_dir: str | Path, *, input_path: str | None = None,
                session_id: str | None = None, exist_ok: bool = True) -> "Session":
         out = Path(out_dir).resolve()
+        init_runtime()   # I-6: set NUMBA_CACHE_DIR + njit-cache patch on EVERY entry, including the
+                         # resume branch below (which returns before the old placement) and replay.
         existing = out / cls.MANIFEST
         if existing.exists() and not exist_ok:
             raise FileExistsError(f"session already exists: {existing}")
@@ -439,7 +441,6 @@ class Session:
                         f"'{Path(input_path).resolve()}' was given (fingerprint mismatch). Use a "
                         f"separate --workdir per input — shards must not share a session.")
             return sess
-        init_runtime()
         now = _now()
         man = Manifest(
             session_id=session_id or uuid.uuid4().hex[:12],
@@ -478,6 +479,7 @@ class Session:
     @classmethod
     def open(cls, out_dir: str | Path) -> "Session":
         out = Path(out_dir).resolve()
+        init_runtime()   # I-6: replay/direct-open must also get NUMBA_CACHE_DIR + njit-cache patch
         path = out / cls.MANIFEST
         if not path.exists():
             raise FileNotFoundError(f"no session manifest at {path}")
@@ -571,7 +573,7 @@ class Session:
 
     # ---------- checkpoints ----------
     def checkpoint(self, stage: str, *, adata=None, x_state: str | None = None,
-                   params: dict | None = None, compression: str = "lzf",
+                   params: dict | None = None, compression: str = "gzip",
                    enforce_invariants: bool = True,
                    require_counts: bool | None = None) -> Checkpoint:
         """Atomically write a post-stage .h5ad checkpoint and register it in the manifest.

@@ -27,7 +27,7 @@ def load_h5ad(path: str, *, backed: str | None = None):
     return ad.read_h5ad(str(path), backed=backed) if backed else ad.read_h5ad(str(path))
 
 
-def save_h5ad(adata, path: str, *, compression: str = "lzf") -> str:
+def save_h5ad(adata, path: str, *, compression: str = "gzip") -> str:  # I-5: gzip ratio > lzf on disk
     """Write an .h5ad and return the absolute path."""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)

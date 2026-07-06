@@ -95,6 +95,7 @@ def annotation_audit(session, *, groupby: str = "leiden", label_key: str = "majo
     import numpy as np
     import pandas as pd
     import scanpy as sc
+    from scipy.stats import entropy as _shannon_entropy
 
     t0 = time.time()
     adata = session.adata
@@ -216,8 +217,7 @@ def annotation_audit(session, *, groupby: str = "leiden", label_key: str = "majo
         if batch_key in adata.obs.columns:
             bv = adata.obs[batch_key].astype(str)[mask].value_counts(normalize=True)
             prov["top_batch_frac"] = round(float(bv.iloc[0]), 3)
-            p = bv.values
-            prov["batch_entropy"] = round(float(-(p * np.log2(p + 1e-12)).sum()), 3)
+            prov["batch_entropy"] = round(float(_shannon_entropy(bv.values, base=2)), 3)
 
         # ---- check 6: artifact QC ----
         qc = {}

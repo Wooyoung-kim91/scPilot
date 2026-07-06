@@ -55,15 +55,14 @@ def _norm_entropy(counts, n_global: int) -> float:
     GLOBAL number of categories — so a compartment present in only one batch
     scores ~0 (single-batch dominated) and one spread evenly over all batches ~1."""
     import numpy as np
+    from scipy.stats import entropy
 
     p = np.asarray(counts, dtype=float)
     p = p[p > 0]
-    total = p.sum()
-    if total <= 0 or n_global <= 1:
+    if p.sum() <= 0 or n_global <= 1:
         return 0.0
-    p = p / total
-    H = float(-(p * np.log(p)).sum())
-    return round(H / np.log(n_global), 4)
+    # scipy normalizes p internally; base=n_global gives the [0,1] normalization by category count.
+    return round(float(entropy(p, base=n_global)), 4)
 
 
 # --------------------------------------------------------------------------- #

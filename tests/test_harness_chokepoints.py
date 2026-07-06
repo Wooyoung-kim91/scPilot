@@ -645,9 +645,12 @@ def test_finalize_annotation_no_malignancy(tmp_path):
 
 
 def test_harmonize_annotations_consensus_fallback(tmp_path):
-    # cellhint is not installed → harmonize_annotations must fall back to the embedding-independent
-    # majority vote (graceful), write the harmonized label, and report which path it used.
+    # harmonize_annotations must ALWAYS fall back to the embedding-independent majority vote when the
+    # cellhint cross-shard path is unavailable — whether cellhint is absent OR installed-but-unwired
+    # (the cross-shard path is still a NotImplementedError stub, I-9 deferred). Either way: graceful
+    # fallback, harmonized label written, path + cellhint availability reported (never silent).
     from scpilot import tools
+    from scpilot.doctor import _findable
 
     s = Session.create(tmp_path / "sess")
     a = _tiny_adata()
@@ -661,8 +664,12 @@ def test_harmonize_annotations_consensus_fallback(tmp_path):
     res = tools.run("harmonize_annotations", s,
                     keys=["major_cell_type", "major_cell_type_harmony", "major_cell_type_scvi"])
     assert res.status == "success"
-    assert res.summary["method_used"] == "consensus_fallback"   # cellhint absent → fallback
-    assert res.summary["cellhint_available"] is False
+    assert res.summary["method_used"] == "consensus_fallback"   # cellhint path unavailable → fallback
+    # report reflects the env truthfully (cellhint 1.0.0 may be installed) rather than a hardcoded flag
+    assert res.summary["cellhint_available"] is bool(_findable("cellhint"))
+    if res.summary["cellhint_available"]:
+        # installed but the cross-shard path is a stub → a warning must explain the degrade (§3: warn, never silent)
+        assert any("cellhint" in w.lower() for w in res.warnings)
     out = s.adata.obs["celltype_harmonized"].astype(str).tolist()
     assert out == base                                          # 2/3 majority resolves every cell
     assert res.summary["n_ambiguous"] == 0

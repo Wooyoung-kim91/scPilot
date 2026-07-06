@@ -95,6 +95,21 @@ def ingest(session, *, profile: str | None = None, min_genes: int | None = None,
     merged = ad.concat(adatas, join="outer", label="sample_id_from_concat", keys=keys,
                        index_unique=None, merge="same", fill_value=0)
     merged.var_names_make_unique()
+    # I-11: ingest bypasses load_input, so Ensembl-ID var_names (e.g. CELLxGENE) would never be
+    # remapped → MT-/RPS prefix matching silently no-ops downstream. Normalize to the data's OWN
+    # symbol column here (evidence-based, no hardcoded biology), mirroring load_input.
+    from scpilot.core import _species
+    _sym_ev = _species.normalize_var_symbols(merged)
+    if _sym_ev.get("remapped"):
+        merged.uns["scpilot_var_symbol_normalization"] = _sym_ev
+        warnings.append(
+            f"remapped Ensembl-ID var_names → symbols via var['{_sym_ev['symbol_column']}'] "
+            f"({_sym_ev['n_vars']} genes; {_sym_ev['n_symbols_missing_kept_as_id']} kept as ID)")
+    elif _sym_ev.get("reason") == "ensembl_but_no_symbol_column":
+        merged.uns["scpilot_var_symbol_normalization"] = _sym_ev
+        warnings.append(
+            "var_names are Ensembl IDs but no usable symbol column found — MT-/marker/CNV symbol "
+            "lookups will be degraded; provide a feature_name/gene_symbol column")
     if sparse.issparse(merged.X):
         merged.X = merged.X.tocsr()
     merged.layers["counts"] = merged.X.copy()

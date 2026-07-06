@@ -41,14 +41,15 @@ def _dist(series) -> dict:
 
 
 def _med_mad(a) -> tuple[float, float]:
-    """(median, scaled MAD) — MAD×1.4826 ≈ σ for normal data (no scipy dependency)."""
+    """(median, scaled MAD) — MAD×1.4826 ≈ σ for normal data, via the validated
+    ``scipy.stats.median_abs_deviation(scale="normal")`` rather than a hand-rolled formula."""
     import numpy as np
+    from scipy.stats import median_abs_deviation
     a = np.asarray(a, dtype=float)
     a = a[np.isfinite(a)]
     if a.size == 0:
         return 0.0, 0.0
-    med = float(np.median(a))
-    return med, float(np.median(np.abs(a - med)) * 1.4826)
+    return float(np.median(a)), float(median_abs_deviation(a, scale="normal"))
 
 
 def _suggest_cutoffs(obs, *, n_mads: float) -> dict:
@@ -133,6 +134,12 @@ def qc_metrics(session, *, sample_key: str = "sample_id", mito_prefix: str | Non
     up = adata.var_names.str.upper()
     adata.var["mt"] = up.str.startswith(mito_prefix.upper())
     adata.var["ribo"] = up.str.startswith(_RIBO_PREFIXES)
+    # I-11 guard: Ensembl-ID var_names match no MT-/RPS prefix → pct_counts_mt/ribo silently 0 and the
+    # mito filter is inert. Surface it explicitly (§3: warn, never silent) and point at the entry remap.
+    if _species.looks_like_ensembl(adata.var_names) and not bool(adata.var["mt"].any()):
+        warnings.append(f"var_names look like Ensembl IDs and no mito gene matched '{mito_prefix}' → "
+                        "pct_counts_mt will be 0 and mito filtering is inert; run the load/ingest symbol "
+                        "remap (normalize_var_symbols) first")
     has_counts = "counts" in adata.layers
     if not has_counts:
         warnings.append("no 'counts' layer — QC metrics computed on X (assumed counts)")

@@ -7,8 +7,8 @@ Four modes (plan §사용 모드):
   - ``scpilot replay <session>``   : deterministic replay from run log (mode 4)
   - ``scpilot doctor``             : environment / capability preflight (plan A2)
 
-A1 scope = skeleton: subcommands are declared and wired; bodies are stubs that
-exit with a clear "not implemented" message. Real behaviour lands in A2/A5/A6/A7.
+All five subcommands (mcp/run/step/replay/doctor) are fully implemented; they share
+the one tool registry and reproducibility harness (see AGENTS.md §2/§4).
 """
 
 from __future__ import annotations

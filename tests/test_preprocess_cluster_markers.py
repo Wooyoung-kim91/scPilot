@@ -49,6 +49,28 @@ def test_preprocess(tmp_path):
     assert "counts" in s.adata.layers
 
 
+def test_preprocess_hvg_batch_key_disable_token(tmp_path):
+    # I-3: an explicit OFF token forces global HVG and must NOT fall through to sample_id auto-detect
+    # (the old bug: "none" was ignored and auto-detect re-grabbed sample_id).
+    s = _session(tmp_path)
+    r = tools.run("preprocess", s, n_top_genes=100, n_pcs=20, hvg_batch_key="none")
+    assert r.status == "success"
+    assert any("disabled" in w.lower() for w in r.warnings)
+    assert not any("auto-detected" in w.lower() for w in r.warnings)
+    assert int(s.adata.var["highly_variable"].sum()) > 0
+
+
+def test_preprocess_tiny_batch_guard_disables_batch_hvg(tmp_path):
+    # I-3: batches below min_cells_per_batch make seurat_v3's per-batch loess singular; the guard
+    # disables batch-aware HVG (with a warning) instead of crashing. The _raw fixture has ~100
+    # cells/sample → all below the default 1000, so an explicit sample_id key trips the guard.
+    s = _session(tmp_path)
+    r = tools.run("preprocess", s, n_top_genes=100, n_pcs=20, hvg_batch_key="sample_id")
+    assert r.status == "success"
+    assert any("batch-aware HVG disabled" in w for w in r.warnings)
+    assert int(s.adata.var["highly_variable"].sum()) > 0
+
+
 def test_preprocess_requires_counts(tmp_path):
     a = _raw()
     del a.layers["counts"]

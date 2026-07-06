@@ -81,7 +81,14 @@ def detect_state(path: str) -> S.ToolResult:
 @register("detect_state", mutating=False,
           description="Detect how far an h5ad has been processed (raw/hvg/clustered/annotated) → re-entry point.")
 def _detect_state_tool(session, **params) -> S.ToolResult:
-    path = params.get("path") or session.manifest.input.get("path")
+    # I-18: classify the session's CURRENT state, not the immutable original input. Once a session has
+    # progressed, manifest.input still points at the raw file, so keying off it always reports
+    # stage="raw" and breaks auto-resume. Precedence: explicit path > latest checkpoint (the persisted
+    # current state) > original input (a fresh, un-checkpointed session).
+    path = params.get("path")
+    if not path:
+        cp = session.latest_checkpoint()
+        path = (cp.get("path") if cp else None) or (session.manifest.input or {}).get("path")
     if not path:
         return S.error("detect_state", "missing_input", "no input path", recoverable=False)
     return detect_state(path)
