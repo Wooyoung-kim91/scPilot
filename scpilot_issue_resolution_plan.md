@@ -127,8 +127,8 @@
 - **토큰: 국면별 하이브리드** — 파일럿=역할별 티어링, 확장=결정론적 스캐폴딩; 공통으로 트랜스크립트 압축+캐시(I-23).
 
 ### 5.1 기존 이슈 상태 갱신
-- **I-4 → ✅ 해결(현재 코드)**: `qc.py` mixed-lineage가 opt-in 파라미터 + `_species.resolve` 대소문자 무시로 변경됨. 회귀 테스트만 추가 후 닫기.
-- I-3(HVG 강제)·I-5(디스크)·I-6·I-7: 여전히 미해결, 아래 신규 항목과 통합 대응.
+- **I-4 → ✅ 해결(코드+테스트)**: `qc.py` mixed-lineage opt-in + `_species.resolve` 대소문자 무시. 2026-07-06 마우스 케이싱 회귀 테스트 추가로 닫힘(§6).
+- **I-3(HVG 강제)·I-5(디스크)·I-6(env): ✅ 2026-07-06 해결**(상세 §6). I-7(부분 체크포인트 미보존): 단일 scanpy 호출 특성상 설계 한계로 보류(I-1 캡으로 완화).
 
 ### 5.2 신규 이슈 (심각도 순)
 
@@ -167,3 +167,43 @@
 3. **GPU·확장**: I-10(scVI GPU/epoch), I-20(중립 기본값), I-19(max-iters), I-14(용량/provenance).
 4. **확장 전용**: I-9(cellhint 크로스샤드), 다중샤드 오케스트레이터, I-23(토큰).
 각 항목 §8대로 env 바이너리로 테스트 후 완료 선언. 대규모 동작 변경은 실제 데이터 캡/경량 재현 포함.
+
+---
+
+## 6. 수정 패스 (2026-07-06, 커밋 `aa21f89`)
+
+recon(코드 4영역 병렬 감사, 문서 아닌 현재 코드 기준 §7)으로 문서상 미완 항목의 실제 상태를 확정한 뒤,
+main tree에서 순차 수정 + 이슈별 env 바이너리 타깃 테스트로 검증. **전체 스위트 260 passed / 1 skipped / 0 failed**
+(직전 baseline은 253 passed / 1 failed).
+
+### 6.1 해결 (코드 + 테스트)
+- **I-18 (신규 발견, resume 깨짐)**: `state.py` `_detect_state_tool`이 `manifest.input`(원본 raw)이 아니라
+  `session.latest_checkpoint()` 기준으로 재진입 판정. 진행된 세션이 항상 `stage="raw"`로 오보고되던 문제 해결.
+  회귀 테스트 `test_io_state.py::test_detect_state_tool_keys_off_latest_checkpoint`.
+- **I-6 (env)**: `init_runtime()`를 `Session.create` **및** `Session.open` 진입점 최상단으로 이동 →
+  resume 분기·replay(fresh 프로세스)도 `NUMBA_CACHE_DIR`/njit-cache 패치를 받음.
+  회귀 테스트(서브프로세스) `test_session_open_sets_numba_cache_dir`.
+- **I-11 (CELLxGENE 직결)**: `ingest`가 `load_input`을 우회하던 문제 → 병합 직후
+  `_species.normalize_var_symbols(merged)` 배선 + evidence를 warnings/uns 기록. `qc_metrics`에 Ensembl-ID
+  var_names로 `pct_counts_mt=0`(mito 필터 무력)일 때 명시 경고 가드 추가(§3 warn-never-silent).
+  테스트: `test_qc.py` 마우스 케이싱(I-4/I-8) + Ensembl 가드.
+- **I-5 (디스크)**: 체크포인트/`save_h5ad` 기본 압축 `lzf`→`gzip`(비율↑; `compression` 파라미터로 오버라이드).
+  replay 정합 확인.
+- **I-3 (HVG)**: 코드는 기해결(`recipes.py:49-97`)이었고 회귀 테스트만 부재 → disable-token, tiny-batch 가드
+  경로 테스트 추가(`test_preprocess_cluster_markers.py`). singular-loess 자동복구는 결정론적 트리거가 어려워
+  코드 검토로 갈음.
+- **I-9 (테스트만)**: cellhint 1.0.0 설치 반영해 낡은 `test_harmonize_annotations_consensus_fallback`를
+  env-독립적으로 수정(설치 여부를 실제 반영; stub이 `NotImplementedError`라 여전히 consensus fallback + 경고).
+  **실제 크로스샤드 배선은 새 다중샤드 입력 계약(§4 owner 결정)이 필요해 연기.**
+
+### 6.2 API 충실도 정리 (검증된 라이브러리 API로 위임)
+- `qc.py::_med_mad` → `scipy.stats.median_abs_deviation(scale="normal")`.
+- Shannon entropy(`audit.py` batch_entropy, `compartment.py` `_norm_entropy`) → `scipy.stats.entropy`.
+- (감사 결과 integrate=harmonypy/scvi-tools, cnv=infercnvpy, silhouette=sklearn 등 무거운 계산은 이미
+  전부 라이브러리 위임 — 손수 재구현 없음. `audit` 마커 Jaccard는 소규모 정확 집합연산이라 의도적으로 유지.)
+
+### 6.3 의도적 보류 (이유 명시)
+- **I-9 실제 크로스샤드 cellhint 배선**: 다중샤드 입력 계약 = owner 결정(§4). GPU/8TB 확보 후 착수.
+- **`integrate_scvi`의 `batch_key="GSM"` 기본값**: 사전학습 모델은 학습 시 batch_key에 바인딩되고 이미 미지
+  카테고리 게이트가 있어 silent-wrong 아님 → 방어적으로 정당. 개선 시 모델 레지스트리에서 키를 읽도록.
+- **cli.py**: 낡은 "A1 skeleton/stubs" docstring 정리(구현은 이미 완료).
