@@ -106,6 +106,49 @@ model — via `--backend openai --base-url`. Modes 1/3/4 need no LLM key.
 
 ---
 
+## Quickstart example
+
+A minimal end-to-end run on a single `.h5ad`. This assumes the `scpilot` env is
+installed (see above) and, for the autonomous agent, that `ANTHROPIC_API_KEY` is
+set in your shell.
+
+```bash
+# 0) Preflight — confirm deps + per-tool capabilities are green
+conda run -n scpilot scpilot doctor
+
+# 1) Autonomous run — the LLM drives QC → integration → clustering → annotation
+export ANTHROPIC_API_KEY=sk-...          # your key; needed only for `scpilot run`
+conda run -n scpilot scpilot run data.h5ad \
+  --tissue "human pancreas, PDAC" \
+  --goal  "annotate major + fine cell types, flag malignant cells" \
+  --seed 0 \
+  -w runs/demo                            # session/working directory
+
+# 2) Inspect the results
+ls runs/demo/artifacts/                   # figures (UMAP, dotplots, CNV heatmaps) + CSVs
+cat runs/demo/reasoning_log.md            # human-readable narrative of every decision
+
+# 3) Reproduce the exact run with NO LLM in the loop
+conda run -n scpilot scpilot replay runs/demo
+```
+
+**No API key? Run it deterministically instead** — drive the pipeline step by
+step yourself (modes 3/4 need no LLM):
+
+```bash
+conda run -n scpilot scpilot step qc_metrics data.h5ad -w runs/demo
+conda run -n scpilot scpilot step qc_filter  -w runs/demo -p min_genes=200 -p max_pct_mt=15
+conda run -n scpilot scpilot step preprocess -w runs/demo -p n_top_genes=2000 -p n_pcs=30
+conda run -n scpilot scpilot step cluster    -w runs/demo -p resolution=0.25
+```
+
+**Prefer plain scanpy?** After any run, `runs/demo/code/` holds standalone,
+scPilot-free scripts (`00_ingest.py`, `01_qc_metrics.py`, …) that reproduce the
+whole pipeline with direct scanpy/pandas — run them in order in any scientific-
+Python env (see [Reproducible standalone export](#reproducible-standalone-export)).
+
+---
+
 ## The analysis method
 
 The autonomous pipeline (`scpilot run`) follows the cancer-scRNAseq annotation
@@ -337,3 +380,10 @@ conda run -n scpilot python -m pytest tests/ -q
 Each tool has unit + structural-invariant tests on a tiny fixture; the harness has
 driver-parity, replay round-trip, parameter-catalog, and invariant-violation
 regression tests.
+
+---
+
+## License
+
+Released under the [MIT License](LICENSE) — free to use, modify, and distribute
+with attribution. © 2026 Wooyoung Kim.

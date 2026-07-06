@@ -8,6 +8,8 @@ version = "0.0.1"
 description = "LLM-driven scRNA-seq analysis pipeline (MCP server + CLI agent)"
 readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "wykim", email = "wykim91@kbsi.re.kr" }]
 
 # NOTE: the scientific stack is provided by the conda env `scpilot` (cloned from
