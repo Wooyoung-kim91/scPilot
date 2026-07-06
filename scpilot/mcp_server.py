@@ -19,9 +19,14 @@ import warnings
 from pathlib import Path
 
 
+
+
 def default_workdir_for_input(input_path: str) -> str:
-    p = Path(input_path).resolve()
-    return str(p.parent / f"{p.stem}_scpilot_session")
+    """Per-input session dir. Thin re-export of the single source in ``scpilot.session`` (I-12) — kept
+    at module level (public API) but imported lazily so importing this module does not pull the
+    scientific stack before ``init_runtime()`` runs."""
+    from scpilot.session import default_workdir_for_input as _f
+    return _f(input_path)
 
 
 def _select_specs(specs, lg):

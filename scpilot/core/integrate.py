@@ -31,6 +31,26 @@ _RUN = _os.environ.get("SCPILOT_RUN_DIR", _os.path.expanduser("~/data/scpilot_ru
 DEFAULT_SCVI_MODEL = _os.path.join(_RUN, "models", "scvi_GSM")
 
 
+# I-20: neutral batch-key resolution — no PDAC-specific "GSM" default. Common batch column names
+# (a naming convention list, not biology); the caller/agent normally picks from data evidence.
+_BATCH_KEY_CANDIDATES = ("sample_id", "donor_id", "dataset_id", "batch", "sample", "donor", "patient", "GSM", "GSE")
+# I-10: floor scVI epochs so large-N shards don't undertrain — scVI's own heuristic yields ~2 epochs
+# at 5M cells (min(400, round((20000/n)*400))). Early stopping still cuts it short when converged.
+MIN_SCVI_EPOCHS = 50
+
+
+def _resolve_batch_key(adata, given):
+    """Resolve the integration batch key. Use the caller's key if present; else auto-detect the first
+    common batch column (2..N distinct values). Returns ``(key, error_or_None)`` — no hardcoded default."""
+    if given:
+        return (given, None) if given in adata.obs.columns else (None, f"batch_key '{given}' absent in obs")
+    for c in _BATCH_KEY_CANDIDATES:
+        if c in adata.obs.columns and 2 <= adata.obs[c].nunique() <= adata.n_obs:
+            return c, None
+    return None, (f"no batch_key given and none of the common batch columns {_BATCH_KEY_CANDIDATES} "
+                  "found in obs — pass batch_key explicitly")
+
+
 def _model_batch_categories(model_pt: Path) -> list[str]:
     """Read the batch categories the scVI model was trained on (registry)."""
     import torch
@@ -105,10 +125,12 @@ def integrate_scvi(session, *, model_dir: str = DEFAULT_SCVI_MODEL, out_key: str
 
 @register("train_scvi", mutating=True, long_running=True,
           description="TRAIN a new scVI model on counts-HVG (batch_key) and apply it → obsm['X_scVI'] + saved model "
-                      "(plan B9b). For data without a compatible pretrained model (e.g. PDAC+Control). CPU = slow.")
-def train_scvi(session, *, batch_key: str = "GSM", n_latent: int = 30, n_layers: int = 2,
+                      "(plan B9b). For data without a compatible pretrained model. accelerator='auto' uses the GPU "
+                      "when present (CPU otherwise); max_epochs is floored so large shards don't undertrain.")
+def train_scvi(session, *, batch_key: str | None = None, n_latent: int = 30, n_layers: int = 2,
                max_epochs: int | None = None, out_key: str = "X_scVI", model_out: str | None = None,
                num_workers: int | None = None, batch_size: int | None = None,
+               accelerator: str = "auto", devices: str | int = "auto",
                seed: int = 0, **params) -> S.ToolResult:
     if (err := require_capability("train_scvi")) is not None:
         return err
@@ -119,13 +141,25 @@ def train_scvi(session, *, batch_key: str = "GSM", n_latent: int = 30, n_layers:
 
     t0 = _t.time()
     adata = session.adata
+    warnings: list[str] = []
     if "counts" not in adata.layers:
         return S.error("train_scvi", "invalid_state", "no 'counts' layer — scVI needs raw counts", recoverable=False)
-    if batch_key not in adata.obs.columns:
-        return S.error("train_scvi", "data_gate_failed", f"batch_key '{batch_key}' absent in obs", recoverable=False)
+    batch_key, berr = _resolve_batch_key(adata, batch_key)      # I-20: neutral, no hardcoded 'GSM'
+    if berr:
+        return S.error("train_scvi", "data_gate_failed", berr, recoverable=True)
     if "highly_variable" not in adata.var.columns:
         return S.error("train_scvi", "invalid_state", "no HVG — run preprocess first", recoverable=True,
                        suggested_next_tools=["preprocess"])
+
+    # I-10: floor the epoch schedule. scVI's default heuristic (max_epochs=None) trains only ~2 epochs
+    # at 5M cells → silently undertrained. When unset, use max(heuristic, MIN_SCVI_EPOCHS).
+    n_cells = int(adata.n_obs)
+    if max_epochs is None:
+        heuristic = min(400, max(1, round((20000 / max(1, n_cells)) * 400)))
+        max_epochs = max(heuristic, MIN_SCVI_EPOCHS)
+        if max_epochs != heuristic:
+            warnings.append(f"max_epochs floored to {max_epochs} (scVI heuristic was {heuristic} at "
+                            f"n={n_cells}; early_stopping still halts on convergence)")
 
     scvi.settings.seed = seed
     # CPU throughput: overlap sparse->dense batch loading across workers (default 0 = single-thread bottleneck)
@@ -134,7 +168,10 @@ def train_scvi(session, *, batch_key: str = "GSM", n_latent: int = 30, n_layers:
     sub = adata[:, adata.var["highly_variable"]].copy()      # train on HVG counts
     scvi.model.SCVI.setup_anndata(sub, layer="counts", batch_key=batch_key)
     model = scvi.model.SCVI(sub, n_latent=n_latent, n_layers=n_layers)
-    train_kwargs = {"max_epochs": max_epochs, "early_stopping": True, "accelerator": "cpu"}
+    # I-10: accelerator='auto' picks the GPU when available (was hardcoded 'cpu' → the 96GB GPU
+    # would be ignored). Caller can pin accelerator='cpu'/'gpu' and devices.
+    train_kwargs = {"max_epochs": max_epochs, "early_stopping": True,
+                    "accelerator": accelerator, "devices": devices}
     if batch_size is not None:
         train_kwargs["batch_size"] = int(batch_size)
     model.train(**train_kwargs)
@@ -147,24 +184,25 @@ def train_scvi(session, *, batch_key: str = "GSM", n_latent: int = 30, n_layers:
     summary = {
         "method": "scvi_trained", "out_key": out_key, "batch_key": batch_key,
         "n_latent": n_latent, "n_layers": n_layers, "n_hvg": int(sub.n_vars),
-        "n_cells": int(adata.n_obs), "epochs_run": int(epochs_run),
-        "train_time_s": round(_t.time() - t0, 1), "model_out": out,
+        "n_cells": n_cells, "epochs_run": int(epochs_run), "max_epochs": int(max_epochs),
+        "accelerator": accelerator, "train_time_s": round(_t.time() - t0, 1), "model_out": out,
         "num_workers": num_workers, "batch_size": batch_size,
         "embeddings_present": sorted(adata.obsm.keys()),
     }
     cp = session.checkpoint("train_scvi", x_state=session.manifest.x_state,
                             params={"batch_key": batch_key, "n_latent": n_latent, "n_layers": n_layers,
                                     "max_epochs": max_epochs, "out_key": out_key, "model_out": out,
-                                    "num_workers": num_workers, "batch_size": batch_size, "seed": seed})
-    return S.success("train_scvi", summary=summary, checkpoint=cp.path, determinism_grade="B",
-                     duration_s=round(_t.time() - t0, 1),
+                                    "num_workers": num_workers, "batch_size": batch_size,
+                                    "accelerator": accelerator, "devices": devices, "seed": seed})
+    return S.success("train_scvi", summary=summary, warnings=warnings, checkpoint=cp.path,
+                     determinism_grade="B", duration_s=round(_t.time() - t0, 1),
                      suggested_next_tools=["cluster", "benchmark"])
 
 
 @register("integrate_harmony", mutating=True,
           description="Harmony integration via harmonypy (direct call, torch-output workaround) → obsm['X_harmony'] "
                       "(plan B9). Baseline/candidate; scVI is primary on this dataset.")
-def integrate_harmony(session, *, batch_key: str = "GSM", use_rep: str = "X_pca",
+def integrate_harmony(session, *, batch_key: str | None = None, use_rep: str = "X_pca",
                       out_key: str = "X_harmony", seed: int = 0, **params) -> S.ToolResult:
     if (err := require_capability("integrate_harmony")) is not None:
         return err
@@ -176,9 +214,9 @@ def integrate_harmony(session, *, batch_key: str = "GSM", use_rep: str = "X_pca"
         return S.error("integrate_harmony", "invalid_state",
                        f"'{use_rep}' absent — run preprocess (PCA) first", recoverable=True,
                        suggested_next_tools=["preprocess"])
-    if batch_key not in adata.obs.columns:
-        return S.error("integrate_harmony", "data_gate_failed", f"batch_key '{batch_key}' absent in obs",
-                       recoverable=False)
+    batch_key, berr = _resolve_batch_key(adata, batch_key)      # I-20: neutral, no hardcoded 'GSM'
+    if berr:
+        return S.error("integrate_harmony", "data_gate_failed", berr, recoverable=True)
 
     # the harmonypy call lives in scpilot.recipes (scpilot-free) so the generated standalone tutorial
     # script inlines the SAME logic — logic-identical by construction.

@@ -64,10 +64,11 @@ def test_ingest_builds_merged_from_raw_10x(tmp_path):
     sm = r.summary
     assert sm["n_samples_merged"] == 2
     assert sm["n_cells"] == 80                      # 40 + 40, min_genes=0 keeps all
-    assert "counts" in sm["layers"] and "scale.data" in sm["layers"]
+    # I-14: only the immutable 'counts' layer is kept; X holds log-norm (no duplicate 'scale.data')
+    assert "counts" in sm["layers"] and "scale.data" not in sm["layers"]
     assert sm["condition_counts"] == {"PDAC": 40, "Normal": 40}
     # session now holds the merged + downstream-ready; checkpoint written
-    assert "counts" in s.adata.layers and "scale.data" in s.adata.layers
+    assert "counts" in s.adata.layers and "scale.data" not in s.adata.layers
     assert r.checkpoint
     r.to_dict()
 

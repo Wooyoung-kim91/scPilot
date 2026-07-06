@@ -28,7 +28,7 @@ DE_METHOD = "wilcoxon"   # FIXED for cell-type marker DE — not a parameter (se
           description="rank_genes_groups (Wilcoxon, fixed) per cluster → top markers table + per-cluster "
                       "size/sample spread; capped ranking CSV by default, full ranking when "
                       "max_genes_ranked=None (plan B7).")
-def markers(session, *, groupby: str = "leiden", n_genes: int = 25, layer: str | None = "scale.data",
+def markers(session, *, groupby: str = "leiden", n_genes: int = 25, layer: str | None = None,
             sample_key: str = "sample_id",
             max_genes_ranked: int | None = DEFAULT_MAX_GENES_RANKED, **params) -> S.ToolResult:
     import pandas as pd

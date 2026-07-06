@@ -107,3 +107,63 @@
 ## 4. 검증용 안전 재개 지점 (기존 산출물 재사용)
 - 클러스터 체크포인트: `scpilot_obesity_run/checkpoints/04_cluster.h5ad` (leiden, X_pca, X_umap, scale.data 보유)
 - markers 재실행 시 위 파일을 입력으로, 캡 적용 + `t-test_overestim_var`로 우선 검증.
+
+---
+
+## 5. CELLxGENE 재주석 · 대규모 확장 감사 (2026-07-02)
+
+근거: 코드 3영역(annotation 코어 / 결정론적 도구 / 오케스트레이션) 병렬 감사 + 현재 워크트리 코드 검증(§7.3).
+목표: CELLxGENE **인간 췌장 완전 재주석**(저자 라벨 폐기, marker-DB-free) → **인간 primary 전체**로 확장(≤5M 세포 샤드, 샤드별 실행 → 샤드 간 라벨 통합).
+하드웨어: 502GB RAM, 120스레드; 신규 96GB GPU + 8TB 저장 구매 예정(현재 torch CUDA 불가).
+
+### 5.0 사용자 의도 결정 (수정 방향 확정)
+- **CNV/malignancy: 전 샘플 수행** → 정상조직 robust화 필수(I-21).
+- **통합: Harmony + scVI 둘 다 → benchmark 자동선택** → scVI GPU/epoch 수정 전제(I-10).
+- **샤드 간 통합: cellhint 실제 배선** (I-9).
+- **marker-DB-free: 하드 강제** — 오직 DE로 LLM 추론. `annotate_broad`/패널 경로 비활성, `harness_audit`가 패널 사용을 **fail**로 차단(현재 warn).
+- **해상도: 분리도(separability) 기반** — 세포수 무관, 과분할/과소분할 방지(I-22, §3 계약 변경 — owner 결정).
+- **Tier-3(trajectory/cell_state): 보류** — cell_state는 fine 단계 free-text 유지.
+- **provenance: 강제하되 체크포인트 용량 억제** (I-14 + I-5).
+- **토큰: 국면별 하이브리드** — 파일럿=역할별 티어링, 확장=결정론적 스캐폴딩; 공통으로 트랜스크립트 압축+캐시(I-23).
+
+### 5.1 기존 이슈 상태 갱신
+- **I-4 → ✅ 해결(현재 코드)**: `qc.py` mixed-lineage가 opt-in 파라미터 + `_species.resolve` 대소문자 무시로 변경됨. 회귀 테스트만 추가 후 닫기.
+- I-3(HVG 강제)·I-5(디스크)·I-6·I-7: 여전히 미해결, 아래 신규 항목과 통합 대응.
+
+### 5.2 신규 이슈 (심각도 순)
+
+**Blockers**
+- **I-9 샤드 간 라벨 통합 부재.** `annotate.py:705-713` `_harmonize_with_cellhint`가 `raise NotImplementedError`; `harmonize_annotations`/`consensus_vote`(`recipes.py:273-316`)는 한 AnnData의 여러 obs 컬럼(같은 세포)끼리만 투표 → 샤드(다른 세포) 못 넘음. 결정: **cellhint 배선 + 크로스-데이터셋 라벨 어휘 정렬**.
+- **I-10 scVI CPU 고정 + 저학습.** ✅(완료·검증) `train_scvi`에 `accelerator="auto"`(GPU 있으면 사용)+`devices` 파라미터, `max_epochs=None`일 때 `max(heuristic, MIN_SCVI_EPOCHS=50)` floor(대형 shard 저학습 방지, early_stopping 유지). `test_integrate.py` 7 pass(CPU 폴백 확인). GPU 실검증은 하드웨어 도착 후.
+- **I-11 Ensembl-ID var_names 무증상 붕괴 (CELLxGENE 직격).** `_species.detect_organism`(`_species.py:30`)의 `isupper()`가 `ENSG…`를 True→"human" 오탐(마우스 `ENSMUSG`도), `qc.py:134`의 `MT-` 매칭 0 → `pct_counts_mt=0`, 미토 필터 무력화(경고 없음). 마커 DE·CNV 심볼매핑 동시 저하. 결정: **데이터의 `feature_name`/gene-symbol 컬럼에서 심볼로 재매핑하는 evidence-based 진입 단계**(하드코딩 아님) — load/ingest에서 Ensembl-ID var_names 감지 시 심볼 컬럼으로 스왑, 감지·스왑 사실을 warnings에 기록.
+- **I-12 배치 러너 부재 + workdir 충돌.** ✅(부분 완료·검증) mode-2 `run` 기본 workdir를 `default_workdir_for_input`(입력별 고유 dir, session.py로 단일화 — MCP도 공유)로 변경 → 샤드 간 미충돌. `Session.create`에 **fingerprint 불일치 가드**(`InputMismatch`) 추가 → 같은 workdir에 다른 입력 시 silent 재사용 대신 명확히 거부(I-2 잔여작업 해결). `test_session_input_guard.py` 5 pass. **남음(확장)**: 외부 다중샤드 오케스트레이터(I-9와 함께).
+- **I-13 LLM 재시도/백오프 없음.** ✅(완료·검증) base `Provider.complete`가 `_complete`(백엔드별)를 감싸 지수 백오프 재시도(chokepoint 한 곳 → agent 루프·force_structured·interpretation·run_review 전부 커버). `_is_retryable`(429/529/5xx/timeout/connection만; auth/bad-request/ProviderUnavailable 제외). agent 메인 루프는 재시도 소진/영구오류 시 graceful break(`stopped_reason="provider_error"`)로 report/interpretation 보존. `test_provider_retry.py` 5 pass.
+
+**Major**
+- **I-14 3중 행렬복사 + 체크포인트 비대 (I-5 확장).** ⚠️(부분 완료) ✅ `log_consistency`가 **checkpoint-vs-run 간극 감지**(`checkpoint_bypass_suspected`; 사용자가 본 "25 vs 2" ad-hoc bypass를 표면화). `test_provenance_gap.py` 3 pass. **남음(별도 집중 작업 — 위험)**: `scale.data` 중복 제거(markers/detect_state/benchmark/ingest 등 다수 파일 + 재현성 불변식 영향), 경량 단계 델타/포인터 체크포인트, `checkpoint()`→run_log 자동기록(§2 chokepoint 설계와 충돌 가능). 이들은 재현성 회귀 위험이 커 집중 세션 권장.
+- **I-15 majority_vote 세포당 Python 루프** ✅(완료·검증) `recipes.py`에서 (n,k,k) 동치 텐서로 벡터화(n_keys 작음) → 최빈값·유일성·agreement 일괄 계산, 세포당 Python 루프 제거. `test_tier4_scale.py` 통과.
+- **I-16 Tier-4 마커검증 특이성 누락** ✅(완료·검증) `audit.py` `_check_marker`에 pct_out≤max_pct_out AND spec≥min_specificity 게이트 추가(marker-DB-free 선택 게이트와 정합) → housekeeping/ambient 유전자가 marker_set_support_frac 부풀리는 것 방지. `marker_criteria`에 두 값 노출. `test_audit.py` 갱신 통과.
+- **I-17 Tier-4 근거 20k 절단** ✅(완료·검증) `agent.py` `_cap_evidence()` 헬퍼로 캡 60k 상향 + 절단 시 **가시 마커 + 경고**(리뷰어가 부분 커버리지 인지, run_annotation_critique가 `evidence_truncated` 반환) → silent 누락 제거. `test_tier4_scale.py` 통과. (클러스터 단위 트리밍은 후속 개선 여지.)
+- **I-18 detect_state가 원본 입력 읽음** (`state.py:84-87`) → 진행도 무관 `stage="raw"`, 자동 재개 깨짐(I-2/I-7 확장). 결정: 최신 체크포인트/manifest stage 기준으로 재진입 판정.
+- **I-19 `--max-iters=40` 부족** ✅(완료) `cli.py` 기본값 40→**120**(전체 파이프라인 60-120 호출; ceiling 200). + **marker-DB-free 하드 강제**: `harness_audit`의 `marker_db_free` 체크를 warn→**fail**로 변경(annotate_broad 사용 시 governance 게이트 실패). `test_audit.py` 갱신 통과.
+- **I-20 PDAC 특화 기본값** ✅(부분 완료·검증) `train_scvi`/`integrate_harmony`의 `batch_key` 기본을 `"GSM"`→**중립 auto-resolve**(`_resolve_batch_key`: 명시 우선, 없으면 sample_id/donor_id/dataset_id… 자동 탐지, 없으면 명확 에러). `test_integrate_defaults.py` 4 pass. (integrate_scvi 사전학습 applier는 모델-bound라 GSM 유지 — 데이터에 없으면 이미 명확히 게이트.)
+- **I-21 reference-free CNV 정상조직 오탐** ✅(완료·검증) `cnv.py`: (a) advisory 경고에 acinar 등 pseudo-CNV 위험 명시, (b) **데이터 기반 내부 reference 후보 제안**(`suggested_reference_groups` — 최저 CNV burden 그룹, 하드코딩 아님), (c) malignancy_evidence의 clonal 신호에 `donor_confound_suspected` 플래그(단일 donor 우세 + CNV 비상승 → 정상 donor-특이 집단, 진짜 클론은 미플래그). 증거 방출만(판정은 LLM+하드룰 유지). `test_cnv.py` 13 pass(over-flag 방지 포함).
+
+**설계 변경 / cost**
+- **I-22 해상도 분리도 기반** ✅(완료·검증) `cluster_sweep`가 해상도별 **실루엣**(use_rep 임베딩, 시드 subsample)을 함께 산출; `suggest_resolution`이 ≥2클러스터 중 **실루엣 최대** 해상도 선택(실루엣 없으면 기존 n_clusters knee로 폴백). 과분할(희소/노이즈)·과소분할 모두 실루엣이 낮아 자동 회피 → 세포수 아닌 실제 분리도 기반. `test_resolution_separability.py` 3 pass + 기존 sweep 테스트 유지. (§3 계약 개정: knee→분리도.)
+- **I-23 토큰 절감.** 원인: 메인 루프 트랜스크립트 O(n²) 재전송(`agent.py:500`), 전 역할 Opus 기본(`provider.py:48`), 샤드 간 캐시 미재사용, 20k 원시 JSON. 결정: 결정론적 스캐폴딩(고정 DAG, 판정 지점만 LLM) + 역할별 티어링 + 트랜스크립트 압축 + 지속 캐시 프리픽스 + per-shard 토큰 예산 가드.
+
+**신규 기능 (사용자 요청, 2026-07-02)**
+- **I-24 MCP 호출 시점 LLM topology 선택.** LLM 호출을 `api`(scpilot이 API 직접 호출) / `cli`(scpilot이 `claude`·`codex` 서브프로세스 실행) / `host_plugin`(호스트가 플러그인으로 위임)로 구분하고, 역할별(analysis/reviewer/annotator/interpreter)로 MCP 호출 시점에 선택. analysis는 mode-1에선 호스트 자신이므로 **선언/provenance 기록용**. 리뷰어는 세 방식 모두 config 선택. 노출은 전용 `configure_run` 툴.
+  - **결정(사용자 확정)**: 리뷰어 실행 3방식 모두 지원 / `configure_run` 전용 툴 / analysis 선언·기록용.
+  - **Increment 1 ✅(완료·검증)**: `llm/topology.py`(validate + availability probe), `core/configure.py`(`configure_run` 툴 — 세션 manifest 영속화, host_plugin 리뷰어 위임 directive, 미가용 경고), `session.Manifest.llm_topology` 필드. 테스트 `test_configure_run.py` 5 pass + 회귀 21 pass.
+  - **Increment 2 ✅(완료·검증)**: `provider.py`에 `CLIProvider`(claude/codex subprocess; forced-structured JSON 파싱, `_run_cli` 격리로 테스트) + `build_role_provider(spec)`(api→API backend, cli→CLIProvider, host_plugin→None). 테스트 `test_cli_provider.py` 6 pass.
+  - **Increment 3 ✅(완료·검증)**: `run_review` 툴(결정론적 — annotation_audit 증거 + topology 기반 라우팅 directive; LLM을 registry 툴 내부에서 안 돌려 replay 안전) + `review_routing()` 순수 헬퍼 + mode-2 `cli.py _role`이 세션 topology 소비(우선순위: CLI 플래그 > topology > analysis; host_plugin은 mode-2 비적용→analysis 폴백). 테스트 통과.
+  - **전체 회귀**: `pytest` 230 passed / 1 skipped / 0 fail (459s). replay-safety 설계 결정: mode-1 registry 툴은 LLM 인라인 실행 안 함 — api/cli 리뷰어의 실제 실행은 replay-safe한 mode-2 `run_agent` 경로(verdicts가 apply_annotation_audit param으로 기록됨) 또는 호스트가 담당.
+
+### 5.3 구현 우선순위
+1. **파일럿 차단 해제(즉시)**: I-11(Ensembl 진입), I-13(백오프), I-12(workdir/fingerprint). — 췌장 파일럿을 안전히 돌리기 위한 최소 집합.
+2. **품질·정확성**: I-16, I-17, I-15, I-21(CNV 정상조직), I-22(해상도), marker-DB-free 하드 강제.
+3. **GPU·확장**: I-10(scVI GPU/epoch), I-20(중립 기본값), I-19(max-iters), I-14(용량/provenance).
+4. **확장 전용**: I-9(cellhint 크로스샤드), 다중샤드 오케스트레이터, I-23(토큰).
+각 항목 §8대로 env 바이너리로 테스트 후 완료 선언. 대규모 동작 변경은 실제 데이터 캡/경량 재현 포함.

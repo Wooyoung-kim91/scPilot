@@ -77,7 +77,8 @@ def test_annotation_audit_emits_seven_checks(tmp_path):
     assert by["1"]["marker_set_support_frac"] < by["0"]["marker_set_support_frac"]
     assert "weak_marker_support" in by["1"]["flags"]
     # marker criteria (pct/logFC/p-value) are validated per claimed gene, and reported
-    assert sm["marker_criteria"] == {"min_pct": 0.25, "min_lfc": 1.0, "padj_max": 0.05}
+    assert sm["marker_criteria"] == {"min_pct": 0.25, "min_lfc": 1.0, "padj_max": 0.05,
+                                     "min_specificity": 0.1, "max_pct_out": 0.5}
     # cluster 0 (TypeA, A-markers boosted) -> its claimed A genes PASS all criteria
     ev0 = {m["gene"]: m for m in by["0"]["marker_criteria_check"]}
     assert ev0 and all(m["passes"] for m in ev0.values())
@@ -229,8 +230,9 @@ def test_harness_audit_governance_scorecard(tmp_path):
     r2 = tools.run("harness_audit", s2)
     st2 = {c["check"]: c["status"] for c in r2.summary["checks"]}
     assert st2["tier4_review_ran"] == "fail"         # no annotation_audit/apply_annotation_audit
-    assert st2["marker_db_free"] == "warn"           # annotate_broad used
-    assert r2.summary["verdict"] == "incomplete" and "tier4_review_ran" in r2.summary["violations"]
+    assert st2["marker_db_free"] == "fail"           # annotate_broad used → HARD fail (marker-DB-free rule)
+    assert r2.summary["verdict"] == "incomplete"
+    assert {"tier4_review_ran", "marker_db_free"} <= set(r2.summary["violations"])
 
 
 def test_harness_audit_flags_unreviewed_annotation_column(tmp_path):

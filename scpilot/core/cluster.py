@@ -76,14 +76,15 @@ def cluster(session, *, use_rep: str = "X_pca", n_neighbors: int = 15, n_pcs: in
 
 
 @register("cluster_sweep", mutating=False,
-          description="Sweep leiden resolution (default 0.1–0.5 step 0.1) on an embedding and return the "
-                      "n_clusters-vs-resolution curve + a suggested resolution at the KNEE (the value JUST "
-                      "BEFORE n_clusters jumps by ≥jump_ratio). Evidence for choosing resolution — the LLM "
-                      "judges/overrides, then calls cluster(use_rep, resolution=chosen). Non-mutating; the "
-                      "auto-plot is the resolution_sweep justification figure (plan: dynamic resolution).")
+          description="Sweep leiden resolution (default 0.1–0.5 step 0.1) on an embedding and return, per "
+                      "resolution, n_clusters AND a SEPARABILITY score (embedding silhouette). Suggests the "
+                      "resolution with the best separation (falls back to the n_clusters knee if silhouette is "
+                      "unavailable) — so resolution follows real structure, not raw cluster count (I-22). The LLM "
+                      "judges/overrides, then calls cluster(use_rep, resolution=chosen). Non-mutating.")
 def cluster_sweep(session, *, use_rep: str = "X_pca", res_min: float = 0.1, res_max: float = 0.5,
                   res_step: float = 0.1, n_neighbors: int = 15, n_pcs: int | None = None,
-                  jump_ratio: float = 1.5, seed: int = 0, **params) -> S.ToolResult:
+                  jump_ratio: float = 1.5, silhouette_subsample: int = 5000,
+                  seed: int = 0, **params) -> S.ToolResult:
     import pandas as pd
 
     from .. import recipes
@@ -95,16 +96,19 @@ def cluster_sweep(session, *, use_rep: str = "X_pca", res_min: float = 0.1, res_
                        f"embedding '{use_rep}' absent in obsm{sorted(adata.obsm)} — run preprocess/integrate first",
                        recoverable=True, suggested_next_tools=["preprocess"])
 
-    # the (non-mutating) resolution sweep + knee pick live in scpilot.recipes (scpilot-free) so the
-    # generated standalone tutorial script inlines the SAME source — logic-identical by construction.
+    # the (non-mutating) resolution sweep + separability pick live in scpilot.recipes (scpilot-free) so
+    # the generated standalone tutorial script inlines the SAME source — logic-identical by construction.
     sweep = recipes.cluster_sweep(adata, use_rep=use_rep, res_min=res_min, res_max=res_max,
-                                  res_step=res_step, n_neighbors=n_neighbors, n_pcs=n_pcs, seed=seed)
+                                  res_step=res_step, n_neighbors=n_neighbors, n_pcs=n_pcs,
+                                  silhouette_subsample=silhouette_subsample, seed=seed)
     suggested, rationale = recipes.suggest_resolution(sweep, jump_ratio=jump_ratio)
-    df = pd.DataFrame([{"resolution": r, "n_clusters": n} for r, n in sweep])
+    rows = [{"resolution": r, "n_clusters": n, "silhouette": sil} for r, n, sil in sweep]
+    df = pd.DataFrame(rows)
     summary = {
         "use_rep": use_rep,
-        "sweep": [{"resolution": r, "n_clusters": n} for r, n in sweep],
+        "sweep": rows,
         "suggested_resolution": suggested,
+        "selection_metric": "silhouette" if any(row["silhouette"] is not None for row in rows) else "n_clusters_knee",
         "jump_ratio": jump_ratio,
         "rationale": rationale,
         "n_steps": len(sweep),

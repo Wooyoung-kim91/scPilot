@@ -279,7 +279,7 @@ def compartment_subset(session, *, compartment: str | None = None, groupby: str 
         sub.X = sub.layers["counts"].copy()
         sc.pp.normalize_total(sub, target_sum=target_sum)
         sc.pp.log1p(sub)
-        sub.layers["scale.data"] = sub.X.copy()
+        # I-14: X holds log-norm; no duplicate 'scale.data' layer (see recipes.preprocess)
         bkey = hvg_batch_key if (hvg_batch_key and hvg_batch_key in sub.obs.columns) else None
         if hvg_batch_key and bkey is None:
             warnings.append(f"hvg_batch_key '{hvg_batch_key}' absent — HVG computed without batch")

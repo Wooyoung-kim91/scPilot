@@ -335,8 +335,10 @@ def cnv_score(session, *, reference_key: str | None = None, reference_cat: list 
     warnings = []
     if advisory:
         warnings.append("no reference_key/reference_cat: CNV is scored against the average of ALL cells "
-                        "(advisory-only). Provide a known non-malignant reference (e.g. condition=Normal or "
-                        "immune/stromal cell type) for a trustworthy malignant/normal contrast.")
+                        "(advisory-only) — UNRELIABLE on normal/non-tumor tissue, where highly-secretory or "
+                        "low-complexity populations (e.g. pancreatic acinar) can read as PSEUDO-CNV. Provide a "
+                        "known non-malignant reference (condition=Normal or an immune/stromal cell type); see "
+                        "summary.suggested_reference_groups for a data-driven starting point (I-21).")
 
     # 1) infercnv on log-normalized expression (genes lacking coordinates are auto-excluded)
     cnv.tl.infercnv(adata, reference_key=reference_key, reference_cat=reference_cat,
@@ -375,6 +377,7 @@ def cnv_score(session, *, reference_key: str | None = None, reference_cat: list 
             if cand in adata.obs.columns:
                 groupby = cand
                 break
+    suggested_reference_groups = None
     if groupby and groupby in adata.obs.columns:
         ct = (adata.obs.groupby(groupby, observed=True)["cnv_score"]
               .agg(["size", "mean"]).reset_index()
@@ -383,6 +386,12 @@ def cnv_score(session, *, reference_key: str | None = None, reference_cat: list 
         cnv_csv = session.artifact_path("cnv_by_celltype.csv")   # no-overwrite on re-run (P1-2)
         celltype_cnv = S.table_preview(ct, full_csv=str(cnv_csv))
         ct.to_csv(cnv_csv, index=False)
+        # I-21: when no reference was given, the LOWEST-CNV-burden groups (>=50 cells) are the most
+        # plausible non-malignant baseline. Surface them as EVIDENCE (not a call, no hardcoded cell
+        # types) so the LLM can re-run cnv_score with reference_key=groupby, reference_cat=[...].
+        if advisory:
+            elig = ct[ct["n_cells"] >= 50].sort_values("mean_cnv_score")
+            suggested_reference_groups = [str(g) for g in elig[groupby].head(3)]
 
     summary = {
         "n_cells": int(adata.n_obs), "n_genes_with_coords": n_coord,
@@ -392,6 +401,7 @@ def cnv_score(session, *, reference_key: str | None = None, reference_cat: list 
         "cnv_score_median": round(float(scores.median()), 4),
         "n_cnv_clusters": int(adata.obs["cnv_leiden"].nunique()),
         "reference_contrast": ref_contrast,
+        "suggested_reference_groups": suggested_reference_groups,
         "note": "cnv_score is per-cell CNV burden; HIGH = more aberrant (candidate malignant). "
                 "This tool emits EVIDENCE only — the malignant/non-malignant call is downstream.",
     }
@@ -507,11 +517,16 @@ def malignancy_evidence(session, *, groupby: str | None = None, reference_key: s
         # immune/stromal compartments are shared across patients.
         if has_sample:
             sv = adata.obs[sample_key].astype(str)[mask].value_counts(normalize=True)
-            evidence["clonal_expansion"] = {
-                "top_sample_fraction": round(float(sv.iloc[0]), 3),
-                "n_samples": int(sv.size),
-                "dominant_sample": str(sv.index[0]),
-            }
+            top_frac = float(sv.iloc[0])
+            ce = {"top_sample_fraction": round(top_frac, 3), "n_samples": int(sv.size),
+                  "dominant_sample": str(sv.index[0])}
+            # I-21: single-donor dominance WITHOUT elevated CNV vs the reference is more likely a
+            # donor-specific NORMAL population than a malignant clone — flag so clonal-expansion isn't
+            # over-read on normal/non-tumor tissue (the malignant call still needs concordant CNV).
+            ratio = evidence["cnv_burden"]["ratio_to_reference"]
+            if top_frac >= 0.8 and (ratio is None or ratio <= 1.1):
+                ce["donor_confound_suspected"] = True
+            evidence["clonal_expansion"] = ce
         if tumor_score is not None:
             evidence["tumor_marker_score"] = round(float(tumor_score.values[mask].mean()), 4)
         if normal_score is not None:

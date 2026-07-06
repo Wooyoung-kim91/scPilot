@@ -21,20 +21,24 @@ from scpilot.tools import register
 
 
 def _add_lognorm(adata, *, normalized_layer="scale.data", target_sum=1e4):
-    """normalize_total + log1p into X, mirrored to ``normalized_layer`` (scqc convention)."""
+    """normalize_total + log1p into X. ``counts`` stays immutable; X holds the log-norm values.
+
+    I-14: we no longer mirror X into a ``normalized_layer`` ('scale.data') — it was a byte-for-byte
+    duplicate of X (no z-scaling), doubling RAM + every checkpoint. ``normalized_layer`` is accepted
+    for profile back-compat but ignored. Downstream reads X (layer=None) and falls back to X anyway.
+    """
     import scanpy as sc
     if "counts" not in adata.layers:
         adata.layers["counts"] = adata.X.copy()
     adata.X = adata.layers["counts"].copy()
     sc.pp.normalize_total(adata, target_sum=target_sum)
     sc.pp.log1p(adata)
-    adata.layers[normalized_layer] = adata.X.copy()
     return adata
 
 
 @register("ingest", mutating=True, long_running=True,
           description="Build the merged AnnData from a dataset profile: metadata harmonize → per-sample 10x "
-                      "read + cell QC → merge → normalize (counts + scale.data). Raw-10x entry point (plan B0).")
+                      "read + cell QC → merge → normalize (immutable counts layer; X=log-norm). Raw-10x entry point (plan B0).")
 def ingest(session, *, profile: str | None = None, min_genes: int | None = None,
            max_pct_mt: float | None = None, min_cells: int | None = None,
            target_sum: float | None = None, **params) -> S.ToolResult:

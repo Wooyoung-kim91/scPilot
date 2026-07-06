@@ -122,7 +122,7 @@ def test_compartment_subset_markers_mode_recomputes_features(tmp_path):
     assert sm["x_state"] == "log1p" and sm["recompute_rep"] == "X_pca"
     sub = Session.open(sm["child_session_dir"]).adata
     assert "highly_variable" in sub.var and int(sub.var["highly_variable"].sum()) == sm["n_hvg"]
-    assert "X_pca" in sub.obsm and "scale.data" in sub.layers
+    assert "X_pca" in sub.obsm and "scale.data" not in sub.layers  # I-14: X is the log-norm layer
     assert r.determinism_grade == "B"
 
 

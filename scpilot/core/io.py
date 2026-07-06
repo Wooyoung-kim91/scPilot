@@ -161,6 +161,14 @@ def _load_tool(session, **params) -> S.ToolResult:
         "has_counts": "counts" in layers, "x_state_guess": x_state,
     }
     warnings = [] if "counts" in layers else ["no 'counts' layer — raw counts unavailable downstream"]
+    ev = adata.uns.get("scpilot_var_symbol_normalization")
+    if ev and ev.get("remapped"):
+        summary["var_symbol_normalization"] = ev
+        warnings.append(f"var_names were Ensembl IDs → remapped to symbols from var['{ev['symbol_column']}'] "
+                        f"(original IDs kept in var['gene_ids'])")
+    elif ev and ev.get("reason") == "ensembl_but_no_symbol_column":
+        warnings.append("var_names are Ensembl IDs but NO usable symbol column was found — "
+                        "mito/ribo/marker/CNV symbol logic will not work; add a gene-symbol var column")
     cp = session.checkpoint("load", x_state=x_state, params={"path": str(Path(path).resolve())})
     return S.success("load", summary=summary, warnings=warnings, checkpoint=cp.path,
                      determinism_grade="A", duration_s=round(time.time() - t0, 3),

@@ -52,7 +52,9 @@ def preprocess(adata, *, target_sum: float = 1e4, n_top_genes: int = 2000,
     adata.X = adata.layers["counts"].copy()
     sc.pp.normalize_total(adata, target_sum=target_sum)
     sc.pp.log1p(adata)
-    adata.layers["scale.data"] = adata.X.copy()    # project convention: normalized values kept here
+    # I-14: no 'scale.data' layer — it was a byte-for-byte duplicate of X (both log1p; no z-scaling
+    # is done here), so it doubled RAM + every checkpoint for no gain. X IS the log-norm layer;
+    # markers/annotation read X by default (layer=None) and fall back to X if 'scale.data' is absent.
 
     # HVG batch-key resolution (explicit OFF token → global; else auto-detect a sample-like column)
     batch_off = isinstance(hvg_batch_key, str) and hvg_batch_key.strip().lower() in _BATCH_OFF
@@ -150,7 +152,7 @@ def cluster(adata, *, use_rep: str = "X_pca", n_neighbors: int = 15, n_pcs: int 
     return adata, info
 
 
-def markers_rank(adata, *, groupby: str = "leiden", layer: str | None = "scale.data",
+def markers_rank(adata, *, groupby: str = "leiden", layer: str | None = None,
                  max_genes_ranked: int | None = 5000):
     """Wilcoxon ``rank_genes_groups`` per cluster (pts=True), in place into ``uns``. Pure scanpy.
 
@@ -208,33 +210,60 @@ def apply_annotation(adata, *, groupby: str = "leiden", labels: dict | None = No
 
 
 def suggest_resolution(sweep, *, jump_ratio: float = 1.5):
-    """Pick the resolution JUST BEFORE n_clusters jumps by ≥ ``jump_ratio`` (the knee). No abrupt
-    jump → the lowest (conservative) resolution. ``sweep`` is an ordered list of (resolution,
-    n_clusters). Returns (resolution, rationale). Pure python."""
+    """Pick a resolution from the sweep (I-22). Entries are ``(resolution, n_clusters[, silhouette])``.
+
+    If a SEPARABILITY score (embedding silhouette) is present, choose the resolution with the BEST
+    separation among those with ≥2 clusters — this reflects whether clusters ACTUALLY separate, not
+    just how many there are: over-clustering a noisy/sparse region lowers silhouette (so it is not
+    chosen), and merging distinct populations also lowers it. If no silhouette is available (legacy
+    2-tuples), fall back to the n_clusters KNEE (value just before an n_clusters jump ≥ ``jump_ratio``).
+    Returns ``(resolution, rationale)``. Pure python."""
+    res = [e[0] for e in sweep]
+    ncl = [e[1] for e in sweep]
+    sil = [(e[2] if len(e) > 2 else None) for e in sweep]
+
+    scored = [(r, s) for r, n, s in zip(res, ncl, sil) if s is not None and n >= 2]
+    if scored:
+        best_r, best_s = max(scored, key=lambda x: x[1])
+        return best_r, (f"chose res {best_r} — highest embedding separability (silhouette {best_s:.3f}) "
+                        f"among resolutions with ≥2 clusters; reflects real cluster separation, not raw "
+                        f"n_clusters (guards against over-clustering sparse/noisy regions)")
+    # fallback: n_clusters knee (no separability signal available)
     for i in range(len(sweep) - 1):
-        r_i, n_i = sweep[i]
-        r_next, n_next = sweep[i + 1]
-        if n_next >= max(n_i, 1) * jump_ratio:
-            return r_i, (f"n_clusters jumps {n_i}→{n_next} at res {r_next} (≥{jump_ratio}×); "
-                         f"chose res {r_i} just before the jump")
-    return sweep[0][0], (f"no abrupt jump (≥{jump_ratio}×) over res {sweep[0][0]}–{sweep[-1][0]}; "
-                         f"chose conservative lowest res {sweep[0][0]}")
+        if ncl[i + 1] >= max(ncl[i], 1) * jump_ratio:
+            return res[i], (f"n_clusters jumps {ncl[i]}→{ncl[i + 1]} at res {res[i + 1]} (≥{jump_ratio}×); "
+                            f"chose res {res[i]} just before the jump")
+    return res[0], (f"no abrupt jump (≥{jump_ratio}×) over res {res[0]}–{res[-1]}; "
+                    f"chose conservative lowest res {res[0]}")
 
 
 def cluster_sweep(adata, *, use_rep: str = "X_pca", res_min: float = 0.1, res_max: float = 0.5,
                   res_step: float = 0.1, n_neighbors: int = 15, n_pcs: int | None = None,
-                  seed: int = 0):
-    """Sweep leiden resolution on an embedding → ordered list of (resolution, n_clusters).
+                  seed: int = 0, silhouette_subsample: int = 5000):
+    """Sweep leiden resolution on an embedding → ordered list of ``(resolution, n_clusters, silhouette)``.
 
-    NON-MUTATING: the temporary neighbor/leiden keys are removed before returning. Pure scanpy.
-    (Pair with ``suggest_resolution`` to pick the knee.)
+    The per-resolution SILHOUETTE (mean over a seeded subsample of ``use_rep``) is a SEPARABILITY score
+    (I-22): it says whether the clusters at that resolution actually separate in the embedding, so
+    resolution can be chosen by real structure rather than raw cluster count. ``silhouette`` is ``None``
+    when n_clusters < 2 (undefined). NON-MUTATING: temporary neighbor/leiden keys are removed. Pure scanpy.
+    (Pair with ``suggest_resolution``.)
     """
+    import numpy as np
     import scanpy as sc
+    from sklearn.metrics import silhouette_score
 
-    rep_dim = adata.obsm[use_rep].shape[1]
+    rep = adata.obsm[use_rep]
+    rep_dim = rep.shape[1]
     use_pcs = min(n_pcs, rep_dim) if n_pcs else rep_dim
     n_steps = int(round((res_max - res_min) / res_step)) + 1
     grid = [round(res_min + i * res_step, 4) for i in range(max(1, n_steps))]
+    # one seeded subsample reused across resolutions → tractable + comparable silhouettes at scale
+    n = adata.n_obs
+    if n <= silhouette_subsample:
+        sidx = np.arange(n)
+    else:
+        sidx = np.sort(np.random.default_rng(seed).choice(n, silhouette_subsample, replace=False))
+    Xsub = np.asarray(rep[sidx, :use_pcs])
     nkey, lkey = "_sweep_nbr", "_sweep_leiden"
     sc.pp.neighbors(adata, n_neighbors=n_neighbors, n_pcs=use_pcs, use_rep=use_rep,
                     random_state=seed, key_added=nkey)
@@ -243,7 +272,16 @@ def cluster_sweep(adata, *, use_rep: str = "X_pca", res_min: float = 0.1, res_ma
         for r in grid:
             sc.tl.leiden(adata, resolution=r, key_added=lkey, flavor="igraph",
                          n_iterations=2, directed=False, random_state=seed, neighbors_key=nkey)
-            sweep.append((r, int(adata.obs[lkey].nunique())))
+            n_cl = int(adata.obs[lkey].nunique())
+            sil = None
+            if n_cl >= 2:
+                lab_sub = adata.obs[lkey].to_numpy()[sidx]
+                if len(set(lab_sub)) >= 2:
+                    try:
+                        sil = round(float(silhouette_score(Xsub, lab_sub)), 4)
+                    except Exception:  # noqa: BLE001 — silhouette must never break the sweep
+                        sil = None
+            sweep.append((r, n_cl, sil))
     finally:
         adata.obs.drop(columns=[lkey], errors="ignore", inplace=True)
         adata.uns.pop(nkey, None)
@@ -282,14 +320,19 @@ def majority_vote(adata, keys, *, min_agreement: float = 0.5, ambiguous_label: s
     cats = pd.unique(np.concatenate([adata.obs[k].astype(str).values for k in keys]))
     codes = np.column_stack([
         pd.Categorical(adata.obs[k].astype(str).values, categories=cats).codes for k in keys])
-    out = np.empty(adata.n_obs, dtype=object)
-    agree = np.zeros(adata.n_obs, dtype=float)
-    for i in range(adata.n_obs):
-        counts = np.bincount(codes[i], minlength=len(cats))
-        mx = counts.max()
-        winners = np.flatnonzero(counts == mx)
-        agree[i] = mx / n_keys
-        out[i] = cats[winners[0]] if (winners.size == 1 and mx / n_keys > min_agreement) else ambiguous_label
+    # I-15: vectorized per-cell majority (was an O(n_obs) Python loop — minutes-to-hours at 5M cells).
+    # n_keys is small (# annotation columns being voted, ~2–5), so the (n, k, k) equality tensor is cheap.
+    # freq[i,j] = how many of the k columns share column j's label for cell i.
+    eq = codes[:, :, None] == codes[:, None, :]           # (n_obs, k, k) bool
+    freq = eq.sum(axis=2)                                 # (n_obs, k)
+    mx = freq.max(axis=1)                                 # top label frequency per cell
+    agree = mx / n_keys
+    is_max = freq == mx[:, None]
+    # a UNIQUE winner ⇔ all columns achieving mx carry the SAME label (min==max of their codes)
+    wmin = np.where(is_max, codes, codes.max() + 1).min(axis=1)
+    wmax = np.where(is_max, codes, -1).max(axis=1)
+    win_ok = (wmin == wmax) & (agree > min_agreement)
+    out = np.where(win_ok, cats[wmin], ambiguous_label).astype(object)
     pairwise = {}
     for a in range(n_keys):
         for b in range(a + 1, n_keys):

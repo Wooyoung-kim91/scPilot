@@ -1,13 +1,13 @@
 """Preprocessing: normalize → log1p → HVG (seurat_v3) → PCA — scpilot plan B4.
 
 Starts from the immutable ``counts`` layer (so the step is reproducible regardless
-of what X currently holds), writes log-normalized values to X + a ``scale.data``
-layer (project convention; kept for marker/annotation use), selects HVGs with
-``seurat_v3`` (counts-based,
+of what X currently holds), writes log-normalized values to X (X IS the log-norm
+layer — markers/annotation read X), selects HVGs with ``seurat_v3`` (counts-based,
 needs scikit-misc; batch-aware via ``hvg_batch_key``), and runs PCA on the HVGs.
 
 No global ``sc.pp.scale`` — densifying 40k genes × 180k cells is infeasible and
-PCA centers internally; the merged already carries a ``scale.data`` layer if needed.
+PCA centers internally. (I-14: the former ``scale.data`` layer was a byte-for-byte
+duplicate of X and is no longer written — it doubled RAM + every checkpoint.)
 Returns the PCA variance-ratio + an elbow suggestion so the LLM can pick n_pcs.
 """
 
@@ -58,7 +58,7 @@ def preprocess(session, *, target_sum: float = 1e4, n_top_genes: int = 2000,
         "variance_ratio": vr[:50],
         "cumulative_variance_at_n_pcs": round(cum, 4),
         "suggested_n_pcs_elbow": suggested,
-        "x_state": "log1p", "normalized_layer": "scale.data",
+        "x_state": "log1p", "normalized_layer": "X",
     }
     cp = session.checkpoint("preprocess", x_state="log1p",
                             params={"target_sum": target_sum,

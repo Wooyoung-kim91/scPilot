@@ -73,7 +73,8 @@ def _de_stats(de_sub) -> dict:
 @register("annotation_audit", mutating=False,
           description="Tier-4 consistency AUDIT of the final annotation (evidence-only, no judgment, no marker DB): "
                       "emits the 7 inconsistency checks — and VALIDATES each claimed cell-type marker against the "
-                      "standard criteria (pct_in>=min_pct, logFC>=min_lfc, padj<padj_max) — plus marker-profile "
+                      "standard criteria (pct_in>=min_pct, logFC>=min_lfc, padj<padj_max, AND specific: "
+                      "spec>=min_specificity, pct_out<=max_pct_out) — plus marker-profile "
                       "collisions across labels, major/fine/facs hierarchy triples, single-patient & batch dominance, "
                       "doublet/stress/%MT, and malignancy-without-CNV. Deterministic flags for an INDEPENDENT "
                       "reviewer to confirm/refute (see ANNOTATION_AUDIT_PROMPT). Run after finalize_annotation.")
@@ -136,7 +137,8 @@ def annotation_audit(session, *, groupby: str = "leiden", label_key: str = "majo
     # the cell-type marker bar (parameters, NOT hardcoded per type): a claimed marker passes only if
     # it is expressed in enough of the cluster (pct_in >= min_pct), up-regulated (logFC >= min_lfc),
     # AND significant (padj < padj_max). marker_set_support_frac = fraction of claimed genes passing.
-    marker_criteria = {"min_pct": min_pct, "min_lfc": min_lfc, "padj_max": padj_max}
+    marker_criteria = {"min_pct": min_pct, "min_lfc": min_lfc, "padj_max": padj_max,
+                       "min_specificity": min_specificity, "max_pct_out": max_pct_out}
 
     def _check_marker(stats: dict) -> tuple[bool, list]:
         failed = []
@@ -146,6 +148,14 @@ def annotation_audit(session, *, groupby: str = "leiden", label_key: str = "majo
             failed.append("lfc")
         if stats.get("padj") is not None and stats["padj"] >= padj_max:
             failed.append("pvalue")
+        # I-16: a claimed marker must also be SPECIFIC (not broadly expressed) — mirror the
+        # marker-DB-free selection gate (_specific_markers) so the audit does NOT pass a
+        # housekeeping/ambient gene (e.g. MALAT1/RPS*) that satisfies pct/lfc/padj but fails
+        # specificity, which would otherwise inflate marker_set_support_frac and hide a weak label.
+        if stats.get("pct_out") is not None and stats["pct_out"] > max_pct_out:
+            failed.append("pct_out")
+        if stats.get("spec") is not None and stats["spec"] < min_specificity:
+            failed.append("spec")
         return (not failed), failed
 
     def _col(key):
@@ -403,9 +413,11 @@ def harness_audit(session, *, label_key: str = "major_cell_type", **params) -> S
                       for r in runs)
     chk("artifact_clusters_labeled", (not art_flagged) or art_labeled,
         f"artifact_flagged={art_flagged}, artifact_label_present={art_labeled}", sev="warn")
-    # 5) marker-DB-FREE annotation (no hardcoded fixed panel)
+    # 5) marker-DB-FREE annotation (no fixed panel) — HARD-enforced: annotation must be inferred from
+    # DE alone (annotation_review → apply_annotation), never via the panel path. Using annotate_broad
+    # FAILS the governance gate (project rule: marker-DB-free, per the CELLxGENE re-annotation decision).
     chk("marker_db_free", "annotate_broad" not in tools_run,
-        f"annotate_broad_used={'annotate_broad' in tools_run}", sev="warn")
+        f"annotate_broad_used={'annotate_broad' in tools_run}")
     # 6) reproducibility invariants: seeds on every run, decisions logged, run_log↔outputs consistent
     no_seed = [r.get("tool") for r in runs if r.get("seed") is None]
     chk("seeds_recorded", not no_seed, f"runs_without_seed={no_seed}")

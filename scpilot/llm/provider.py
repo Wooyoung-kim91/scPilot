@@ -58,6 +58,24 @@ class ProviderUnavailable(ProviderError):
     """The selected backend cannot run (SDK missing, no key, unreachable)."""
 
 
+# Transient error markers (I-13): substrings that indicate a retryable API condition. A single
+# transient 429/529/5xx/timeout otherwise crashes a whole shard run mid-pipeline. Matched
+# case-insensitively against the (wrapped) ProviderError message.
+_RETRYABLE_MARKERS = (
+    "rate limit", "ratelimit", "429", "overloaded", "529", "500", "502", "503", "504",
+    "timeout", "timed out", "connection", "temporarily", "server error", "internal server",
+)
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """True for transient API failures worth retrying; False for permanent ones (auth, bad request,
+    missing SDK/key → ProviderUnavailable)."""
+    if isinstance(exc, ProviderUnavailable):
+        return False
+    msg = str(exc).lower()
+    return any(m in msg for m in _RETRYABLE_MARKERS)
+
+
 # --------------------------------------------------------------------------- #
 # Normalized wire types
 # --------------------------------------------------------------------------- #
@@ -148,10 +166,43 @@ class Provider:
     def model(self) -> str:
         return self.config.resolved_model()
 
+    # Retry policy (I-13): transient API errors crash a whole shard run mid-pipeline otherwise. Retry
+    # with exponential backoff at THIS single chokepoint so every caller (agent loop, force_structured,
+    # interpretation, run_review) is covered without per-call-site changes. Non-transient errors (auth,
+    # bad request, missing SDK/key) are NOT retried. Subclasses implement ``_complete``.
+    max_retries: int = 5
+    backoff_base: float = 2.0        # seconds; delay = min(cap, base**attempt)
+    backoff_cap: float = 30.0
+
     def complete(self, messages: list[dict], *, tools: list[dict] | None = None,
                  system: str | None = None, tool_choice: str | dict | None = None,
                  max_tokens: int | None = None) -> LLMResponse:
+        import time
+        attempt = 0
+        while True:
+            try:
+                return self._complete(messages, tools=tools, system=system,
+                                      tool_choice=tool_choice, max_tokens=max_tokens)
+            except ProviderError as exc:
+                attempt += 1
+                if attempt > self.max_retries or not _is_retryable(exc):
+                    raise
+                delay = min(self.backoff_cap, self.backoff_base ** attempt)
+                self._on_retry(exc, attempt, delay)
+                time.sleep(delay)
+
+    def _complete(self, messages: list[dict], *, tools: list[dict] | None = None,
+                  system: str | None = None, tool_choice: str | dict | None = None,
+                  max_tokens: int | None = None) -> LLMResponse:
+        """Backend-specific single completion (no retry). Subclasses implement this."""
         raise NotImplementedError
+
+    def _on_retry(self, exc: Exception, attempt: int, delay: float) -> None:
+        """Called before sleeping on a retry. Logs to stderr; never raises. Overridable."""
+        import sys
+        print(f"[scpilot.provider:{self.name}] transient LLM error "
+              f"(attempt {attempt}/{self.max_retries}): {exc}; retrying in {delay:.0f}s",
+              file=sys.stderr)
 
     # ---- message-shaping helpers (the agent builds backend-neutral messages) ----
     @staticmethod
@@ -187,8 +238,8 @@ class AnthropicProvider(Provider):
         from anthropic import Anthropic
         self._client = Anthropic(api_key=config.api_key)
 
-    def complete(self, messages, *, tools=None, system=None, tool_choice=None,
-                 max_tokens=None) -> LLMResponse:
+    def _complete(self, messages, *, tools=None, system=None, tool_choice=None,
+                  max_tokens=None) -> LLMResponse:
         msgs = _to_anthropic_messages(messages)
         # PROMPT CACHING (cost): the agent re-sends the whole prefix (tools + system + growing
         # history) every turn. Mark the stable system block AND the last message so Anthropic
@@ -242,8 +293,8 @@ class OpenAICompatProvider(Provider):
             client_kwargs["base_url"] = config.base_url
         self._client = OpenAI(**client_kwargs)
 
-    def complete(self, messages, *, tools=None, system=None, tool_choice=None,
-                 max_tokens=None) -> LLMResponse:
+    def _complete(self, messages, *, tools=None, system=None, tool_choice=None,
+                  max_tokens=None) -> LLMResponse:
         oai_messages = _to_openai_messages(messages, system=system)
         kwargs: dict = {
             "model": self.model,
@@ -264,9 +315,150 @@ class OpenAICompatProvider(Provider):
 
 
 # --------------------------------------------------------------------------- #
+# CLI-execution backend (Claude Code / Codex as a subprocess) — I-24
+# --------------------------------------------------------------------------- #
+class CLIProvider(Provider):
+    """Invoke a CLI tool (``claude`` / ``codex``) as a subprocess to get a completion.
+
+    Used for the ``cli`` topology invocation type (see ``llm/topology.py``): scpilot runs the CLI
+    in non-interactive print/exec mode and captures stdout as the assistant text. This is NOT a
+    tool-calling loop — it is a single prompt→text turn, which is what the Tier-4 reviewer needs. For
+    a FORCED-structured request (``tool_choice`` = a tool name, e.g. the critique schema) it appends a
+    JSON-only instruction and parses stdout into a synthetic ToolCall so the existing structured path
+    still works. The subprocess call is isolated in ``_run_cli`` so tests can stub it.
+    """
+    # default argv (prompt is piped on stdin); {model} is filled from config. Override via spec['cmd'].
+    _DEFAULT_CMD = {"claude": ["claude", "-p"], "claude-code": ["claude", "-p"],
+                    "codex": ["codex", "exec"]}
+
+    def __init__(self, config: ProviderConfig, *, cli: str, cmd: list | None = None, timeout: int = 600):
+        super().__init__(config)
+        self.cli = cli
+        self.timeout = timeout
+        self._cmd = list(cmd) if cmd else None
+
+    @property
+    def name(self) -> str:
+        return f"cli:{self.cli}"
+
+    @property
+    def model(self) -> str:
+        return self.config.model or ""      # let the CLI use its own default when unset
+
+    def argv(self) -> list[str]:
+        if self._cmd:
+            return [a.replace("{model}", self.config.model or "") for a in self._cmd
+                    if not (a == "{model}" and not self.config.model)]
+        base = list(self._DEFAULT_CMD.get(self.cli, [self.cli]))
+        if self.config.model:
+            base += ["--model", self.config.model]
+        return base
+
+    def _run_cli(self, argv: list[str], prompt: str) -> str:
+        import subprocess
+        proc = subprocess.run(argv, input=prompt, capture_output=True, text=True, timeout=self.timeout)
+        if proc.returncode != 0:
+            raise ProviderError(f"{self.name} exited {proc.returncode}: {(proc.stderr or '')[-500:]}")
+        return proc.stdout
+
+    def _complete(self, messages, *, tools=None, system=None, tool_choice=None,
+                  max_tokens=None) -> LLMResponse:
+        import shutil
+        argv = self.argv()
+        if shutil.which(argv[0]) is None:
+            raise ProviderUnavailable(f"CLI '{argv[0]}' not found on PATH (topology cli role '{self.cli}')")
+        forced = tool_choice if isinstance(tool_choice, str) and tool_choice not in ("auto", "any", "none") else None
+        prompt = _flatten_prompt(messages, system=system, tools=tools, forced_tool=forced)
+        out = self._run_cli(argv, prompt)
+        if forced:
+            obj = _extract_json_object(out)
+            if obj is not None:
+                return LLMResponse(text="", tool_calls=[ToolCall(id="cli_0", name=forced, arguments=obj)],
+                                   stop_reason="tool_use", usage={})
+        return LLMResponse(text=out.strip(), stop_reason="end_turn", usage={})
+
+
+def _flatten_prompt(messages, *, system=None, tools=None, forced_tool=None) -> str:
+    """Flatten neutral messages (+system) into ONE text prompt for a CLI subprocess. When a tool is
+    forced, append its schema and a JSON-only instruction so the reply can be parsed back."""
+    parts: list[str] = []
+    if system:
+        parts.append(str(system))
+    for m in messages:
+        role = m.get("role")
+        if role in ("user", "assistant", "system"):
+            parts.append(f"[{role}]\n{m.get('content', '')}")
+        elif role == "tool":
+            parts.append(f"[tool_result {m.get('name', '')}]\n{m.get('content', '')}")
+    if forced_tool:
+        schema = None
+        for t in (tools or []):
+            if t.get("name") == forced_tool:
+                schema = t.get("input_schema") or t.get("parameters")
+                break
+        parts.append(
+            f"\nRespond with ONLY a single JSON object that is a valid argument to '{forced_tool}'"
+            + (f" matching this JSON schema:\n{json.dumps(schema)}" if schema else "")
+            + "\nNo prose, no code fences — just the JSON object.")
+    return "\n\n".join(parts)
+
+
+def _extract_json_object(text: str):
+    """Best-effort: parse the first balanced top-level JSON object from CLI stdout."""
+    if not text:
+        return None
+    s = text.strip()
+    if s.startswith("```"):                       # strip a ```json … ``` fence if present
+        s = s.split("```", 2)[1] if s.count("```") >= 2 else s.lstrip("`")
+        s = s[4:] if s.lower().startswith("json") else s
+    start = s.find("{")
+    if start < 0:
+        return None
+    depth, in_str, esc = 0, False, False
+    for i in range(start, len(s)):
+        c = s[i]
+        if in_str:
+            esc = (c == "\\" and not esc)
+            if c == '"' and not esc:
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(s[start:i + 1])
+                except json.JSONDecodeError:
+                    return None
+    return None
+
+
+# --------------------------------------------------------------------------- #
 # Factory + availability probe (used by doctor D1)
 # --------------------------------------------------------------------------- #
 _BACKENDS = {"anthropic": AnthropicProvider, "openai": OpenAICompatProvider}
+
+
+def build_role_provider(spec: dict) -> "Provider | None":
+    """Build a Provider from a normalized topology role spec (see ``llm/topology.py``).
+
+    ``api`` → the configured API backend; ``cli`` → ``CLIProvider`` (subprocess); ``host_plugin`` →
+    ``None`` (the HOST fulfils it — scpilot does not invoke anything). Raises ``ProviderUnavailable``
+    on a hard gate (unknown type / missing SDK / no key), consistent with ``build_provider``.
+    """
+    t = (spec or {}).get("type")
+    if t == "api":
+        cfg = ProviderConfig.from_env(backend=spec.get("backend"), model=spec.get("model"),
+                                      base_url=spec.get("base_url"), thinking={"type": "adaptive"})
+        return build_provider(cfg)
+    if t == "cli":
+        return CLIProvider(ProviderConfig(backend="cli", model=spec.get("model")),
+                           cli=spec["cli"], cmd=spec.get("cmd"))
+    if t == "host_plugin":
+        return None
+    raise ProviderUnavailable(f"unknown topology provider type {t!r} (valid: api|cli|host_plugin)")
 
 
 def build_provider(config: ProviderConfig | None = None, **overrides) -> Provider:

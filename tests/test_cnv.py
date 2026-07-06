@@ -165,6 +165,10 @@ def test_cnv_score_advisory_when_no_reference(tmp_path):
     assert r.status == "success"
     assert r.summary["advisory_only"] is True
     assert any("advisory-only" in w for w in r.warnings)
+    # I-21: with an annotation present, advisory mode surfaces data-driven reference candidates
+    assert "suggested_reference_groups" in r.summary
+    srg = r.summary["suggested_reference_groups"]
+    assert srg is None or isinstance(srg, list)
 
 
 # --------------------------------------------------------------------------- #
@@ -196,6 +200,8 @@ def test_malignancy_evidence_packages_axes(tmp_path):
     assert by["Epithelial"]["cnv_burden"]["ratio_to_reference"] > by["T_cell"]["cnv_burden"]["ratio_to_reference"]
     # clonal expansion: tumor epithelial dominated by one patient
     assert by["Epithelial"]["clonal_expansion"]["top_sample_fraction"] == 1.0
+    # I-21: a REAL clone (single-donor AND elevated CNV) must NOT be flagged as a donor confound
+    assert "donor_confound_suspected" not in by["Epithelial"]["clonal_expansion"]
     # read-only: scratch score columns cleaned up, no malignancy call yet
     assert "malignancy" not in s.adata.obs.columns
     r.to_dict()

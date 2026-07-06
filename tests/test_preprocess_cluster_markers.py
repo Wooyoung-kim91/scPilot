@@ -41,7 +41,7 @@ def test_preprocess(tmp_path):
     assert sm["n_hvg"] > 0 and sm["n_hvg"] <= 100
     assert sm["x_state"] == "log1p"
     assert "X_pca" in s.adata.obsm
-    assert "scale.data" in s.adata.layers      # project convention: log-norm layer
+    assert "scale.data" not in s.adata.layers  # I-14: X is the log-norm layer (no duplicate)
     assert len(sm["variance_ratio"]) == sm["n_pcs"]
     assert 1 <= sm["suggested_n_pcs_elbow"] <= sm["n_pcs"]
     assert r.determinism_grade == "B"

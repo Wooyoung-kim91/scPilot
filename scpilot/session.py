@@ -45,6 +45,18 @@ DEFAULT_RUN_DIR = os.environ.get("SCPILOT_RUN_DIR", str(Path.home() / "data" / "
 XState = Literal["raw_counts", "normalized", "log1p", "scaled", "unknown"]
 
 
+class InputMismatch(RuntimeError):
+    """Raised (I-12) when a session dir is reused with a DIFFERENT input than it was created for —
+    e.g. two shards sharing one --workdir. Prevents the silent reuse that caused invalid_state (I-2)."""
+
+
+def default_workdir_for_input(input_path: str) -> str:
+    """Per-input session dir (``<stem>_scpilot_session`` next to the input) — the single source used
+    by BOTH the MCP server and mode-2 ``run`` so different inputs (shards) never collide on one dir."""
+    p = Path(input_path).resolve()
+    return str(p.parent / f"{p.stem}_scpilot_session")
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -355,6 +367,7 @@ class Manifest:
     n_runs: int = 0
     n_outputs: int = 0                                   # outputs.jsonl records written (should track n_runs)
     log_inconsistencies: int = 0                         # times the outputs record failed to write after run_log
+    llm_topology: dict | None = None                     # per-role LLM invocation config (configure_run)
 
 
 class Session:
@@ -413,7 +426,19 @@ class Session:
         if existing.exists() and not exist_ok:
             raise FileExistsError(f"session already exists: {existing}")
         if existing.exists() and exist_ok:
-            return cls.open(out)
+            sess = cls.open(out)
+            # I-12 guard: reject a SILENT input swap — same workdir, different input file. This is the
+            # root cause of I-2 (a shard's run reused another's session and read the wrong checkpoint).
+            if input_path:
+                recorded = (sess.manifest.input or {}).get("fingerprint")
+                incoming = _fingerprint(input_path)
+                if recorded and incoming and recorded != incoming:
+                    rec_path = (sess.manifest.input or {}).get("path")
+                    raise InputMismatch(
+                        f"session at {out} was created for input '{rec_path}' but a DIFFERENT input "
+                        f"'{Path(input_path).resolve()}' was given (fingerprint mismatch). Use a "
+                        f"separate --workdir per input — shards must not share a session.")
+            return sess
         init_runtime()
         now = _now()
         man = Manifest(
@@ -474,6 +499,15 @@ class Session:
         if not src:
             raise ValueError("no input path given and none recorded in manifest")
         self._adata = ad.read_h5ad(src, backed=backed) if backed else ad.read_h5ad(src)
+        # Entry-point symbol normalization (I-11): CELLxGENE stores Ensembl-ID var_names with
+        # symbols in a var column; left as-is, MT-/RPS prefix matching silently no-ops. Remap to
+        # the data's own symbols here so every downstream path (load tool AND lazy auto-load before
+        # qc) sees symbols. No-op when var_names are already symbols; skipped on backed reads.
+        if backed is None:
+            from scpilot.core import _species
+            ev = _species.normalize_var_symbols(self._adata)
+            if ev.get("remapped") or ev.get("reason") == "ensembl_but_no_symbol_column":
+                self._adata.uns["scpilot_var_symbol_normalization"] = ev
         if not self.manifest.input:
             self.manifest.input = {"path": str(Path(src).resolve()), "fingerprint": _fingerprint(src)}
         self._refresh_counts_state()
@@ -884,11 +918,21 @@ class Session:
     def log_consistency(self) -> dict:
         """run_log ↔ outputs.jsonl coupling check (C-2): every logged run should have one
         outputs record. Returns counts + a ``consistent`` flag; a mismatch means an outputs
-        write failed after the run-log append (recorded in ``log_inconsistencies``)."""
+        write failed after the run-log append (recorded in ``log_inconsistencies``).
+
+        I-14 also surfaces a PROVENANCE BYPASS: the "25 checkpoints vs 2 runs" case, where
+        ``checkpoint()`` was called by ad-hoc/direct code that skipped the ``record_run`` chokepoint
+        (so those steps are not replayable). A mutating tool run through the harness produces BOTH a
+        checkpoint and a run, so far more checkpoints than runs ⇒ bypass. Non-mutating tools add runs
+        without checkpoints, so a small/negative gap is normal; a large POSITIVE gap is the signal.
+        """
         m = self.manifest
+        n_ckpt = len(m.checkpoints or [])
         consistent = m.log_inconsistencies == 0 and m.n_outputs == m.n_runs
-        return {"n_runs": m.n_runs, "n_outputs": m.n_outputs,
-                "log_inconsistencies": m.log_inconsistencies, "consistent": bool(consistent)}
+        gap = n_ckpt - m.n_runs
+        return {"n_runs": m.n_runs, "n_outputs": m.n_outputs, "n_checkpoints": n_ckpt,
+                "log_inconsistencies": m.log_inconsistencies, "consistent": bool(consistent),
+                "checkpoint_run_gap": gap, "checkpoint_bypass_suspected": gap > 1}
 
     def artifact_path(self, name: str) -> Path:
         """A non-colliding path under ``artifacts_dir`` for an output file (P1-2).

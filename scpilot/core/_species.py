@@ -14,6 +14,71 @@ case-insensitive lookup is a normalization, not a species assumption.
 
 from __future__ import annotations
 
+import re
+
+# Ensembl gene-ID format across species (ENSG human, ENSMUSG mouse, ENSDARG zebrafish, …),
+# optionally version-suffixed ("…​.3"). This is a FORMAT check on the identifiers themselves,
+# not a species/biology assumption — the same spirit as reading symbol casing.
+_ENSEMBL_GENE_RE = re.compile(r"^ENS[A-Z]{0,5}G\d{6,}(\.\d+)?$")
+
+# var columns that, WHEN ALREADY PRESENT IN THE DATA, carry gene symbols. We only CHOOSE among
+# columns the object already ships (CELLxGENE writes symbols to ``feature_name``); no gene
+# biology is hardcoded — this is a column-name convention list, not a marker/panel.
+_SYMBOL_COL_CANDIDATES = (
+    "feature_name", "gene_symbols", "gene_symbol", "gene_name", "gene_names",
+    "Symbol", "symbol", "symbols", "SYMBOL", "hgnc_symbol", "mgi_symbol",
+)
+
+
+def looks_like_ensembl(var_names, *, min_frac: float = 0.5) -> bool:
+    """True if ``var_names`` are predominantly Ensembl gene IDs (a format check, not a species guess)."""
+    import pandas as pd
+    s = pd.Index([str(x) for x in var_names]).to_series()
+    if s.empty:
+        return False
+    return float(s.str.match(_ENSEMBL_GENE_RE).mean()) >= min_frac
+
+
+def _usable_symbols(col):
+    """Boolean mask of var rows whose symbol value is a non-empty, non-'nan' string."""
+    s = col.astype("string")
+    return s.notna() & (s.str.len() > 0) & (s.str.upper() != "NAN")
+
+
+def normalize_var_symbols(adata, *, min_coverage: float = 0.5) -> dict:
+    """Remap Ensembl-ID ``var_names`` → gene symbols read from the data's OWN var column.
+
+    Evidence-based, no hardcoded biology (§1): the symbol source is a column already present on
+    the object; we only pick WHICH existing column to use. Original IDs are preserved in
+    ``var['gene_ids']``. Idempotent and a no-op when var_names are already symbols or no usable
+    symbol column exists. Returns an evidence dict; callers surface it in ``warnings``/``uns``.
+
+    Motivation: CELLxGENE stores Ensembl IDs (``ENSG…``) as var_names with symbols in
+    ``feature_name``. Left as-is, ``MT-``/``RPS`` prefix matching finds nothing → ``pct_counts_mt``
+    silently 0 and marker/CNV symbol lookups degrade, with no error. This normalizes at entry.
+    """
+    import pandas as pd
+    v = adata.var_names
+    if not looks_like_ensembl(v):
+        return {"remapped": False, "reason": "not_ensembl", "n_vars": int(len(v))}
+    chosen = None
+    for c in _SYMBOL_COL_CANDIDATES:
+        if c in adata.var.columns and float(_usable_symbols(adata.var[c]).mean()) >= min_coverage:
+            chosen = c
+            break
+    if chosen is None:
+        return {"remapped": False, "reason": "ensembl_but_no_symbol_column",
+                "var_columns": [str(c) for c in adata.var.columns], "n_vars": int(len(v))}
+    ids = pd.Index([str(x) for x in v])
+    if "gene_ids" not in adata.var.columns:
+        adata.var["gene_ids"] = list(ids)
+    ok = _usable_symbols(adata.var[chosen])
+    filled = adata.var[chosen].astype("string").where(ok, pd.Series(list(ids), index=adata.var.index))
+    adata.var_names = pd.Index([str(x) for x in filled])
+    adata.var_names_make_unique()
+    return {"remapped": True, "symbol_column": chosen, "n_vars": int(len(v)),
+            "n_symbols_missing_kept_as_id": int((~ok).sum())}
+
 
 def detect_organism(adata) -> dict:
     """Infer organism from gene-name casing + mito-gene style. Returns evidence, never
@@ -27,6 +92,12 @@ def detect_organism(adata) -> dict:
     if n == 0:
         return {"organism": "unknown", "n_genes": 0, "frac_symbols_uppercase": 0.0,
                 "mito_prefix": "MT-", "evidence": "no genes"}
+    # Ensembl IDs are ALL-CAPS by format (ENSG…/ENSMUSG…) and would be misread as "human" by
+    # casing while matching no ``MT-`` gene — defer instead of guessing (see normalize_var_symbols).
+    if looks_like_ensembl(v):
+        return {"organism": "unknown", "n_genes": n, "frac_symbols_uppercase": 1.0,
+                "mito_prefix": "MT-",
+                "evidence": "var_names are Ensembl IDs — call normalize_var_symbols first to map to symbols"}
     frac_upper = float(v.str.isupper().mean())
     has_mt_lower = bool(v.str.startswith("mt-").any())
     has_mt_upper = bool(v.str.startswith("MT-").any())

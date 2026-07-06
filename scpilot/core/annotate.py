@@ -132,7 +132,7 @@ def annotate_broad(session, *, groupby: str = "leiden",
                    min_pct: float = 0.25, min_lfc: float = 1.0,
                    min_markers: int = 3, top_n_markers: int = 30,
                    sample_key: str = "sample_id", batch_key: str = "GSE",
-                   layer: str | None = "scale.data", single_source_frac: float = 0.8,
+                   layer: str | None = None, single_source_frac: float = 0.8,
                    # rule 2 (PTPRC consistency) — opt-in: supply ptprc_gene + the compartment split
                    ptprc_gene: str | None = None,
                    immune_compartments: list | set | None = None,

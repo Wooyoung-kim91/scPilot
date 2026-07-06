@@ -185,7 +185,7 @@ def test_ingest_standalone_matches_tool(tmp_path):
     assert out.obs["sample_id"].astype(str).value_counts().to_dict() == \
         tool.obs["sample_id"].astype(str).value_counts().to_dict()
     assert sorted(out.var_names) == sorted(tool.var_names)
-    assert set(out.layers) >= {"counts", "scale.data"}
+    assert "counts" in set(out.layers) and "scale.data" not in set(out.layers)  # I-14: no duplicate layer
     out_counts = np.asarray(out.layers["counts"].todense()) if hasattr(out.layers["counts"], "todense") \
         else np.asarray(out.layers["counts"])
     # align gene/cell order then compare raw counts

@@ -191,7 +191,10 @@ def run(
     review_max_rounds: int = typer.Option(3, "--review-max-rounds",
                                           help="bounded annotation+review loop: max audit→re-annotate rounds"),
     seed: int = typer.Option(0, "--seed", help="global RNG seed (recorded for replay)"),
-    max_iters: int = typer.Option(40, "--max-iters", help="max LLM tool-loop iterations"),
+    max_iters: int = typer.Option(120, "--max-iters",
+                                  help="max LLM tool-loop iterations (default 120: a full pipeline — QC→"
+                                       "integrate→per-embedding annotate+Tier-4→compartments→CNV→finalize — "
+                                       "is ~60-120 tool calls; 40 stopped mid-run)"),
     param_file: str = typer.Option(None, "--param-file",
                                    help="YAML preset of {tool: {param: value}} to FIX (see `scpilot params --template`)"),
 ) -> None:
@@ -208,9 +211,10 @@ def run(
     from scpilot import tools
     from scpilot.llm.agent import run_agent
     from scpilot.llm import prompts
-    from scpilot.llm.provider import ProviderConfig, ProviderUnavailable, build_provider
+    from scpilot.llm.provider import (ProviderConfig, ProviderUnavailable, build_provider,
+                                       build_role_provider)
     from scpilot.repro import set_global_seed
-    from scpilot.session import DEFAULT_RUN_DIR, Session
+    from scpilot.session import InputMismatch, Session, default_workdir_for_input
 
     if not Path(inp).exists():
         typer.secho(f"input not found: {inp}", fg=typer.colors.RED, err=True)
@@ -232,8 +236,13 @@ def run(
         raise typer.Exit(code=2)
 
     seed_rec = set_global_seed(seed)
-    wd = workdir or str(Path(DEFAULT_RUN_DIR) / "mode2")
-    session = Session.create(wd, input_path=inp)
+    # I-12: default to a PER-INPUT session dir so shards run in parallel without clobbering one dir.
+    wd = workdir or default_workdir_for_input(inp)
+    try:
+        session = Session.create(wd, input_path=inp)
+    except InputMismatch as exc:
+        typer.secho(f"[scpilot run] {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
 
     typer.secho(f"[scpilot run] backend={provider.name} model={provider.model} -> {wd}",
                 fg=typer.colors.CYAN, err=True)
@@ -267,24 +276,44 @@ def run(
     # DIFFERENT models (complement each model's strengths). Each role falls back to the analysis
     # model unless its own --<role>-model/-backend is given. Cross-model review (reviewer ≠ analysis)
     # is the most valuable: one engine annotates, ANOTHER independently audits.
-    def _role(name, r_model, r_backend, r_base):
-        if not (r_model or r_backend or r_base):
-            return provider
-        try:
-            p = build_provider(ProviderConfig.from_env(backend=r_backend or backend, model=r_model,
-                                                       base_url=r_base or base_url, effort=effort,
-                                                       thinking={"type": "adaptive"}))
-            typer.secho(f"[scpilot run] {name}: backend={p.name} model={p.model}",
-                        fg=typer.colors.CYAN, err=True)
-            return p
-        except ProviderUnavailable as exc:
-            typer.secho(f"[scpilot run] {name} unavailable ({exc}); using the analysis model",
-                        fg=typer.colors.YELLOW, err=True)
-            return provider
+    # Priority: explicit CLI flags (most specific, human-in-the-loop) > session topology (configure_run,
+    # I-24) > the analysis model. host_plugin topology roles are host-fulfilled → not runnable in the
+    # self-driving mode-2 loop, so they fall back to the analysis model here (with a note).
+    topo = session.manifest.llm_topology or {}
 
-    reviewer = _role("Tier-4 reviewer", reviewer_model, reviewer_backend, reviewer_base_url) if review else None
-    annotator = _role("annotator (re-annotation)", annotator_model, annotator_backend, annotator_base_url)
-    interpreter = _role("interpretation", interpretation_model, interpretation_backend, interpretation_base_url)
+    def _role(name, role_key, r_model, r_backend, r_base):
+        if r_model or r_backend or r_base:
+            try:
+                p = build_provider(ProviderConfig.from_env(backend=r_backend or backend, model=r_model,
+                                                           base_url=r_base or base_url, effort=effort,
+                                                           thinking={"type": "adaptive"}))
+                typer.secho(f"[scpilot run] {name}: backend={p.name} model={p.model}",
+                            fg=typer.colors.CYAN, err=True)
+                return p
+            except ProviderUnavailable as exc:
+                typer.secho(f"[scpilot run] {name} unavailable ({exc}); using the analysis model",
+                            fg=typer.colors.YELLOW, err=True)
+                return provider
+        spec = topo.get(role_key)
+        if spec:
+            try:
+                p = build_role_provider(spec)
+                if p is None:   # host_plugin — fulfilled by a host, not by the self-driving loop
+                    typer.secho(f"[scpilot run] {name}: topology '{role_key}' is host_plugin — not "
+                                "runnable in mode-2; using the analysis model", fg=typer.colors.YELLOW, err=True)
+                    return provider
+                typer.secho(f"[scpilot run] {name}: from topology ({spec.get('type')} "
+                            f"{getattr(p, 'model', '')})", fg=typer.colors.CYAN, err=True)
+                return p
+            except ProviderUnavailable as exc:
+                typer.secho(f"[scpilot run] {name} topology unavailable ({exc}); using the analysis model",
+                            fg=typer.colors.YELLOW, err=True)
+                return provider
+        return provider
+
+    reviewer = _role("Tier-4 reviewer", "reviewer", reviewer_model, reviewer_backend, reviewer_base_url) if review else None
+    annotator = _role("annotator (re-annotation)", "annotator", annotator_model, annotator_backend, annotator_base_url)
+    interpreter = _role("interpretation", "interpreter", interpretation_model, interpretation_backend, interpretation_base_url)
 
     result = run_agent(session, provider, goal=goal, tissue=tissue, resolutions=resolutions,
                        seed=seed, max_iters=max_iters, param_overrides=param_overrides,

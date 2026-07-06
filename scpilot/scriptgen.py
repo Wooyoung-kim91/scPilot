@@ -69,7 +69,7 @@ seed = {_g(params, "seed", 0)!r}
 adata.X = adata.layers["counts"].copy()
 sc.pp.normalize_total(adata, target_sum=target_sum)
 sc.pp.log1p(adata)
-adata.layers["scale.data"] = adata.X.copy()        # keep normalized values for markers/annotation
+# X holds the log-normalized values (no duplicate 'scale.data' layer); markers/annotation read X
 
 # resolve the HVG batch key: explicit OFF token -> global; else auto-detect a sample-like column
 batch_off = isinstance(hvg_batch_key, str) and hvg_batch_key.strip().lower() in {{"none", "", "off", "false", "no"}}
@@ -193,7 +193,7 @@ def _markers(cid: str, params: dict) -> str:
 
 # parameters (edit freely)
 groupby = {_g(params, "groupby", "leiden")!r}
-layer = {_g(params, "layer", "scale.data")!r}
+layer = {_g(params, "layer", None)!r}
 max_genes_ranked = {_g(params, "max_genes_ranked", 5000)!r}
 
 # Wilcoxon rank-sum DE per cluster (FIXED method for marker genes; pts=True -> expressed fractions)
@@ -829,7 +829,7 @@ merged.layers["counts"] = merged.X.copy()
 merged.X = merged.layers["counts"].copy()
 sc.pp.normalize_total(merged, target_sum=target_sum)
 sc.pp.log1p(merged)
-merged.layers[normalized_layer] = merged.X.copy()
+# X holds the log-normalized values (no duplicate normalized layer; markers/annotation read X)
 
 merged.write_h5ad(OUT)
 print("[__CID__] ingest: %d cells x %d genes from %d samples (%d failed) -> %s"
