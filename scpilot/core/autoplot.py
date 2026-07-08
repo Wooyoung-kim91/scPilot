@@ -17,7 +17,32 @@ Design notes:
 
 from __future__ import annotations
 
+# Pre-benchmark FALLBACK order only — NOT a claim about which reduction is best. The best reduction
+# is a benchmark RESULT read from uns['scpilot']['best_embedding'] (see _resolve_best_umap); that
+# always takes priority in _best_basis. This order is used only before any best has been recorded.
 _UMAP_PREFERENCE = ("X_umap_scvi", "X_umap_harmony", "X_umap")
+
+
+def _umap_for_reduction(reduction: str | None) -> str | None:
+    """Map a reduction key (as recorded by benchmark, e.g. 'X_harmony'/'X_scVI'/'X_pca') to the
+    2D UMAP layout computed on it ('X_umap_harmony'/'X_umap_scvi'/'X_umap'). None if unknown."""
+    if not reduction:
+        return None
+    r = str(reduction).removeprefix("X_").lower()
+    if r in ("pca", ""):
+        return "X_umap"
+    return "X_umap_" + r                                     # harmony -> X_umap_harmony, scvi -> X_umap_scvi
+
+
+def _resolve_best_umap(adata) -> str | None:
+    """The UMAP of the benchmark-chosen BEST embedding, if its layout exists — so annotation/finalize
+    plots use the SAME manifold the labels were derived on (not a fixed scVI-first preference)."""
+    try:
+        best = (adata.uns.get("scpilot", {}) or {}).get("best_embedding")
+        bk = _umap_for_reduction(best)
+        return bk if bk and bk in adata.obsm else None
+    except Exception:  # noqa: BLE001
+        return None
 
 # sample/condition-like obs columns to auto-color UMAPs by (name hints + low-cardinality
 # categoricals); QC numerics, doublet flags and leiden keys are excluded.
@@ -27,7 +52,9 @@ _META_NAME_HINTS = ("sample", "sample_id", "condition", "tissue", "batch", "pati
 _META_EXCLUDE = {"predicted_doublet", "mixed_lineage_flag", "mt", "ribo"}
 
 
-def _best_basis(obsm) -> str:
+def _best_basis(obsm, preferred: str | None = None) -> str:
+    if preferred and preferred in obsm:                      # benchmark-chosen best embedding's UMAP
+        return preferred
     for b in _UMAP_PREFERENCE:
         if b in obsm:
             return b
@@ -69,8 +96,11 @@ def _metadata_color_keys(adata, *, cap: int = 6, max_card: int = 30) -> list:
 
 
 def plan_autoplots(tool: str, summary: dict, *, obs: set, obsm: set,
-                   meta_keys: list | None = None) -> list[dict]:
-    """Return a list of ``plots``-tool kwargs appropriate for the just-run ``tool``."""
+                   meta_keys: list | None = None, best_umap: str | None = None) -> list[dict]:
+    """Return a list of ``plots``-tool kwargs appropriate for the just-run ``tool``.
+
+    ``best_umap`` (if given) is the UMAP of the benchmark-chosen best embedding; annotation/finalize
+    plots use it so labels are shown on the manifold they were derived on."""
     summary = summary or {}
     specs: list[dict] = []
     has_scatter = {"total_counts", "n_genes_by_counts"} <= obs
@@ -103,7 +133,7 @@ def plan_autoplots(tool: str, summary: dict, *, obs: set, obsm: set,
     elif tool == "apply_annotation":
         key = summary.get("label_key")
         if key and key in obs:
-            specs.append({"kind": "umap", "color": key, "basis": _best_basis(obsm)})
+            specs.append({"kind": "umap", "color": key, "basis": _best_basis(obsm, best_umap)})
             # broad annotation-evidence dotplot (cell types × their marker set). Prefer the LLM's
             # recorded >=3-gene marker_sets; else derive cell-type panels from the leiden DE via the
             # cluster->label map. Rows are family-contiguous (staircase) by default.
@@ -118,7 +148,7 @@ def plan_autoplots(tool: str, summary: dict, *, obs: set, obsm: set,
         fk = summary.get("facs_key", "facs_style_label")
         key = fk if fk in obs else summary.get("fine_key", "fine_cell_type")
         if key in obs:
-            specs.append({"kind": "umap", "color": key, "basis": _best_basis(obsm)})
+            specs.append({"kind": "umap", "color": key, "basis": _best_basis(obsm, best_umap)})
         gb = summary.get("groupby")                          # subcluster leiden (carries the DE)
         lm = summary.get("facs_label_map")
         if key in obs and gb and gb in obs and lm:
@@ -129,15 +159,15 @@ def plan_autoplots(tool: str, summary: dict, *, obs: set, obsm: set,
     elif tool == "consensus_annotation":
         key = summary.get("out_key")
         if key and key in obs:
-            specs.append({"kind": "umap", "color": key, "basis": _best_basis(obsm)})
+            specs.append({"kind": "umap", "color": key, "basis": _best_basis(obsm, best_umap)})
     elif tool == "merge_fine_annotations":
         key = "facs_style_label" if "facs_style_label" in obs else summary.get("fine_key", "fine_cell_type")
         if key in obs:
-            specs.append({"kind": "umap", "color": key, "basis": _best_basis(obsm)})
+            specs.append({"kind": "umap", "color": key, "basis": _best_basis(obsm, best_umap)})
     elif tool == "finalize_annotation":
         key = summary.get("out_key", "final_annotation")        # consolidated FACS-like map
         if key in obs:
-            specs.append({"kind": "umap", "color": key, "basis": _best_basis(obsm)})
+            specs.append({"kind": "umap", "color": key, "basis": _best_basis(obsm, best_umap)})
     return specs
 
 
@@ -152,7 +182,8 @@ def auto_plots(session, tool: str, summary: dict) -> list:
     obs = set(adata.obs.columns)
     obsm = set(adata.obsm.keys())
     meta_keys = _metadata_color_keys(adata) if tool == "cluster" else None
-    specs = plan_autoplots(tool, summary, obs=obs, obsm=obsm, meta_keys=meta_keys)
+    best_umap = _resolve_best_umap(adata)
+    specs = plan_autoplots(tool, summary, obs=obs, obsm=obsm, meta_keys=meta_keys, best_umap=best_umap)
     if not specs:
         return []
     try:  # RISK #16: a plots-module import failure must not escape (never-raises contract)

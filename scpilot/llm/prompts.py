@@ -258,6 +258,10 @@ CANONICAL FLOW (skip steps already satisfied per detect_state; stop when the goa
 10. finalize_annotation -> consolidate every label into obs['final_annotation'] (FACS-like): base =
     facs_style_label > fine_cell_type > major_cell_type (most specific), qualified by malignancy
     ('Malignant <base>' for malignant cells). Then DE per the goal and a final report.
+    OPTIONAL publication export: export_final -> writes a slim standalone .h5ad that DROPS QC-artifact
+    cells (Low_quality/Doublet; malignant tumour cells are KEPT) and keeps ONLY the benchmark-chosen
+    best integration reduction (its embedding + UMAP as canonical X_umap + neighbour graph), and
+    renders the final UMAP(s) on that best-embedding manifold. NOT a checkpoint (cell count changes).
 
 11. Tier-4 consistency review — a BOUNDED annotation+verification LOOP (AFTER finalize; up to ~3
     rounds). Each round:

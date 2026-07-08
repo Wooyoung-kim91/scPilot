@@ -138,6 +138,11 @@ def benchmark(session, *, label_key: str = "major_cell_type", batch_key: str = "
     ranked = sorted((e for e in scores if scores[e].get("Total") is not None),
                     key=lambda e: scores[e]["Total"], reverse=True)
     best = ranked[0] if ranked else None
+    if best:                                                 # persist so autoplot/finalize/plots show
+        try:                                                 # labels on the BEST embedding's UMAP,
+            adata.uns.setdefault("scpilot", {})["best_embedding"] = str(best)  # not a fixed scVI-first default
+        except Exception:  # noqa: BLE001
+            pass
 
     # over-correction flag: an embedding that wins batch-correction but loses bio-conservation
     overcorrection = []

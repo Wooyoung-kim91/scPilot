@@ -81,6 +81,7 @@ def build_server():
     over MCP — no edits here. Session working dir comes from a ``workdir`` arg
     (defaults next to the input) so MCP callers get the same on-disk session model.
     """
+    import anyio
     from mcp.server.fastmcp import FastMCP
 
     from scpilot import __version__, tools
@@ -91,14 +92,25 @@ def build_server():
 
     lg = _configure_io()
     specs = _select_specs(specs, lg)   # F5: optional env-gated allow/deny filter
+
+    # Why offload: FastMCP calls a *sync* tool handler directly on the asyncio event loop
+    # (mcp/server/fastmcp func_metadata: `return fn(...)` when the handler is not a coroutine).
+    # So a long tool (ingest 100k+ cells / train_scvi / benchmark / cnv) blocks the loop for
+    # minutes, the server cannot answer the client's protocol PINGs, and the client tears the
+    # stdio connection down mid-run ("works for a while then disconnects"). We instead run the
+    # blocking body in a worker thread so the loop stays free to answer pings for the full
+    # duration. Capacity 1 serializes tool execution: the body pins the *process-global* RNG
+    # (set_global_seed) and mutates scanpy's global settings, so two concurrent tools would
+    # corrupt each other's determinism — the reproducibility invariant requires one-at-a-time.
+    _tool_limiter = anyio.CapacityLimiter(1)
     # Model-agnostic guidance: ship the orchestration brief in the MCP `initialize` handshake so
     # EVERY client's LLM (Claude Code, Codex, a local model) — not just Claude — sees how to drive
     # the pipeline. The full canonical flow is fetchable via prompt/resource/tool below.
     mcp = FastMCP("scpilot", instructions=prompts.MCP_INSTRUCTIONS)
 
     def _make_handler(name: str):
-        def handler(input: str, workdir: str = "", params: dict | None = None,
-                    seed: int = 0) -> dict:
+        def _run_blocking(input: str, workdir: str, params: dict | None, seed: int) -> dict:
+            """The synchronous tool body — run in a worker thread (see _tool_limiter above)."""
             from scpilot import schemas as S
             from scpilot.repro import set_global_seed
             lg.info("tool=%s input=%s seed=%s", name, input, seed)
@@ -123,6 +135,15 @@ def build_server():
             except Exception as exc:  # noqa: BLE001 — MCP must return a structured error, not throw
                 lg.exception("tool %s failed", name)
                 return S.error(name, "internal", f"{type(exc).__name__}: {exc}").to_dict()
+
+        async def handler(input: str, workdir: str = "", params: dict | None = None,
+                          seed: int = 0) -> dict:
+            # async handler => FastMCP awaits it, keeping the event loop responsive to protocol
+            # pings while the blocking body runs off-loop in a worker thread (serialized by
+            # _tool_limiter). This is what stops the client from dropping the connection during
+            # long tools. Signature is unchanged so the exposed tool schema is identical.
+            return await anyio.to_thread.run_sync(
+                _run_blocking, input, workdir, params, seed, limiter=_tool_limiter)
         return handler
 
     for spec in specs:

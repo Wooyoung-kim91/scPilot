@@ -89,7 +89,7 @@ def _artifacts_from_fit(fit, cfg) -> list[S.Artifact]:
                       "auto-fits to the SMALLEST 0.5–2.0×0.5–2.0 col size with no text/dot overlap and a "
                       "size/colour legend ≤5% of the figure (many-category umap uses a generous canvas).")
 def plots(session, *, kind: str = "umap", color: str | None = None,
-          basis: str = "X_umap", keys: list | None = None, groupby: str | None = None,
+          basis: str | None = None, keys: list | None = None, groupby: str | None = None,
           marker_groups: dict | None = None, order: list | None = None,
           family_map: dict | None = None, cluster_key: str | None = None,
           label_map: dict | None = None, include_label_genes: bool = False,
@@ -108,6 +108,9 @@ def plots(session, *, kind: str = "umap", color: str | None = None,
 
     try:
         if kind == "umap":
+            if basis is None:                                # default to the benchmark-chosen best
+                from scpilot.core.autoplot import _resolve_best_umap  # embedding's UMAP, else X_umap
+                basis = _resolve_best_umap(adata) or "X_umap"
             if basis not in adata.obsm:
                 return S.error("plots", "invalid_state",
                                f"no '{basis}' in obsm{sorted(adata.obsm)} — run cluster/integrate first",

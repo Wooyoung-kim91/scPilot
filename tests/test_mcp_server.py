@@ -81,6 +81,25 @@ def test_mcp_workflow_guidance_is_model_agnostic(tmp_path):
     assert "Tier-4 consistency" in wf                              # incl. the independent audit/critique
 
 
+def test_registry_tool_handlers_are_async_offloaded():
+    # Regression guard: every registry-driven MCP tool handler MUST be async so FastMCP awaits
+    # it and offloads the blocking body to a worker thread (see mcp_server._make_handler). If a
+    # handler is sync, FastMCP runs it directly on the asyncio event loop, which freezes the loop
+    # for the whole tool duration — the server then can't answer protocol pings and the client
+    # drops the connection mid-run on long tools (ingest / train_scvi / benchmark / cnv).
+    from scpilot.mcp_server import build_server
+
+    srv = build_server()
+    tools = srv._tool_manager.list_tools()
+    registry_handlers = [t for t in tools if t.name.endswith("_tool")]
+    assert registry_handlers, "expected registry tools to be exposed"
+    offending = [t.name for t in registry_handlers if not t.is_async]
+    assert not offending, f"these handlers are sync and would freeze the event loop: {offending}"
+    # signature/schema must be unchanged by the async wrapper (input/workdir/params/seed)
+    ingest = next(t for t in registry_handlers if t.name == "ingest_tool")
+    assert {"input", "workdir", "params", "seed"} <= set(ingest.parameters["properties"])
+
+
 def test_mcp_stdio_tool_discovery_and_call(tmp_path):
     h5ad = tmp_path / "tiny.h5ad"
     _tiny_h5ad(h5ad)

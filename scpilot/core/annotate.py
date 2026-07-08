@@ -1339,8 +1339,8 @@ def finalize_annotation(session, *, facs_key: str = "facs_style_label", fine_key
     def _clean(key):
         if key not in adata.obs.columns:
             return blank
-        s = adata.obs[key].fillna("").astype(str)
-        return s.mask(s.str.strip().str.lower().isin(["", "nan", "unassigned"]), "")
+        s = adata.obs[key].astype(str)  # str first: categorical .fillna("") rejects a non-category fill value
+        return s.mask(s.str.strip().str.lower().isin(["", "nan", "none", "unassigned"]), "")
 
     facs, fine, major = _clean(facs_key), _clean(fine_key), _clean(major_key)
     # most-specific-available base: FACS subtype > fine > broad

@@ -400,10 +400,11 @@ def harness_audit(session, *, label_key: str = "major_cell_type", **params) -> S
     chk("tier4_reviewer_recorded", bool(t4.get("reviewer_model")),
         f"reviewer_model={t4.get('reviewer_model')}", sev="warn")
     # 3) FLAGS → ACTION: every refuted/suspect cluster is surfaced + review_required set on cells
-    ref, sus = t4.get("refuted_clusters", []), t4.get("suspect_clusters", [])
+    ref = list(t4.get("refuted_clusters", []))   # uns round-trips lists to numpy arrays; len() avoids ambiguous bool
+    sus = list(t4.get("suspect_clusters", []))
     rr_col = next((c for c in adata.obs.columns if str(c).endswith("review_required")), None)
     n_rr = int(adata.obs[rr_col].sum()) if rr_col else 0
-    chk("flags_lead_to_action", (not (ref or sus)) or (n_rr > 0),
+    chk("flags_lead_to_action", (len(ref) == 0 and len(sus) == 0) or (n_rr > 0),
         f"refuted={ref}, suspect={sus}, review_required_cells={n_rr}", sev="warn")
     # 4) QC-artifact clusters get an explicit artifact label (not a biological cell type)
     lbls = set(adata.obs[label_key].astype(str).unique()) if label_key in adata.obs.columns else set()
