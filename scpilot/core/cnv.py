@@ -302,7 +302,14 @@ def _save_cnv_plots(session, adata, cnv, *, celltype_key):
                       "downstream multi-evidence judgment: CNV burden + tumor markers + reference + patient "
                       "expansion). reference_key/reference_cat set the baseline (e.g. condition=Normal, or a known "
                       "non-malignant immune/stromal cell type); None => average-of-all baseline (advisory-only). "
-                      "REQUIRES annotate_genomic_positions first (var coordinates).")
+                      "reference_cat must be a LIST of category values (a bare string fails the gate). "
+                      "REQUIRES annotate_genomic_positions first (var coordinates). "
+                      "SLOW: infercnv runs over ALL cells — expect ~10-20 min on 100k+ cells (CPU-bound). "
+                      "STRONGLY prefer running this step out-of-band via the CLI on large data: "
+                      "`scpilot step cnv_score -w <run_dir> -p ...` (resumes from checkpoints, cannot be "
+                      "interrupted by an interactive cancel). If driven over MCP and the process sits at "
+                      "0% CPU with no progress, that is a genuine stall (not slow compute) — cancel and "
+                      "re-run via the CLI, and make sure only ONE driver/server is attached to the run dir.")
 def cnv_score(session, *, reference_key: str | None = None, reference_cat: list | None = None,
               layer: str | None = None, groupby: str | None = None, window_size: int = 100,
               step: int = 10, leiden_resolution: float = 1.0, seed: int = 0, **params) -> S.ToolResult:

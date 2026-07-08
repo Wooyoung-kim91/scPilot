@@ -243,8 +243,18 @@ CANONICAL FLOW (skip steps already satisfied per detect_state; stop when the goa
       var[chromosome,start,end] from a pinned GENCODE GTF; gate on protein_coding_coverage
       (>=0.8 ok). If the gate fails (build/symbol-version mismatch), fix the GTF before CNV.
    b. cnv_score(reference_key, reference_cat) — pick a KNOWN non-malignant reference
-      (e.g. condition=Normal, or a confident immune/stromal cell type). No reference =>
-      advisory-only. This emits EVIDENCE (per-cell/per-cluster CNV burden), NOT a call.
+      (e.g. condition=Normal, or a confident immune/stromal cell type). reference_cat is a
+      LIST of category values (e.g. ["T/NK cell","Myeloid"]) — a bare string fails the gate.
+      No reference => advisory-only. This emits EVIDENCE (per-cell/per-cluster CNV burden),
+      NOT a call. RUNTIME: cnv_score runs infercnv over ALL cells and is SLOW (CPU-bound) —
+      expect ~10-20 min on 100k+ cells. STRONGLY prefer driving this step OUT-OF-BAND via the
+      CLI on large data: `scpilot step cnv_score -w <run_dir> -p reference_key=... -p
+      'reference_cat=[...]'` (resumes from checkpoints; an interactive cancel can never
+      interrupt it), then continue the MCP-driven flow. If run over MCP: while CPU is active it
+      is computing — let it finish. But if it sits at 0% CPU with no progress it is a genuine
+      STALL (a real stdio-driven hang has been observed on large data), not slow compute —
+      cancel and re-run via the CLI. NEVER attach two drivers/servers to the same run dir
+      (`.lock` is a no-op advisory marker) — concurrent access can deadlock on file locks.
    c. malignancy_evidence(groupby, reference_key, reference_cat, sample_key) packages the
       per-group multi-axis evidence; YOU judge; apply_malignancy(labels,...) writes
       obs['malignancy'] over {malignant,non_malignant,uncertain,not_applicable}. The CALL is a
