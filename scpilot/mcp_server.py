@@ -194,8 +194,44 @@ def build_server():
     return mcp
 
 
+def _forkserver_warmup_noop() -> None:
+    """Picklable no-op used to force the forkserver daemon to spawn early (see
+    ``_init_fork_safety``). Must be module-level so forkserver workers can import it."""
+    return None
+
+
+def _init_fork_safety(lg=None) -> None:
+    """Make multiprocessing fork-safe in this long-lived, multi-threaded server.
+
+    Some tools create a ``ProcessPoolExecutor`` via the DEFAULT mp context — notably
+    ``cnv_score`` → infercnvpy ``process_map`` (``max_workers=cpu_count()``). The Linux
+    default start method is ``fork``; forking a process that already holds threads/locks
+    (the asyncio loop + the anyio tool worker thread + BLAS/numba pools spawned by earlier
+    tools) lets each child inherit a LOCKED mutex, so the pool workers deadlock on a futex
+    at 0% CPU — this was the historical cnv_score "stall" (N=cpu_count wedged children, the
+    server's threads all in futex_wait). ``forkserver`` forks workers from a clean,
+    single-threaded server process instead, so no held lock is inherited. We start the
+    forkserver daemon NOW, at entry, while this process is still clean (single main thread),
+    so even pools created much later (after many threads exist) fork from clean state."""
+    import multiprocessing as mp
+    if sys.platform == "win32":  # forkserver is POSIX-only; Windows already uses spawn
+        return
+    try:
+        mp.set_start_method("forkserver", force=True)
+        ctx = mp.get_context("forkserver")
+        p = ctx.Process(target=_forkserver_warmup_noop)   # spawns the forkserver daemon while clean
+        p.start()
+        p.join()
+        if lg:
+            lg.info("multiprocessing start method = forkserver (fork-safe process pools)")
+    except Exception as exc:  # noqa: BLE001 — never block server startup on this
+        if lg:
+            lg.warning("could not enable forkserver start method (%r); pools use default", exc)
+
+
 def main() -> None:
     """Entry point for ``scpilot mcp`` — run the stdio server."""
+    _init_fork_safety()   # BEFORE build_server()/any thread: forkserver so tool pools are fork-safe
     server = build_server()
     server.run(transport="stdio")
 

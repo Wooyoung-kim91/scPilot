@@ -312,7 +312,8 @@ def _save_cnv_plots(session, adata, cnv, *, celltype_key):
                       "re-run via the CLI, and make sure only ONE driver/server is attached to the run dir.")
 def cnv_score(session, *, reference_key: str | None = None, reference_cat: list | None = None,
               layer: str | None = None, groupby: str | None = None, window_size: int = 100,
-              step: int = 10, leiden_resolution: float = 1.0, seed: int = 0, **params) -> S.ToolResult:
+              step: int = 10, leiden_resolution: float = 1.0, n_jobs: int | None = None,
+              seed: int = 0, **params) -> S.ToolResult:
     if (err := require_capability("cnv_score")) is not None:
         return err
     import infercnvpy as cnv
@@ -347,9 +348,12 @@ def cnv_score(session, *, reference_key: str | None = None, reference_cat: list 
                         "known non-malignant reference (condition=Normal or an immune/stromal cell type); see "
                         "summary.suggested_reference_groups for a data-driven starting point (I-21).")
 
-    # 1) infercnv on log-normalized expression (genes lacking coordinates are auto-excluded)
+    # 1) infercnv on log-normalized expression (genes lacking coordinates are auto-excluded).
+    # n_jobs bounds infercnvpy's ProcessPoolExecutor (default max_workers=cpu_count()); pass a
+    # small value (or 1) to cap the fork count. Fork-safety in the MCP server is handled by the
+    # forkserver start method (mcp_server._init_fork_safety); this param is for control/perf.
     cnv.tl.infercnv(adata, reference_key=reference_key, reference_cat=reference_cat,
-                    layer=layer, window_size=window_size, step=step, inplace=True)
+                    layer=layer, window_size=window_size, step=step, n_jobs=n_jobs, inplace=True)
     # 2) cnv-space embedding -> neighbors -> leiden clusters
     cnv.tl.pca(adata)
     cnv.pp.neighbors(adata)

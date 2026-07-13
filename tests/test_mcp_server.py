@@ -119,3 +119,20 @@ def test_mcp_stdio_tool_discovery_and_call(tmp_path):
     # error path surfaces as a structured error, not an exception
     assert err["status"] == "error"
     assert err["error_code"] == "missing_input"
+
+
+def test_init_fork_safety_sets_forkserver():
+    """Regression guard for the cnv_score fork-deadlock fix: the MCP server must run
+    tool process-pools under a fork-safe start method. Forking the long-lived,
+    multi-threaded server (default 'fork') let pool workers inherit a locked mutex and
+    deadlock at 0% CPU (infercnvpy ProcessPoolExecutor). _init_fork_safety() flips the
+    default start method to 'forkserver' so workers fork from a clean server process."""
+    import multiprocessing as mp
+    import sys as _sys
+
+    from scpilot.mcp_server import _init_fork_safety
+
+    _init_fork_safety()
+    if _sys.platform == "win32":
+        return  # POSIX-only; Windows already spawns
+    assert mp.get_start_method(allow_none=False) == "forkserver"
