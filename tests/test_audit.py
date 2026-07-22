@@ -336,3 +336,78 @@ def test_run_agent_reviews_after_broad_annotation(tmp_path):
     # the reviewer hook ran the audit on the broad labels and recorded its verdicts in obs/uns
     assert "annotation_audit_status" in s.adata.obs
     assert s.adata.uns[UNS_ANNO]["tier4_audit"]["reviewer_model"] == "reviewer-model"
+
+
+# ---------------------------------------------------------------------------
+# Improvement ③ Part B: reviewer INDEPENDENCE is a first-class recorded flag, not a silent
+# self-review fallback. apply_annotation_audit records it; harness_audit surfaces the status.
+# ---------------------------------------------------------------------------
+def test_apply_annotation_audit_records_reviewer_independence(tmp_path):
+    s = _audit_session(tmp_path)
+    # distinct reviewer vs analysis model -> INDEPENDENT (satisfied)
+    r = tools.run("apply_annotation_audit", s, groupby="leiden", label_key="major_cell_type",
+                  verdicts={"0": {"status": "confirmed"}},
+                  reviewer_model="gpt-reviewer", analysis_model="claude-analysis")
+    assert r.summary["reviewer_independent"] is True
+    assert r.summary["review_mode"] == "independent"
+    ledger = s.adata.uns[UNS_ANNO]["tier4_reviews"]["major_cell_type"]
+    assert ledger["reviewer_independent"] is True and ledger["review_mode"] == "independent"
+
+
+def test_apply_annotation_audit_flags_degraded_self_review(tmp_path):
+    s = _audit_session(tmp_path)
+    # reviewer model == analysis model (the silent fallback) -> DEGRADED self-review, recorded explicitly
+    r = tools.run("apply_annotation_audit", s, groupby="leiden", label_key="major_cell_type",
+                  verdicts={"0": {"status": "confirmed"}},
+                  reviewer_model="claude-analysis", analysis_model="claude-analysis")
+    assert r.summary["reviewer_independent"] is False
+    assert r.summary["review_mode"] == "self-review-degraded"
+    t4 = s.adata.uns[UNS_ANNO]["tier4_audit"]
+    assert t4["reviewer_independent"] is False and t4["review_mode"] == "self-review-degraded"
+
+
+def test_run_annotation_critique_records_self_review_when_same_model(tmp_path):
+    # the self-review fallback: annotator and reviewer are the SAME model -> critique records degraded
+    from scpilot.llm.agent import run_annotation_critique
+    s = _audit_session(tmp_path)
+    reviewer = _Fake([
+        _emit("emit_annotation_audit", {"reviewer_model": "same-model", "verdicts": [
+            {"cluster_id": c, "status": "confirmed", "review_required": False} for c in ["0", "1", "2", "3"]]}),
+    ], model="same-model")
+    crit = run_annotation_critique(s, reviewer, groupby="leiden", label_key="major_cell_type",
+                                   seed=0, analysis_model="same-model")
+    assert crit["reviewer_independent"] is False and crit["review_mode"] == "self-review-degraded"
+    assert s.adata.uns[UNS_ANNO]["tier4_reviews"]["major_cell_type"]["reviewer_independent"] is False
+
+
+def test_harness_audit_surfaces_reviewer_independence(tmp_path):
+    s = _audit_session(tmp_path)
+    for tool in ["markers", "annotation_review", "apply_annotation", "annotation_audit",
+                 "apply_annotation_audit", "finalize_annotation"]:
+        s._append_jsonl(s.run_log_path, {"tool": tool, "status": "success", "seed": 0, "recipe_hash": tool})
+    s.adata.uns[UNS_ANNO]["tier4_audit"] = {"reviewer_model": "rev-model",
+                                            "refuted_clusters": [], "suspect_clusters": []}
+
+    # SATISFIED: distinct reviewer/analysis models on every reviewed column
+    s.adata.uns[UNS_ANNO]["tier4_reviews"] = {
+        "major_cell_type": {"reviewer_model": "gpt", "analysis_model": "claude",
+                            "reviewer_independent": True, "review_mode": "independent"},
+    }
+    r = tools.run("harness_audit", s)
+    st = {c["check"]: c["status"] for c in r.summary["checks"]}
+    assert st["tier4_reviewer_independence"] == "pass"
+    assert r.summary["reviewer_independence"] == "satisfied"
+
+    # DEGRADED: reviewer fell back to the analysis model -> machine-readable degraded_self_review (advisory warn)
+    s.adata.uns[UNS_ANNO]["tier4_reviews"] = {
+        "major_cell_type": {"reviewer_model": "claude", "analysis_model": "claude",
+                            "reviewer_independent": False, "review_mode": "self-review-degraded"},
+    }
+    r2 = tools.run("harness_audit", s)
+    st2 = {c["check"]: c["status"] for c in r2.summary["checks"]}
+    assert st2["tier4_reviewer_independence"] == "warn"      # advisory, does NOT hard-fail the run
+    assert r2.summary["reviewer_independence"] == "degraded_self_review"
+    assert r2.summary["degraded_self_review_columns"] == ["major_cell_type"]
+    # independence is advisory: it contributes a WARN, never a hard FAIL that flips the verdict
+    assert "tier4_reviewer_independence" not in [c["check"] for c in r2.summary["checks"]
+                                                 if c["status"] == "fail"]

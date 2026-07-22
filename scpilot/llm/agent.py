@@ -582,7 +582,8 @@ def run_agent(session, provider: Provider, *, goal: str | None = None,
                         try:
                             rv = _run_stage_review(target, (annotator_provider or provider),
                                                    reviewer_provider, call_name=call.name,
-                                                   args=call.arguments, max_rounds=review_max_rounds, seed=seed)
+                                                   args=call.arguments, max_rounds=review_max_rounds, seed=seed,
+                                                   analysis_model=getattr(provider, "model", None))
                         except Exception as exc:  # noqa: BLE001
                             rv = {"status": "skipped", "error": f"{type(exc).__name__}: {exc}"}
                         content = json.dumps({"tool_result": result.to_dict(),
@@ -636,7 +637,8 @@ def _cap_evidence(text: str, *, max_chars: int = 60000, what: str = "evidence") 
 
 
 def run_annotation_critique(session, reviewer_provider: Provider, *, groupby: str = "leiden",
-                            label_key: str = "major_cell_type", seed: int = 0) -> dict:
+                            label_key: str = "major_cell_type", seed: int = 0,
+                            analysis_model: str | None = None) -> dict:
     """One Tier-4 review pass (the verification/critique primitive).
 
     1) run `annotation_audit` (deterministic evidence) → 2) have ``reviewer_provider`` adversarially
@@ -666,13 +668,22 @@ def run_annotation_critique(session, reviewer_provider: Provider, *, groupby: st
                 for v in args.get("verdicts", []) if isinstance(v, dict) and "cluster_id" in v}
     rm = getattr(reviewer_provider, "model", None)
     gran = args.get("granularity") if isinstance(args.get("granularity"), dict) else None
+    # Improvement ③ (Part B): reviewer independence is recorded, never a silent fallback. When the
+    # reviewer model == the analysis model (e.g. the CLI role fell back to the analysis model), the
+    # verdict is a DEGRADED self-review; apply_annotation_audit records the machine-readable flag.
+    independent = (str(rm) != str(analysis_model)) if (rm is not None and analysis_model is not None) else None
+    review_mode = ("independent" if independent
+                   else "self-review-degraded" if independent is False else "unknown")
     applied = _execute_registry_tool(
         session, "apply_annotation_audit",
         {"groupby": groupby, "label_key": label_key, "verdicts": verdicts, "reviewer_model": rm,
+         "analysis_model": analysis_model, "reviewer_independent": independent, "review_mode": review_mode,
          "granularity": gran},
-        seed, stats, rationale=f"record Tier-4 reviewer verdicts for '{label_key}' (reviewer_model={rm})")
+        seed, stats, rationale=f"record Tier-4 reviewer verdicts for '{label_key}' "
+                               f"(reviewer_model={rm}, review_mode={review_mode})")
     sm = getattr(applied, "summary", None) or {}
     return {"status": applied.status, "summary": sm, "reviewer_model": rm,
+            "reviewer_independent": independent, "review_mode": review_mode,
             "refuted_clusters": sm.get("refuted_clusters", []),
             "refuted_reasons": sm.get("refuted_reasons", {}),
             "suspect_clusters": sm.get("suspect_clusters", []),
@@ -684,7 +695,7 @@ def run_annotation_critique(session, reviewer_provider: Provider, *, groupby: st
 def run_annotation_review_loop(session, annotator_provider: Provider, reviewer_provider: Provider, *,
                                groupby: str = "leiden", label_key: str = "major_cell_type",
                                max_rounds: int = 3, tissue: str | None = None, seed: int = 0,
-                               finalize_after: bool = True) -> dict:
+                               finalize_after: bool = True, analysis_model: str | None = None) -> dict:
     """BOUNDED annotation + verification loop (the converging review).
 
     Each round: audit → INDEPENDENT reviewer critique → if any label is REFUTED, the ANNOTATOR
@@ -700,7 +711,7 @@ def run_annotation_review_loop(session, annotator_provider: Provider, reviewer_p
     converged = False
     for r in range(1, max(1, max_rounds) + 1):
         crit = run_annotation_critique(session, reviewer_provider, groupby=groupby,
-                                       label_key=label_key, seed=seed)
+                                       label_key=label_key, seed=seed, analysis_model=analysis_model)
         if crit.get("status") == "skipped":
             return {"status": "skipped", "reason": crit.get("reason"), "rounds": rounds}
         refuted = list(crit.get("refuted_clusters", []))
@@ -757,13 +768,16 @@ def run_annotation_review_loop(session, annotator_provider: Provider, reviewer_p
                                    rationale="re-consolidate after re-annotation")
     return {"status": "completed", "converged": converged, "n_rounds": len(rounds),
             "rounds": rounds, "reviewer_model": crit.get("reviewer_model"),
+            "reviewer_independent": crit.get("reviewer_independent"),
+            "review_mode": crit.get("review_mode"),
             "final_refuted": rounds[-1]["refuted_clusters"] if rounds else [],
             # ACTION items the loop did NOT auto-fix → surfaced for Tier-2 subtype / human review
             "final_suspect": crit.get("suspect_clusters", [])}
 
 
 def _run_stage_review(session, annotator: Provider, reviewer: Provider, *, call_name: str,
-                      args: dict, max_rounds: int = 3, seed: int = 0) -> dict:
+                      args: dict, max_rounds: int = 3, seed: int = 0,
+                      analysis_model: str | None = None) -> dict:
     """Route the post-apply Tier-4 review to the right label column. EVERY label-writing tool is
     reviewed (reliability of ALL annotation, not just the final table). BROAD (apply_annotation)
     auto-corrects refuted clusters via the bounded loop (no premature finalize mid-pipeline); every
@@ -774,7 +788,7 @@ def _run_stage_review(session, annotator: Provider, reviewer: Provider, *, call_
         return run_annotation_review_loop(
             session, annotator, reviewer, groupby=args.get("groupby", cur_gb),
             label_key=args.get("key", "major_cell_type"), max_rounds=max_rounds, seed=seed,
-            finalize_after=False)
+            finalize_after=False, analysis_model=analysis_model)
     # verify + flag on the column THIS tool wrote (groupby + label_key per tool)
     gb, label_key = cur_gb, "final_annotation"
     if call_name == "apply_fine_annotation":
@@ -789,4 +803,5 @@ def _run_stage_review(session, annotator: Provider, reviewer: Provider, *, call_
                                          else "celltype_harmonized")
     elif call_name == "finalize_annotation":
         gb, label_key = cur_gb, args.get("out_key", "final_annotation")
-    return run_annotation_critique(session, reviewer, groupby=gb, label_key=label_key, seed=seed)
+    return run_annotation_critique(session, reviewer, groupby=gb, label_key=label_key, seed=seed,
+                                   analysis_model=analysis_model)

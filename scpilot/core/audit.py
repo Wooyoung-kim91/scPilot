@@ -399,6 +399,29 @@ def harness_audit(session, *, label_key: str = "major_cell_type", **params) -> S
     # 2) reviewer provenance recorded (cross-model is the goal; at least the model id must be logged)
     chk("tier4_reviewer_recorded", bool(t4.get("reviewer_model")),
         f"reviewer_model={t4.get('reviewer_model')}", sev="warn")
+    # 2b) reviewer INDEPENDENCE (Improvement ③, Part B): the reviewer must not be the SAME model it is
+    #     reviewing (self-review invalidates the independence Tier-4 relies on). Structured + machine-
+    #     readable: per column, satisfied (distinct reviewer/analysis models) vs degraded_self_review
+    #     (same model / silent fallback) vs unknown (ids not both recorded). ADVISORY (does not hard-fail
+    #     a run) but explicit so the audit bundle and a reviewer can see a degraded run.
+    def _indep(r):
+        ri = r.get("reviewer_independent")
+        if ri is True:
+            return "satisfied"
+        if ri is False:
+            return "degraded_self_review"
+        rm, am = r.get("reviewer_model"), r.get("analysis_model")
+        if rm and am:
+            return "satisfied" if str(rm) != str(am) else "degraded_self_review"
+        return "unknown"
+    independence_by_col = {c: _indep(r) for c, r in reviews.items()}
+    degraded_cols = [c for c, st in independence_by_col.items() if st == "degraded_self_review"]
+    independence = ("degraded_self_review" if degraded_cols
+                    else "satisfied" if (independence_by_col
+                                         and all(st == "satisfied" for st in independence_by_col.values()))
+                    else "unknown")
+    chk("tier4_reviewer_independence", not degraded_cols,
+        f"independence={independence}, by_column={independence_by_col}, degraded={degraded_cols}", sev="warn")
     # 3) FLAGS → ACTION: every refuted/suspect cluster is surfaced + review_required set on cells
     ref = list(t4.get("refuted_clusters", []))   # uns round-trips lists to numpy arrays; len() avoids ambiguous bool
     sus = list(t4.get("suspect_clusters", []))
@@ -439,6 +462,9 @@ def harness_audit(session, *, label_key: str = "major_cell_type", **params) -> S
         "n_warn": n_warn, "n_fail": n_fail,
         "violations": [c["check"] for c in checks if c["status"] != "pass"],
         "reviewer_model": t4.get("reviewer_model"),
+        "reviewer_independence": independence,                 # satisfied | degraded_self_review | unknown
+        "reviewer_independence_by_column": independence_by_col,
+        "degraded_self_review_columns": degraded_cols,
         "tier4_coverage": {k: v.get("reviewer_model") for k, v in reviews.items()},
         "tools_run": tools_run, "checks": checks,
         "verdict": "complete" if n_fail == 0 else "incomplete",
@@ -461,6 +487,9 @@ def apply_annotation_audit(session, *, groupby: str = "leiden", verdicts: dict |
                            status_key: str = "annotation_audit_status",
                            review_required_key: str = "annotation_review_required",
                            reviewer_model: str | None = None,
+                           reviewer_independent: bool | None = None,
+                           review_mode: str | None = None,
+                           analysis_model: str | None = None,
                            granularity: dict | None = None, **params) -> S.ToolResult:
     t0 = time.time()
     adata = session.adata
@@ -494,8 +523,19 @@ def apply_annotation_audit(session, *, groupby: str = "leiden", verdicts: dict |
     n_refuted, n_suspect = len(refuted_clusters), len(suspect_clusters)
     adata.uns.setdefault(UNS_ANNO, {})
     gran = dict(granularity) if isinstance(granularity, dict) else None   # advisory resolution feedback
+    # Improvement ③ (Part B): reviewer INDEPENDENCE is a first-class recorded flag, not a silent
+    # fallback. If the caller did not pass it explicitly, derive it by comparing the reviewer model
+    # id to the analysis model id (same model / fallback ⇒ degraded self-review). Advisory only.
+    if reviewer_independent is None and reviewer_model is not None and analysis_model is not None:
+        reviewer_independent = str(reviewer_model) != str(analysis_model)
+    if review_mode is None:
+        review_mode = ("independent" if reviewer_independent
+                       else "self-review-degraded" if reviewer_independent is False
+                       else "unknown")
     record = {
         "groupby": groupby, "label_key": label_key, "reviewer_model": reviewer_model,
+        "analysis_model": analysis_model,
+        "reviewer_independent": reviewer_independent, "review_mode": review_mode,
         "verdicts": vd, "n_refuted": n_refuted, "n_suspect": n_suspect,
         "refuted_clusters": refuted_clusters, "refuted_reasons": refuted_reasons,
         "suspect_clusters": suspect_clusters, "suspect_reasons": suspect_reasons,
@@ -508,6 +548,8 @@ def apply_annotation_audit(session, *, groupby: str = "leiden", verdicts: dict |
     reviews = adata.uns[UNS_ANNO].setdefault("tier4_reviews", {})
     reviews[str(label_key)] = {
         "groupby": groupby, "reviewer_model": reviewer_model,
+        "analysis_model": analysis_model,
+        "reviewer_independent": reviewer_independent, "review_mode": review_mode,
         "n_reviewed": len(vd), "n_refuted": n_refuted, "n_suspect": n_suspect,
         "refuted_clusters": refuted_clusters, "suspect_clusters": suspect_clusters,
         "granularity": gran,
@@ -515,16 +557,19 @@ def apply_annotation_audit(session, *, groupby: str = "leiden", verdicts: dict |
     try:
         session.log_decision(S.DecisionEvent(
             decision_type="annotation_audit", choice=status_map, candidates=[],
-            rationale=f"Tier-4 reviewer verdicts (reviewer_model={reviewer_model}); "
-                      f"{n_refuted} refuted (to re-annotate), {n_suspect} suspect",
+            rationale=f"Tier-4 reviewer verdicts (reviewer_model={reviewer_model}, "
+                      f"review_mode={review_mode}); {n_refuted} refuted (to re-annotate), {n_suspect} suspect",
             stage="apply_annotation_audit",
-            params={"groupby": groupby, "reviewer_model": reviewer_model}).to_dict())
+            params={"groupby": groupby, "reviewer_model": reviewer_model,
+                    "reviewer_independent": reviewer_independent, "review_mode": review_mode,
+                    "analysis_model": analysis_model}).to_dict())
     except Exception:  # noqa: BLE001
         pass
 
     summary = {
         "groupby": groupby, "status_key": status_key, "review_required_key": review_required_key,
-        "reviewer_model": reviewer_model,
+        "reviewer_model": reviewer_model, "analysis_model": analysis_model,
+        "reviewer_independent": reviewer_independent, "review_mode": review_mode,
         "n_clusters_reviewed": len(vd), "n_refuted": n_refuted, "n_suspect": n_suspect,
         "n_confirmed": sum(1 for s in status_map.values() if s == "confirmed"),
         "refuted_clusters": refuted_clusters,          # the annotator re-annotates these

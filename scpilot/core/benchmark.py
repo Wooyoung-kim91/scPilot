@@ -171,3 +171,172 @@ def benchmark(session, *, label_key: str = "major_cell_type", batch_key: str = "
                              "drop_labels": drop_labels, "min_label_cells": min_label_cells,
                              "subsample": subsample, "seed": seed},
                      suggested_next_tools=["cluster", "annotate_broad", "report"])
+
+
+@register("benchmark_reference", mutating=False,
+          description="Score a PREDICTED annotation column against a TRUSTED REFERENCE obs column on the SAME cells "
+                      "(read-only; scores existing labels, does NOT annotate). Metrics: ARI, AMI (partition "
+                      "agreement, label-name-invariant), per-cell accuracy, macro-F1, per-class precision/recall/F1, "
+                      "and a confusion matrix. LABEL-SPACE HONESTY: predicted labels are free-text, the reference is "
+                      "a fixed vocabulary — apply the caller-supplied label_map (predicted->reference; NEVER "
+                      "fabricated), then case-normalized EXACT match; the fraction of predicted cells with no "
+                      "reference counterpart is REPORTED, and BOTH a strict score (unmatched=wrong) AND a "
+                      "matched-only score (cells whose label maps to a known reference class) are returned, clearly "
+                      "labeled. The reference column is user-supplied ground truth — no biology is baked in. Writes a "
+                      "metrics JSON + confusion CSV. Run after annotation when a reference is available.")
+def benchmark_reference(session, *, pred_key: str, ref_key: str,
+                        label_map: dict | None = None, **params) -> S.ToolResult:
+    import json
+
+    import numpy as np
+    import pandas as pd
+    from sklearn.metrics import (adjusted_mutual_info_score, adjusted_rand_score,
+                                 confusion_matrix, precision_recall_fscore_support)
+
+    t0 = time.time()
+    adata = session.adata
+    warnings: list[str] = []
+
+    # --- guards: columns present, same length, non-empty ------------------------
+    if pred_key not in adata.obs.columns:
+        return S.error("benchmark_reference", "invalid_state",
+                       f"predicted column '{pred_key}' absent in obs — annotate first "
+                       f"(have {list(adata.obs.columns)[:12]}...)",
+                       recoverable=True, suggested_next_tools=["apply_annotation", "finalize_annotation"])
+    if ref_key not in adata.obs.columns:
+        return S.error("benchmark_reference", "invalid_state",
+                       f"reference column '{ref_key}' absent in obs — supply a trusted ground-truth column "
+                       f"(have {list(adata.obs.columns)[:12]}...)",
+                       recoverable=True)
+    pred_raw = adata.obs[pred_key]
+    ref_raw = adata.obs[ref_key]
+    if len(pred_raw) != len(ref_raw):   # same adata → same length; guard anyway
+        return S.error("benchmark_reference", "data_gate_failed",
+                       f"length mismatch pred={len(pred_raw)} vs ref={len(ref_raw)}", recoverable=False)
+
+    # --- drop cells missing EITHER label (NaN ground truth cannot be scored) -----
+    valid = pred_raw.notna().values & ref_raw.notna().values
+    n_total = int(len(valid))
+    n_dropped = int((~valid).sum())
+    if valid.sum() == 0:
+        return S.error("benchmark_reference", "data_gate_failed",
+                       f"no cells with BOTH a predicted ('{pred_key}') and reference ('{ref_key}') label "
+                       f"(all NaN in at least one column)", recoverable=True)
+    if n_dropped:
+        warnings.append(f"dropped {n_dropped}/{n_total} cell(s) missing a predicted or reference label "
+                        "(NaN ground truth cannot be scored)")
+
+    pred_s = pred_raw[valid].astype(str).to_numpy()
+    ref_s = ref_raw[valid].astype(str).to_numpy()
+
+    # --- label reconciliation: label_map (never fabricated) then case-normalized exact match ----
+    lmap = {str(k): str(v) for k, v in (label_map or {}).items()}
+    pred_mapped = np.array([lmap.get(p, p) for p in pred_s], dtype=object)
+
+    # reference vocabulary is FIXED (the ground truth); canonical label keyed by casefold
+    ref_canon: dict[str, str] = {}
+    for r in ref_s:
+        ref_canon.setdefault(r.casefold(), r)
+    reference_classes = sorted(set(ref_s))
+
+    matched = np.array([p.casefold() in ref_canon for p in pred_mapped], dtype=bool)
+    n_matched = int(matched.sum())
+    n_unmatched = int((~matched).sum())
+    unmatched_frac = round(n_unmatched / len(pred_mapped), 4)
+    unmatched_labels = sorted({str(p) for p, m in zip(pred_mapped, matched) if not m})
+    if unmatched_labels:
+        warnings.append(f"{n_unmatched}/{len(pred_mapped)} predicted cell(s) "
+                        f"({unmatched_frac:.1%}) have a label with NO reference counterpart: "
+                        f"{unmatched_labels[:10]} — counted WRONG in the strict score, EXCLUDED from matched-only")
+
+    # strict prediction array: matched → canonical reference label; unmatched → a distinct sentinel
+    # (guaranteed absent from the reference vocab, so it is honestly WRONG, never accidentally correct).
+    y_true = ref_s
+    y_pred_strict = np.array([ref_canon[p.casefold()] if m else f"UNMATCHED::{p}"
+                              for p, m in zip(pred_mapped, matched)], dtype=object)
+
+    def _scores(yt, yp) -> dict:
+        """accuracy + macro-F1 + per-class P/R/F1 over the REFERENCE classes present in yt."""
+        classes = sorted(set(yt))
+        acc = float((np.asarray(yt) == np.asarray(yp)).mean())
+        prec, rec, f1, sup = precision_recall_fscore_support(
+            yt, yp, labels=classes, average=None, zero_division=0)
+        macro_f1 = float(np.mean(f1)) if len(f1) else 0.0
+        per_class = {str(c): {"precision": round(float(prec[i]), 4), "recall": round(float(rec[i]), 4),
+                              "f1": round(float(f1[i]), 4), "support": int(sup[i])}
+                     for i, c in enumerate(classes)}
+        return {"accuracy": round(acc, 4), "macro_f1": round(macro_f1, 4),
+                "n_classes": len(classes), "per_class": per_class}
+
+    # ARI/AMI: partition agreement, invariant to label NAMES — computed on the reconciled labeling
+    # (strict, with unmatched cells forming their own group) vs the reference partition.
+    ari = round(float(adjusted_rand_score(y_true, y_pred_strict)), 4)
+    ami = round(float(adjusted_mutual_info_score(y_true, y_pred_strict)), 4)
+
+    strict = _scores(y_true, y_pred_strict)
+
+    # matched-only: restrict to cells whose predicted label maps to a KNOWN reference class
+    matched_only: dict | None
+    if n_matched == 0:
+        matched_only = None
+        warnings.append("matched-only score undefined: NO predicted cell mapped to a reference class")
+    else:
+        mt = _scores(y_true[matched], y_pred_strict[matched])
+        mt["n_cells"] = n_matched
+        matched_only = mt
+
+    if len(reference_classes) < 2:
+        warnings.append(f"single reference class {reference_classes} — ARI/macro-F1 are degenerate here")
+
+    # --- artifacts: confusion CSV (rows=reference, cols=predicted) + metrics JSON ---
+    art_dir = session.artifacts_dir
+    art_dir.mkdir(parents=True, exist_ok=True)
+    conf_labels = sorted(set(y_true) | set(y_pred_strict))
+    cm = confusion_matrix(y_true, y_pred_strict, labels=conf_labels)
+    cm_df = pd.DataFrame(cm, index=[f"ref::{c}" for c in conf_labels],
+                         columns=[f"pred::{c}" for c in conf_labels])
+    conf_path = session.artifact_path("benchmark_reference_confusion.csv")
+    cm_df.to_csv(conf_path)
+
+    metrics = {
+        "pred_key": pred_key, "ref_key": ref_key,
+        "label_map_applied": bool(lmap), "label_map": lmap,
+        "n_cells_total": n_total, "n_cells_scored": int(len(pred_mapped)), "n_dropped_missing": n_dropped,
+        "reference_classes": reference_classes, "n_reference_classes": len(reference_classes),
+        "predicted_labels_mapped": sorted({str(p) for p in pred_mapped}),
+        "unmatched_predicted_fraction": unmatched_frac, "n_unmatched_cells": n_unmatched,
+        "unmatched_predicted_labels": unmatched_labels,
+        "ari": ari, "ami": ami,
+        "strict": strict, "matched_only": matched_only,
+        "confusion_csv": str(conf_path),
+        "note": "strict = unmatched predicted labels counted WRONG; matched_only = computed only on cells "
+                "whose predicted label maps to a known reference class. ARI/AMI are label-name-invariant.",
+    }
+    json_path = session.artifact_path("benchmark_reference.json")
+    json_path.write_text(json.dumps(metrics, indent=2, default=str))
+
+    artifacts = [
+        S.artifact_csv(str(json_path), description="reference-label benchmark metrics (ARI/AMI/accuracy/F1)"),
+        S.artifact_csv(str(conf_path), n_rows=int(cm_df.shape[0]), n_cols=int(cm_df.shape[1]),
+                       description="confusion matrix (rows=reference, cols=predicted; UNMATCHED::* = no ref counterpart)"),
+    ]
+    summary = {
+        "pred_key": pred_key, "ref_key": ref_key,
+        "label_map_applied": bool(lmap),
+        "n_cells_scored": int(len(pred_mapped)), "n_dropped_missing": n_dropped,
+        "n_reference_classes": len(reference_classes),
+        "unmatched_predicted_fraction": unmatched_frac, "n_unmatched_cells": n_unmatched,
+        "unmatched_predicted_labels": unmatched_labels,
+        "ari": ari, "ami": ami,
+        "strict_accuracy": strict["accuracy"], "strict_macro_f1": strict["macro_f1"],
+        "matched_only_accuracy": (matched_only or {}).get("accuracy"),
+        "matched_only_macro_f1": (matched_only or {}).get("macro_f1"),
+        "strict": strict, "matched_only": matched_only,
+        "metrics_json": str(json_path),
+    }
+    tab = pd.DataFrame([{"reference_class": c, **strict["per_class"][c]} for c in strict["per_class"]])
+    tables = {"per_class_strict": S.table_preview(tab, full_csv=str(json_path))} if len(tab) else {}
+    return S.success("benchmark_reference", summary=summary, tables=tables, artifacts=artifacts,
+                     warnings=warnings, determinism_grade="A", duration_s=round(time.time() - t0, 3),
+                     params={"pred_key": pred_key, "ref_key": ref_key, "label_map": lmap},
+                     suggested_next_tools=["report"])
