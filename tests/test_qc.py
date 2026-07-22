@@ -129,6 +129,84 @@ def _ensembl_qc_fixture(n_per_sample=30):
     return a
 
 
+def _unscored_gap_fixture():
+    """One big sample (scored) + one small sample (unscored, <30 cells)."""
+    rng = np.random.default_rng(0)
+    genes = ["MT-CO1", "MT-ND1", "RPS6", "EPCAM"] + [f"G{i}" for i in range(16)]
+    n_big, n_small = 40, 10
+    n_obs = n_big + n_small
+    X = rng.poisson(1.0, (n_obs, len(genes))).astype("float32")
+    a = ad.AnnData(sparse.csr_matrix(X))
+    a.var_names = genes
+    a.obs_names = [f"c{i}" for i in range(n_obs)]
+    a.layers["counts"] = a.X.copy()
+    a.obs["sample_id"] = (["s_big"] * n_big + ["s_small"] * n_small)
+    return a, n_big, n_small
+
+
+def test_qc_metrics_doublet_rate_over_scored_cells_only(tmp_path, monkeypatch):
+    # A small sample is skipped by scrublet -> its cells are UNSCORED (predicted_doublet=False,
+    # doublet_score=NaN). doublet_rate must be computed over SCORED cells only (not biased low by
+    # averaging over unscored cells), and the unscored gap must be surfaced as a warning (not silent).
+    a, n_big, n_small = _unscored_gap_fixture()
+
+    import scpilot.core.qc as qc
+
+    def fake_scrublet(adata, sample_key, *, seed=0):
+        sv = adata.obs[sample_key].astype(str).values
+        scores = np.full(adata.n_obs, np.nan, dtype=float)
+        preds = np.zeros(adata.n_obs, dtype=bool)
+        big = np.where(sv == "s_big")[0]
+        scores[big] = 0.1
+        preds[big[:4]] = True                       # 4 doublets among the 40 scored cells
+        skipped = [{"sample": "s_small", "n_cells": int((sv == "s_small").sum()),
+                    "reason": "too_few_cells"}]
+        return scores, preds, skipped
+
+    monkeypatch.setattr(qc, "_per_sample_scrublet", fake_scrublet)
+
+    s = _session_with(a, tmp_path)
+    r = tools.run("qc_metrics", s, run_scrublet=True, seed=0)
+    assert r.status == "success"
+    sm = r.summary
+    # scored-only rate = 4/40 = 0.1, NOT 4/50 = 0.08 (which averaging over unscored would give)
+    assert abs(sm["doublet_rate_overall"] - 0.1) < 1e-9
+    assert sm["n_doublet_scored_cells"] == n_big
+    assert sm["n_doublet_unscored_cells"] == n_small
+    assert any("unscored" in w and "SCORED cells only" in w for w in r.warnings)
+
+
+def test_qc_filter_warns_on_unscored_when_dropping_doublets(tmp_path, monkeypatch):
+    # drop_predicted_doublets keeps UNSCORED cells (conservative) but must SURFACE how many kept
+    # cells from how many unscored samples were never doublet-screened (not a silent clean bill).
+    a, n_big, n_small = _unscored_gap_fixture()
+
+    import scpilot.core.qc as qc
+
+    def fake_scrublet(adata, sample_key, *, seed=0):
+        sv = adata.obs[sample_key].astype(str).values
+        scores = np.full(adata.n_obs, np.nan, dtype=float)
+        preds = np.zeros(adata.n_obs, dtype=bool)
+        big = np.where(sv == "s_big")[0]
+        scores[big] = 0.1
+        preds[big[:4]] = True
+        skipped = [{"sample": "s_small", "n_cells": int((sv == "s_small").sum()),
+                    "reason": "too_few_cells"}]
+        return scores, preds, skipped
+
+    monkeypatch.setattr(qc, "_per_sample_scrublet", fake_scrublet)
+
+    s = _session_with(a, tmp_path)
+    tools.run("qc_metrics", s, run_scrublet=True, seed=0)
+    n_before = s.adata.n_obs
+    r = tools.run("qc_filter", s, min_genes=0, max_pct_mt=100.0, drop_predicted_doublets=True)
+    assert r.status == "success"
+    # only the 4 SCORED doublets removed; the 10 unscored cells KEPT
+    assert r.summary["n_cells_before"] == n_before
+    assert r.summary["n_cells_after"] == n_before - 4
+    assert any("unscored" in w and "KEPT" in w for w in r.warnings)
+
+
 def test_qc_metrics_ensembl_var_names_flags_inert_mito(tmp_path):
     # I-11: Ensembl-ID var_names with no symbol column can't match MT- → pct_counts_mt is 0. qc_metrics
     # must SURFACE this (never silent) so the operator knows to run the symbol remap first.

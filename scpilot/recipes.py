@@ -22,6 +22,11 @@ def qc_filter_mask(adata, *, min_genes: int = 200, max_pct_mt: float = 20.0,
     Keeps cells with enough genes (``n_genes_by_counts >= min_genes``) and low mito
     (``pct_counts_mt <= max_pct_mt``); optional total-count floor, doublet-score ceiling
     (cells with no score are kept), and dropping predicted doublets.
+
+    ``drop_predicted_doublets`` removes only cells scrublet actually SCORED as doublets; UNSCORED
+    cells (NaN ``doublet_score`` — sample skipped / scrublet raised) have ``predicted_doublet``
+    False and are KEPT (conservative). The keeping is intentional but NOT screened, so the qc_filter
+    tool surfaces how many kept cells came from unscored samples (it is not a clean bill of health).
     """
     keep = (adata.obs["n_genes_by_counts"] >= min_genes) & (adata.obs["pct_counts_mt"] <= max_pct_mt)
     if min_counts > 0 and "total_counts" in adata.obs:
