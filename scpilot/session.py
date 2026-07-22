@@ -379,6 +379,12 @@ class Session:
         self.out = Path(out_dir).resolve()
         self.manifest = manifest
         self._adata = None  # in-memory cache (lazy)
+        # Bug G: the recipe_hash of the CURRENTLY-executing tool run, computed ONCE at the step
+        # start by ``begin_step`` (before the tool mutates the AnnData). In-tool ``log_decision``
+        # calls default their join key to it, and ``record_run`` reuses the SAME value, so a
+        # step's decision(s) + RunLogRecord + OutputRecord all carry an IDENTICAL recipe_hash
+        # (the audit ``used`` join). None outside a driven step (e.g. direct record_run/replay).
+        self._active_recipe_hash: str | None = None
 
     # ---------- directories ----------
     @property
@@ -815,6 +821,49 @@ class Session:
             out.append(d)
         return out
 
+    def begin_step(self, *, params: dict | None = None, seed: int | None = None,
+                   input_checkpoint: str | None = None, lib_versions: dict | None = None) -> str | None:
+        """Compute + cache this step's ``recipe_hash`` at the START of a tool run (Bug G).
+
+        Called by every orchestrated driver (CLI ``step``, MCP handler, mode-2 agent) right
+        BEFORE the tool executes, so the hash reflects the step's INPUT (pre-mutation) fingerprint
+        + params — the recipe that PRODUCES the step, not its post-mutation state. The value is
+        cached on ``self._active_recipe_hash`` so:
+
+        - in-tool ``session.log_decision(...)`` calls — the actual biological CALLs (cell-type /
+          malignancy / consensus / harmonize / finalize), which are logged from INSIDE the tool
+          BEFORE ``record_run`` runs — default their ``recipe_hash`` to it, and
+        - ``record_run`` REUSES the same value for the RunLogRecord + OutputRecord (it does not
+          recompute), then clears the cache.
+
+        This guarantees the join INVARIANT ``decision.recipe_hash == runlog.recipe_hash`` for the
+        same run by construction, so ``audit_export`` emits the ``used(decision → evidence)`` edge
+        that was previously dead for every in-tool decision. Reuses ``repro.recipe_hash`` /
+        ``dataset_fingerprint`` (no second hashing scheme). Returns the cached hash (or None).
+        """
+        from scpilot import repro
+        from scpilot.vendor.harness import _env_versions
+
+        libs = lib_versions if lib_versions is not None else _env_versions()
+        rh = None
+        try:
+            # Fingerprint the step INPUT: use the cached working adata, else lazily materialize it
+            # (latest checkpoint / session input) so the hash is data-sensitive on a fresh-process
+            # driver too. Pre-data stages (ingest/load) have no adata yet → fingerprint stays None.
+            adata = self._adata
+            if adata is None:
+                try:
+                    adata = self.adata
+                except Exception:  # noqa: BLE001 — ingest/load have no working adata yet
+                    adata = None
+            fp = repro.dataset_fingerprint(adata) if adata is not None else None
+            rh = repro.recipe_hash(params=params or {}, lib_versions=libs,
+                                   input_checkpoint_id=input_checkpoint, fingerprint=fp)
+        except Exception:  # noqa: BLE001 — a hashing hiccup must never break the step
+            rh = None
+        self._active_recipe_hash = rh
+        return rh
+
     def record_run(self, result, *, params: dict | None = None, seed: int | None = None,
                    input_checkpoint: str | None = None, lib_versions: dict | None = None,
                    stage: str | None = None, reasoning: str | None = None,
@@ -841,12 +890,19 @@ class Session:
         libs = lib_versions if lib_versions is not None else _env_versions()
         rh = None
         if compute_recipe_hash:
-            try:
-                fp = repro.dataset_fingerprint(self._adata) if self._adata is not None else None
-                rh = repro.recipe_hash(params=params or {}, lib_versions=libs,
-                                       input_checkpoint_id=input_checkpoint, fingerprint=fp)
-            except Exception:  # noqa: BLE001 — a hashing hiccup must never break logging
-                rh = None
+            if self._active_recipe_hash is not None:
+                # Bug G: reuse the value ``begin_step`` computed + cached BEFORE the tool ran, so
+                # this step's RunLogRecord/OutputRecord carry the SAME recipe_hash the in-tool
+                # DecisionEvent(s) already got (join invariant), and the hash reflects the step
+                # INPUT rather than the post-mutation state.
+                rh = self._active_recipe_hash
+            else:
+                try:
+                    fp = repro.dataset_fingerprint(self._adata) if self._adata is not None else None
+                    rh = repro.recipe_hash(params=params or {}, lib_versions=libs,
+                                           input_checkpoint_id=input_checkpoint, fingerprint=fp)
+                except Exception:  # noqa: BLE001 — a hashing hiccup must never break logging
+                    rh = None
         self.log_run(S.RunLogRecord(
             tool=result.tool, status=result.status, stage=stage or result.tool,
             params=params or {}, summary=result.summary, seed=seed,
@@ -888,6 +944,9 @@ class Session:
             self.save()
         except Exception:  # noqa: BLE001 — repro-artifact emission must never break the result
             pass
+        # end of step: clear the cached hash so the NEXT tool (if it doesn't call begin_step)
+        # cannot inherit this step's recipe_hash (Bug G).
+        self._active_recipe_hash = None
         return rh
 
     def record_tool_run(self, result, *, params: dict | None = None, seed: int | None = None,
@@ -971,6 +1030,15 @@ class Session:
         """
         if hasattr(record, "to_dict"):
             record = record.to_dict()
+        # Bug G: in-tool DecisionEvents (the actual biological CALLs — tier1/fine cell-type labels,
+        # malignancy, consensus/harmonize/finalize) are logged from INSIDE the tool, BEFORE the
+        # driver's record_run computes this step's recipe_hash, so they carried recipe_hash=None and
+        # audit_export produced ZERO used(decision → evidence) edges for them. Default the join key
+        # to the value begin_step cached for this run so decision.recipe_hash == the step's
+        # RunLogRecord/OutputRecord recipe_hash. An explicitly-set recipe_hash (agent driver-side
+        # decisions pass the returned rh) is respected untouched.
+        if not record.get("recipe_hash") and self._active_recipe_hash:
+            record = {**record, "recipe_hash": self._active_recipe_hash}
         if validate:
             from scpilot.schemas import validate_decision
             problems = validate_decision(record)

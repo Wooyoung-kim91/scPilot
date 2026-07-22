@@ -241,6 +241,9 @@ def build_server():
                 set_global_seed(seed)
                 wd = workdir or default_workdir_for_input(input)
                 session = Session.create(wd, input_path=input)
+                # Bug G: cache this step's recipe_hash BEFORE the tool runs so any in-tool
+                # DecisionEvent shares the SAME join key its run-log/outputs record will carry.
+                session.begin_step(params=params, seed=seed)
                 result = tools.run(name, session, **params)
                 # result-plot rule + run_log.jsonl + reasoning_log.md via the shared chokepoint
                 # (plan C1): IDENTICAL to the CLI `step` path, so mode-1 runs are fully

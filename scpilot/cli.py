@@ -121,6 +121,9 @@ def step(
         raise typer.Exit(code=2)
     session = Session.create(wd, input_path=inp)   # inp None on resume → opens existing session
 
+    # Bug G: compute + cache this step's recipe_hash BEFORE the tool runs so any in-tool
+    # DecisionEvent shares the SAME join key the run-log/outputs record will carry.
+    session.begin_step(params=params, seed=seed)
     result = spec.fn(session, **params)
     # result-plot rule + run-log + reasoning, all via the shared chokepoint (plan C1):
     # one helper guarantees `step`, the MCP handler and the agent log identical records

@@ -427,6 +427,11 @@ def _execute_registry_tool(session, name: str, args: dict, seed: int,
         prov = {k: v for k, v in prov.items() if v is not None}
         if prov:
             call_kwargs = {**args, **prov}
+    # Bug G: cache this step's recipe_hash BEFORE the tool runs (params=args, NOT call_kwargs — the
+    # provenance stamps stay out of the replayable recipe hash, consistent with ①) so the in-tool
+    # biological-CALL DecisionEvent (tier1/fine labels, malignancy, …) carries the SAME join key
+    # the RunLogRecord/OutputRecord will carry — the value record_tool_run returns below.
+    session.begin_step(params=args, seed=seed)
     try:
         result = spec.fn(session, **call_kwargs)
     except TypeError as exc:                       # unknown kwarg / bad signature → recoverable
