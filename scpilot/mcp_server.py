@@ -515,12 +515,16 @@ def _install_cleanup_handlers(cleanup) -> None:
 
 def main() -> None:
     """Entry point for ``scpilot mcp`` — run the stdio server."""
-    # Bound BLAS/OpenMP threads FIRST — before _init_fork_safety warms the forkserver daemon — so
-    # forkserver-spawned infercnvpy workers inherit the cap (the environment is captured at warmup/
-    # fork time). Setting it later would leave the already-warmed daemon, and thus every CNV worker,
-    # on cpu_count() threads and reintroduce the oversubscription runaway.
-    from scpilot.vendor.harness import bound_thread_env
+    # Bound BLAS/OpenMP threads AND pin the numba/matplotlib cache dirs FIRST — before
+    # _init_fork_safety warms the forkserver daemon — so forkserver-spawned infercnvpy CNV workers
+    # inherit BOTH (the environment is captured at warmup/fork time). Setting the thread cap later
+    # would leave the already-warmed daemon, and thus every CNV worker, on cpu_count() threads and
+    # reintroduce the oversubscription runaway; setting NUMBA_CACHE_DIR later (it otherwise lands in
+    # build_server()→init_runtime, AFTER warmup) would leave those same workers without a writable
+    # numba cache and hit the numba-cache permission failure the harness exists to prevent.
+    from scpilot.vendor.harness import bound_cache_env, bound_thread_env
     bound_thread_env()
+    bound_cache_env()
     _init_fork_safety()   # BEFORE build_server()/any thread: forkserver so tool pools are fork-safe
     server = build_server()
     _install_cleanup_handlers(server._scpilot_cleanup)   # reap jobs/pools on disconnect/exit

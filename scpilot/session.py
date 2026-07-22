@@ -366,7 +366,8 @@ class Manifest:
     pipeline_script: str | None = None                  # code/pipeline.py (full flow)
     n_runs: int = 0
     n_outputs: int = 0                                   # outputs.jsonl records written (should track n_runs)
-    log_inconsistencies: int = 0                         # times the outputs record failed to write after run_log
+    output_write_failures: int = 0                       # monotonic: times an outputs.jsonl record failed to append
+    log_inconsistencies: int = 0                         # TOTAL inconsistencies = output_write_failures + malformed run_log lines (recomputed idempotently)
     llm_topology: dict | None = None                     # per-role LLM invocation config (configure_run)
 
 
@@ -662,8 +663,13 @@ class Session:
                 continue
             if rec.get("status") == "success":
                 runs.append(rec)
-        if bad:
-            self.manifest.log_inconsistencies += bad
+        # Recompute log_inconsistencies IDEMPOTENTLY from the true count of malformed lines seen on
+        # THIS read plus the monotonic output-write-failure counter. Because record_run calls three
+        # writers (each reads the log) and every later record_run re-reads it, an incremental
+        # ``+= bad`` counted one corrupt line 3× per record_run and re-counted it on every subsequent
+        # record_run — wildly inflating the magnitude and pinning ``consistent`` off. An ASSIGNMENT
+        # (not accumulation) makes the count stable no matter how many times the log is read.
+        self.manifest.log_inconsistencies = self.manifest.output_write_failures + bad
         return runs
 
     def _write_pipeline(self) -> str:
@@ -926,6 +932,9 @@ class Session:
             self._append_jsonl(self.outputs_path, out_rec)
             self.manifest.n_outputs += 1
         except Exception as exc:  # noqa: BLE001 — surface (count + log), never silently swallow
+            # monotonic counter for a real, one-time write failure (folded into the total
+            # log_inconsistencies by _read_runs' idempotent recompute; not itself accumulated there).
+            self.manifest.output_write_failures += 1
             self.manifest.log_inconsistencies += 1
             import logging
             logging.getLogger("scpilot.session").error(

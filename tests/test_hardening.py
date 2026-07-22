@@ -92,6 +92,38 @@ def test_malformed_run_log_line_is_counted_not_silently_dropped(tmp_path):
     assert s.manifest.log_inconsistencies == before + 1        # bad one surfaced, not hidden
 
 
+def test_malformed_run_log_line_counted_once_not_accumulated(tmp_path):
+    """F7 magnitude bug: one corrupt line must count as exactly 1, no matter how many times the
+    run log is read. _read_runs used to do ``log_inconsistencies += bad`` — but record_run reads the
+    log 3× (pipeline/notebook/step-scripts) and every later record_run re-reads it, so ONE bad line
+    was counted 3× per record_run and re-accumulated forever. The recompute must be idempotent."""
+    s = _session(tmp_path)
+    s._append_jsonl(s.run_log_path,
+                    {"tool": "preprocess", "params": {}, "seed": 0, "status": "success"})
+    with open(s.run_log_path, "a") as fh:
+        fh.write('{"tool": "cluster", BROKEN json\n')   # single truncated/garbled record
+    for _ in range(5):                                  # many reads (as pipeline regen would trigger)
+        s._read_runs()
+    assert s.manifest.log_inconsistencies == 1          # counted ONCE, never inflated to 3/5/15…
+    lc = s.log_consistency()
+    assert lc["log_inconsistencies"] == 1 and lc["consistent"] is False
+
+
+def test_output_write_failure_and_malformed_line_are_summed_idempotently(tmp_path):
+    """The reported total = monotonic output-write failures + the true count of malformed run_log
+    lines, and re-reading the log does not inflate it."""
+    s = _session(tmp_path)
+    s._append_jsonl(s.run_log_path,
+                    {"tool": "preprocess", "params": {}, "seed": 0, "status": "success"})
+    with open(s.run_log_path, "a") as fh:
+        fh.write('{"tool": "cluster", BROKEN json\n')
+    s.manifest.output_write_failures = 2                # simulate two prior real outputs-write failures
+    s._read_runs()
+    assert s.manifest.log_inconsistencies == 2 + 1      # 2 write failures + 1 malformed line
+    s._read_runs()
+    assert s.manifest.log_inconsistencies == 3          # still 3 on a second read (idempotent)
+
+
 def test_jsonl_append_is_one_durable_line(tmp_path):
     s = _session(tmp_path)
     s._append_jsonl(s.run_log_path, {"a": 1})

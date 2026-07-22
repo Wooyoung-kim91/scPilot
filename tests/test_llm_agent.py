@@ -544,3 +544,49 @@ def test_direct_in_tool_label_call_leaves_provenance_none(tmp_path):
     assert call["model_id"] is None and call["prompt_hash"] is None
     assert call["prompt_version"] is None and call["temperature"] is None
     assert S.validate_decision(call) == []
+
+
+def test_non_mutating_tool_records_input_checkpoint(tmp_path):
+    """Provenance gap fix: a non-mutating tool (writes NO output checkpoint) must record the
+    session's CURRENT checkpoint as its ``input_checkpoint`` — the checkpoint it actually read from.
+    Previously in_cp was set only when result.checkpoint was truthy (mutating tools), so every
+    read-only step logged ``input_checkpoint=None`` and left a provenance gap."""
+    s = _session(tmp_path)
+    script = [
+        _resp(_tc(1, "preprocess", {"n_top_genes": 80, "n_pcs": 20})),            # mutating → checkpoint
+        _resp(_tc(2, "cluster_sweep", {"res_min": 0.1, "res_max": 0.3, "res_step": 0.1})),  # non-mutating
+        LLMResponse(text="done", tool_calls=[], stop_reason="end_turn", usage={}),
+    ]
+    run_agent(s, FakeProvider(script), seed=0, max_iters=20)
+
+    runs = [json.loads(l) for l in s.run_log_path.read_text().splitlines() if l.strip()]
+    sweep = next(r for r in runs if r["tool"] == "cluster_sweep" and r.get("status") == "success")
+    assert not sweep.get("output_checkpoint")                    # non-mutating: created no checkpoint
+    latest = s.manifest.checkpoints[-1]["id"]                    # the preprocess checkpoint it read
+    assert sweep["input_checkpoint"] == latest and latest is not None
+
+
+def test_force_structured_increments_real_decisions_logged(tmp_path):
+    """Cost/decision accounting fix: force_structured must thread the REAL RunStats so the
+    structured emit's decision event bumps the actual run's ``decisions_logged``. It used to pass a
+    throwaway RunStats(), so every Tier-4 structured emit (audit verdicts / re-annotation labels)
+    was dropped from the count."""
+    from scpilot.llm.agent import RunStats, force_structured
+
+    s = _session(tmp_path)
+    stats = RunStats()
+    call = _tc(1, "emit_annotation_labels",
+               {"clusters": [{"cluster_id": "0", "major_cell_type": "T cell"}]})
+    prov = FakeProvider([_resp(call)])
+    before = stats.decisions_logged
+    force_structured(s, prov, schema_tool="emit_annotation_labels",
+                     context="ctx", system="sys", seed=0, stats=stats)
+    assert stats.decisions_logged == before + 1                 # counted on the REAL stats
+    assert (s.artifacts_dir / "annotation_labels.json").exists()
+
+    # default (no stats threaded) stays backward-compatible: uses a throwaway, never crashes
+    prov2 = FakeProvider([_resp(_tc(2, "emit_annotation_labels",
+                          {"clusters": [{"cluster_id": "0", "major_cell_type": "B cell"}]}))])
+    force_structured(s, prov2, schema_tool="emit_annotation_labels",
+                     context="ctx", system="sys", seed=0)
+    assert stats.decisions_logged == before + 1                 # unaffected (separate throwaway)
