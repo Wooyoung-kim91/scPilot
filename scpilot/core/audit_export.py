@@ -50,6 +50,7 @@ export on an unchanged session yields byte-identical JSON.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -205,7 +206,12 @@ def build_bundle(session) -> dict:
                 continue
             meta = a.get("meta") or {}
             sha = meta.get("sha256")
-            art_id = f"entity:artifact/{sha}" if sha else f"entity:artifact/nohash/{Path(str(path)).name}"
+            # sha256 is the artifact identity when recorded; otherwise key on a short hash of the FULL
+            # path (+ basename for readability) so distinct un-hashed artifacts that happen to share a
+            # basename across steps do NOT collapse into one entity (which would misattribute the graph).
+            art_id = (f"entity:artifact/{sha}" if sha
+                      else f"entity:artifact/nohash/{hashlib.sha1(str(path).encode()).hexdigest()[:12]}/"
+                           f"{Path(str(path)).name}")
             entity.setdefault(art_id, {
                 "prov:type": "scpilot:Artifact",
                 "scpilot:path": path,

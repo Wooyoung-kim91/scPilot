@@ -173,3 +173,28 @@ def test_export_is_byte_deterministic(tmp_path):
     tools.run("export_audit", s)
     second = (s.out / "audit_bundle.json").read_bytes()
     assert first == second
+
+
+def test_no_hash_artifacts_same_basename_do_not_collide(tmp_path):
+    # Regression (Improvement ② review, Minor #1): two artifacts across DIFFERENT steps that both
+    # lack a recorded sha256 (files absent on disk) and share a basename must map to DISTINCT
+    # entities — keying on basename alone would collapse them and misattribute the graph.
+    inp = tmp_path / "input.h5ad"
+    _tiny_adata().write_h5ad(inp)
+    s = Session.create(tmp_path / "sess_nohash", input_path=str(inp))
+    s.load_input()
+    for i in range(2):
+        missing = s.artifacts_dir / f"missing_dir_{i}" / "de.csv"   # same basename, different path, absent
+        res = S.success("markers", summary={"step": i},
+                        artifacts=[S.artifact_csv(str(missing), n_rows=1, n_cols=1, description="absent")])
+        s.record_run(res, params={"step": i}, seed=0)
+    tools.run("export_audit", s)
+    doc = json.loads((s.out / "audit_bundle.json").read_text())
+
+    nohash = [e for e in doc["entity"] if e.startswith("entity:artifact/nohash/")]
+    assert len(nohash) == 2, f"expected 2 distinct no-hash artifact entities, got {nohash}"
+    for e in nohash:
+        assert doc["entity"][e]["scpilot:sha256_recorded"] is False   # honest: no fabricated hash
+    # each artifact is a member of its OWN step's evidence collection (no cross-step misattribution)
+    members = [m["prov:entity"] for m in doc["hadMember"].values()]
+    assert sorted(members) == sorted(nohash)
