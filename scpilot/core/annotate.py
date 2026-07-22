@@ -1258,7 +1258,14 @@ def apply_fine_annotation(session, *, groupby: str = "leiden", fine_labels: dict
             comp_cl = str(adata.obs[major_key].astype(str)[(obs_g == cl).values].value_counts().index[0])
 
         fine_final[cl] = final
-        facs_final[cl] = facs.get(cl) or final          # FACS is the PRIMARY display name; fall back to fine
+        # FACS is the PRIMARY display name (fall back to fine). BUT a DEMOTED cluster — one where
+        # `final` is a deterministic fallback substitution rather than the LLM's proposed label:
+        # tiny (merged → '<compartment>_unresolved') or not_labeled (→ unassigned) — must NOT keep
+        # its speculative FACS label; propagate the fallback so finalize_annotation (FACS > fine >
+        # major) can't resurrect the under-powered subtype in the human-facing label. A cluster that
+        # kept its proposed label (even if flagged review for weak evidence) keeps its FACS label.
+        demoted = merged or proposed is None
+        facs_final[cl] = final if demoted else (facs.get(cl) or final)
         state_final[cl] = state.get(cl, "")
         conf_final[cl] = cf.get(cl, float("nan"))
         review_final[cl] = review
