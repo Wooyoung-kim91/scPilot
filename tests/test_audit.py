@@ -100,6 +100,43 @@ def test_annotation_audit_needs_labels(tmp_path):
     assert r.status == "error" and r.error_code == "invalid_state"
 
 
+def test_annotation_audit_flags_malignant_low_cnv_burden(tmp_path):
+    # check 7 (low-burden case): the CNV track EXISTS but a malignant cluster's per-cluster burden is
+    # NOT elevated above the (majority-normal) data-derived baseline → advisory malignant_low_cnv_burden.
+    # This is the gap the old code missed: it only flagged the MISSING-column case.
+    s = _audit_session(tmp_path)
+    leiden = s.adata.obs["leiden"].astype(str).values
+    # cluster 3 is the malignant cluster; give it LOW CNV burden while the population is HIGH so the
+    # median baseline sits above it. No hardcoded biological cutoff — the reference comes from the data.
+    s.adata.obs["cnv_score"] = np.where(leiden == "3", 0.02, 0.5).astype(float)
+    r = tools.run("annotation_audit", s, groupby="leiden", label_key="major_cell_type")
+    assert r.status == "success", r.error
+    sm = r.summary
+    assert sm["n_malignant_low_cnv_burden"] >= 1
+    assert sm["n_malignant_without_cnv"] == 0          # CNV track present → NOT the missing-column flag
+    assert sm["cnv_burden_baseline"] is not None
+    import json
+    by = {c["cluster_id"]: c for c in json.load(open(sm["audit_input"]))["clusters"]}
+    assert "malignant_low_cnv_burden" in by["3"]["flags"]
+    assert "malignant_without_cnv" not in by["3"]["flags"]
+
+
+def test_annotation_audit_no_low_cnv_flag_when_burden_elevated(tmp_path):
+    # a malignant cluster WITH CNV burden elevated above the population baseline must NOT be flagged
+    # (the advisory low-burden signal is evidence of a CONTRADICTION, not fired on every malignant call).
+    s = _audit_session(tmp_path)
+    leiden = s.adata.obs["leiden"].astype(str).values
+    s.adata.obs["cnv_score"] = np.where(leiden == "3", 0.6, 0.05).astype(float)
+    r = tools.run("annotation_audit", s, groupby="leiden", label_key="major_cell_type")
+    assert r.status == "success", r.error
+    sm = r.summary
+    assert sm["n_malignant_low_cnv_burden"] == 0
+    assert sm["n_malignant_without_cnv"] == 0
+    import json
+    by = {c["cluster_id"]: c for c in json.load(open(sm["audit_input"]))["clusters"]}
+    assert "malignant_low_cnv_burden" not in by["3"]["flags"]
+
+
 def test_apply_annotation_audit_records_verdicts_and_reasons(tmp_path):
     s = _audit_session(tmp_path)
     tools.run("annotation_audit", s, groupby="leiden", label_key="major_cell_type")
@@ -233,6 +270,32 @@ def test_harness_audit_governance_scorecard(tmp_path):
     assert st2["marker_db_free"] == "fail"           # annotate_broad used → HARD fail (marker-DB-free rule)
     assert r2.summary["verdict"] == "incomplete"
     assert {"tier4_review_ran", "marker_db_free"} <= set(r2.summary["violations"])
+
+
+def test_harness_audit_flags_lead_to_action_reads_the_tier4_column(tmp_path):
+    # A full run leaves MULTIPLE '*review_required' columns. The Tier-1 column
+    # (major_cell_type_review_required) is inserted FIRST and is all-False here; the Tier-4 column
+    # (annotation_review_required, written by apply_annotation_audit) carries the actual flag for the
+    # suspect cluster. Picking only the FIRST column by insertion order would read the decoy and warn;
+    # OR-ing across ALL columns must see the Tier-4 flag → pass.
+    s = _audit_session(tmp_path)
+    for tool in ["markers", "annotation_review", "apply_annotation", "annotation_audit",
+                 "apply_annotation_audit", "finalize_annotation"]:
+        s._append_jsonl(s.run_log_path, {"tool": tool, "status": "success", "seed": 0, "recipe_hash": tool})
+    s.adata.uns[UNS_ANNO]["tier4_audit"] = {"reviewer_model": "rev-model",
+                                            "refuted_clusters": [], "suspect_clusters": ["3"]}
+    s.adata.uns[UNS_ANNO]["tier4_reviews"] = {
+        "major_cell_type": {"reviewer_model": "rev-model", "refuted_clusters": [], "suspect_clusters": ["3"]},
+        "malignancy": {"reviewer_model": "rev-model", "refuted_clusters": [], "suspect_clusters": []},
+    }
+    # decoy Tier-1 column FIRST (all-False), then the real Tier-4 column flagging cluster 3
+    s.adata.obs["major_cell_type_review_required"] = False
+    s.adata.obs["annotation_review_required"] = (s.adata.obs["leiden"].astype(str) == "3")
+    r = tools.run("harness_audit", s)
+    st = {c["check"]: c["status"] for c in r.summary["checks"]}
+    assert st["flags_lead_to_action"] == "pass"        # Tier-4 flag seen despite the all-False Tier-1 decoy
+    detail = next(c["detail"] for c in r.summary["checks"] if c["check"] == "flags_lead_to_action")
+    assert "annotation_review_required" in detail and "review_required_cells" in detail
 
 
 def test_harness_audit_flags_unreviewed_annotation_column(tmp_path):
