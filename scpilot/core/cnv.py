@@ -236,6 +236,20 @@ def annotate_genomic_positions(session, *, gtf: str | None = None, genome_build:
                      warnings=warnings, suggested_next_tools=nxt)
 
 
+def _resolve_n_jobs(n_jobs: int | None) -> int:
+    """Resolve a None/unset ``n_jobs`` to a CAPPED default ``min(cpu_count, 8)``.
+
+    ``infercnvpy.tl.infercnv`` forwards ``n_jobs=None`` to tqdm ``process_map``, whose
+    ``ProcessPoolExecutor`` then defaults ``max_workers=cpu_count()`` (120 on this box). Combined
+    with the historical absence of any BLAS thread cap, that produced N×cpu_count oversubscription.
+    We cap the worker count here; an explicit caller value is preserved (see the ``n_jobs`` param
+    help re: oversubscription risk).
+    """
+    if n_jobs is None:
+        return min(os.cpu_count() or 1, 8)
+    return int(n_jobs)
+
+
 def _cnv_save_fig(session, base: str):
     """Save the current matplotlib figure as a no-overwrite PNG artifact (CNV figures are
     genome-wide / panel layouts, so they bypass the journal-column fit harness)."""
@@ -303,6 +317,9 @@ def _save_cnv_plots(session, adata, cnv, *, celltype_key):
                       "expansion). reference_key/reference_cat set the baseline (e.g. condition=Normal, or a known "
                       "non-malignant immune/stromal cell type); None => average-of-all baseline (advisory-only). "
                       "reference_cat must be a LIST of category values (a bare string fails the gate). "
+                      "n_jobs bounds infercnv's ProcessPoolExecutor; unset => capped default min(cpu_count,8). "
+                      "A larger explicit n_jobs is honored but risks CPU oversubscription (each worker also "
+                      "spawns BLAS/OpenMP threads) — raise it only on a lightly loaded, high-core box. "
                       "REQUIRES annotate_genomic_positions first (var coordinates). "
                       "SLOW: infercnv runs over ALL cells — expect ~10-20 min on 100k+ cells (CPU-bound). "
                       "STRONGLY prefer running this step out-of-band via the CLI on large data: "
@@ -349,11 +366,27 @@ def cnv_score(session, *, reference_key: str | None = None, reference_cat: list 
                         "summary.suggested_reference_groups for a data-driven starting point (I-21).")
 
     # 1) infercnv on log-normalized expression (genes lacking coordinates are auto-excluded).
-    # n_jobs bounds infercnvpy's ProcessPoolExecutor (default max_workers=cpu_count()); pass a
-    # small value (or 1) to cap the fork count. Fork-safety in the MCP server is handled by the
-    # forkserver start method (mcp_server._init_fork_safety); this param is for control/perf.
-    cnv.tl.infercnv(adata, reference_key=reference_key, reference_cat=reference_cat,
-                    layer=layer, window_size=window_size, step=step, n_jobs=n_jobs, inplace=True)
+    # n_jobs bounds infercnvpy's ProcessPoolExecutor: an unset value would let it default to
+    # max_workers=cpu_count() (120 here), so we cap it to min(cpu_count, 8) (see _resolve_n_jobs).
+    # Fork-safety in the MCP server is handled by the forkserver start method
+    # (mcp_server._init_fork_safety); BLAS/OpenMP thread oversubscription is capped by
+    # harness.bound_thread_env (env vars inherited by forkserver workers). threadpoolctl is an
+    # extra in-process guard: it bounds the MAIN process's BLAS pools for the duration of the
+    # compute (it CANNOT reach the forkserver-spawned worker processes — those rely on the env cap).
+    resolved_n_jobs = _resolve_n_jobs(n_jobs)
+    from scpilot.vendor.harness import bounded_thread_count
+    try:
+        import threadpoolctl
+        _tp_guard = threadpoolctl.threadpool_limits(limits=bounded_thread_count())
+    except Exception:  # noqa: BLE001 — threadpoolctl is optional; env-var cap still applies
+        _tp_guard = None
+    try:
+        cnv.tl.infercnv(adata, reference_key=reference_key, reference_cat=reference_cat,
+                        layer=layer, window_size=window_size, step=step, n_jobs=resolved_n_jobs,
+                        inplace=True)
+    finally:
+        if _tp_guard is not None:
+            _tp_guard.unregister()
     # 2) cnv-space embedding -> neighbors -> leiden clusters
     cnv.tl.pca(adata)
     cnv.pp.neighbors(adata)

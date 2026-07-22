@@ -37,6 +37,40 @@ from scpilot.vendor.config import PipelineConfig, SCHEMA_VERSION
 # --------------------------------------------------------------------------- #
 _RUNTIME_READY = False
 
+# BLAS/OpenMP thread-count env vars we bound so a process pool cannot oversubscribe the box.
+_THREAD_ENV_VARS = (
+    "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS",
+)
+
+
+def bounded_thread_count() -> int:
+    """A conservative per-pool BLAS/OpenMP thread bound: ``min(cpu_count, 8)``.
+
+    Symmetric with ``cnv._resolve_n_jobs``' worker cap, so the worst case is bounded
+    (≤8 workers × ≤8 threads) instead of the historical cpu_count × cpu_count runaway.
+    """
+    return min(os.cpu_count() or 1, 8)
+
+
+def bound_thread_env(n: int | None = None) -> None:
+    """``setdefault`` the BLAS/OpenMP thread-count env vars to a bounded value.
+
+    Why: ``cnv_score`` → ``infercnvpy.tl.infercnv`` spawns a ``ProcessPoolExecutor``; with no
+    thread cap each of N workers spawns ``cpu_count()`` BLAS/OpenMP threads (120 on this box),
+    so N×cpu_count oversubscription pins the machine (the ~900-CPU-hour runaways). Bounding the
+    thread count keeps every worker (and the main process) from oversubscribing.
+
+    Ordering INVARIANT: this MUST run before numpy/BLAS is imported (BLAS reads these once, at
+    import) AND before the ``forkserver`` daemon is warmed, because forkserver-spawned workers
+    inherit the environment captured at warmup time — see ``scpilot/mcp_server.py:main()``. Only
+    a var the user has NOT already set is touched (``setdefault``), so an explicit environment
+    always wins (evidence-based / no clobbering).
+    """
+    val = str(n if n is not None else bounded_thread_count())
+    for var in _THREAD_ENV_VARS:
+        os.environ.setdefault(var, val)
+
 
 def init_runtime() -> None:
     """Idempotent process setup: numba/matplotlib caches + numba njit patch.
@@ -49,6 +83,9 @@ def init_runtime() -> None:
         return
     os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp/numba_cache")
     os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib_cache")
+    # Bound BLAS/OpenMP threads for CLI and any non-MCP entrypoint too. In the MCP server this has
+    # already run earlier (main(), before forkserver warmup); here it is an idempotent setdefault.
+    bound_thread_env()
     Path(os.environ["NUMBA_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
     Path(os.environ["MPLCONFIGDIR"]).mkdir(parents=True, exist_ok=True)
 
