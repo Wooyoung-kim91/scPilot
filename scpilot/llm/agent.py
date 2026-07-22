@@ -722,6 +722,18 @@ def run_annotation_critique(session, reviewer_provider: Provider, *, groupby: st
         seed, stats, rationale=f"record Tier-4 reviewer verdicts for '{label_key}' "
                                f"(reviewer_model={rm}, review_mode={review_mode})")
     sm = getattr(applied, "summary", None) or {}
+    # Bug E: a FAILED apply step (reviewer emitted an invalid/empty verdict → invalid_params/
+    # missing_input, or any structured error) means the verdicts were NOT recorded. It must NOT be
+    # read as "reviewed, nothing refuted": ``sm`` is empty, so returning ``refuted_clusters=[]`` with a
+    # success-looking status would silently declare the annotation clean and ship an unreviewed label.
+    # Return a NON-success status WITHOUT an empty refuted set posing as a real review.
+    if applied.status != "success":
+        return {"status": applied.status or "error",
+                "error": getattr(applied, "error", None),
+                "error_code": getattr(applied, "error_code", None),
+                "summary": sm, "reviewer_model": rm,
+                "reviewer_independent": independent, "review_mode": review_mode,
+                "evidence_truncated": trunc_warn, "granularity": gran}
     return {"status": applied.status, "summary": sm, "reviewer_model": rm,
             "reviewer_independent": independent, "review_mode": review_mode,
             "refuted_clusters": sm.get("refuted_clusters", []),
@@ -754,6 +766,19 @@ def run_annotation_review_loop(session, annotator_provider: Provider, reviewer_p
                                        label_key=label_key, seed=seed, analysis_model=analysis_model)
         if crit.get("status") == "skipped":
             return {"status": "skipped", "reason": crit.get("reason"), "rounds": rounds}
+        # Bug E: this review round FAILED (apply_annotation_audit errored — the reviewer verdicts were
+        # NOT recorded). A failed review is NOT convergence: do not set converged=True and do not read
+        # the (empty) refuted set as "nothing to fix". Stop and surface the failure so the label is
+        # flagged, never shipped as "reviewed". (Convergence requires a SUCCESSFUL review that genuinely
+        # found nothing refuted; the "skipped" case above — audit couldn't even run — is handled first.)
+        if crit.get("status") != "success":
+            return {"status": "review_failed",
+                    "reason": crit.get("error") or "annotation review application failed",
+                    "review_status": crit.get("status"), "error_code": crit.get("error_code"),
+                    "converged": False, "n_rounds": len(rounds), "rounds": rounds,
+                    "reviewer_model": crit.get("reviewer_model"),
+                    "reviewer_independent": crit.get("reviewer_independent"),
+                    "review_mode": crit.get("review_mode")}
         refuted = list(crit.get("refuted_clusters", []))
         reasons = crit.get("refuted_reasons", {})
         rounds.append({"round": r, "n_refuted": len(refuted), "refuted_clusters": refuted})

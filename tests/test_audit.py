@@ -315,6 +315,70 @@ def test_review_loop_reannotates_refuted_then_converges(tmp_path):
     assert list(c1) == ["TypeA"]
 
 
+# ---------------------------------------------------------------------------
+# Bug E: a FAILED apply_annotation_audit (verdicts NOT recorded) must NOT be read as
+# "reviewed, nothing refuted". run_annotation_critique returns a NON-success status, and
+# run_annotation_review_loop must NOT claim convergence — it surfaces the failure instead,
+# so an unreviewed label is never shipped as clean (defeats the §4 independent-review invariant).
+# ---------------------------------------------------------------------------
+def test_critique_returns_non_success_when_apply_fails(tmp_path):
+    from scpilot.llm.agent import run_annotation_critique
+
+    s = _audit_session(tmp_path)
+    # reviewer OMITS cluster_id on every verdict -> the built verdicts map is empty ->
+    # apply_annotation_audit errors (missing_input). The verdicts were NOT recorded.
+    reviewer = _Fake([
+        _emit("emit_annotation_audit", {"reviewer_model": "rev", "verdicts": [
+            {"status": "confirmed", "review_required": False}]}),
+    ], model="reviewer-model")
+
+    crit = run_annotation_critique(s, reviewer, groupby="leiden", label_key="major_cell_type",
+                                   seed=0, analysis_model="annotator-model")
+    # NOT a success, and NOT a success-looking payload with an empty refuted set
+    assert crit["status"] != "success"
+    assert crit["status"] != "skipped"           # the audit DID run; it's the apply that failed
+    assert "refuted_clusters" not in crit         # never a fake "reviewed, nothing refuted"
+    assert crit.get("error")                       # the failure reason is surfaced
+
+
+def test_review_loop_does_not_converge_when_apply_fails(tmp_path):
+    from scpilot.llm.agent import run_annotation_review_loop
+
+    s = _audit_session(tmp_path)
+    reviewer = _Fake([
+        _emit("emit_annotation_audit", {"reviewer_model": "rev", "verdicts": [
+            {"status": "confirmed", "review_required": False}]}),
+    ], model="reviewer-model")
+    annotator = _Fake([], model="annotator-model")   # never reached — the round fails first
+
+    res = run_annotation_review_loop(s, annotator, reviewer, groupby="leiden",
+                                     label_key="major_cell_type", max_rounds=3, seed=0)
+    # the loop must NOT declare the annotation clean on a failed review round
+    assert res.get("converged") is not True
+    assert res["status"] != "completed"           # a real failure, not a silent "completed"
+    assert res["status"] != "skipped"
+    assert res.get("reason")                       # the failure reason is surfaced
+
+
+def test_review_loop_converges_on_clean_successful_review(tmp_path):
+    # Happy path (UNCHANGED): a SUCCESSFUL review that genuinely finds 0 refuted -> converged=True.
+    from scpilot.llm.agent import run_annotation_review_loop
+
+    s = _audit_session(tmp_path)
+    reviewer = _Fake([
+        _emit("emit_annotation_audit", {"reviewer_model": "rev", "verdicts": [
+            {"cluster_id": c, "status": "confirmed", "review_required": False}
+            for c in ["0", "1", "2", "3"]]}),
+    ], model="reviewer-model")
+    annotator = _Fake([], model="annotator-model")   # not reached — nothing refuted
+
+    res = run_annotation_review_loop(s, annotator, reviewer, groupby="leiden",
+                                     label_key="major_cell_type", max_rounds=3, seed=0)
+    assert res["status"] == "completed"
+    assert res["converged"] is True and res["final_refuted"] == []
+    assert res["n_rounds"] == 1
+
+
 def test_run_agent_reviews_after_broad_annotation(tmp_path):
     # the cross-model hook: run_agent fires an INDEPENDENT review right after apply_annotation
     from scpilot.llm.agent import run_agent
