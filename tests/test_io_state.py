@@ -71,6 +71,31 @@ def test_mcp_default_session_uses_requested_checkpoint_input(tmp_path):
     assert r.summary["n_genes_ranked"] == 5
 
 
+def test_guess_x_state_ignores_leading_zero_rows():
+    # Bug: classifying X from only the LEADING 50 cells — if those are all-zero (e.g. after some
+    # merges/sorts), log-normalized data is misread as raw_counts, flipping detect_state's
+    # stage/reentry. Sampling spread across the whole matrix (+ ignoring all-zero rows) fixes it.
+    from scpilot.core.io import _guess_x_state
+
+    rng = np.random.default_rng(0)
+    n_obs, n_vars = 300, 40
+    counts = rng.poisson(2.0, (n_obs, n_vars)).astype("float32")
+
+    a = ad.AnnData(sparse.csr_matrix(counts))
+    sc.pp.normalize_total(a, target_sum=1e4)
+    sc.pp.log1p(a)                                   # X is now log-normalized (non-integer)
+    Xd = a.X.toarray()
+    Xd[:50, :] = 0.0                                 # leading 50 cells all-zero (near-empty)
+    a.X = sparse.csr_matrix(Xd)
+    assert _guess_x_state(a) == "normalized"         # was "raw_counts" with leading-50-only sampling
+
+    # sanity: genuine raw counts still classify as raw_counts, even with leading zeros
+    Cd = counts.copy()
+    Cd[:50, :] = 0.0
+    raw = ad.AnnData(sparse.csr_matrix(Cd))
+    assert _guess_x_state(raw) == "raw_counts"
+
+
 def test_registry_lists_b1_b2_tools():
     names = {t["name"] for t in tools.list_tools()}
     assert {"inspect", "load", "detect_state"} <= names

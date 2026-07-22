@@ -45,6 +45,20 @@ def markers(session, *, groupby: str = "leiden", n_genes: int = 25, layer: str |
         return S.error("markers", "invalid_state",
                        f"grouping '{groupby}' absent — run cluster first", recoverable=True,
                        suggested_next_tools=["cluster"])
+    # A single-group DE is degenerate: sc.tl.rank_genes_groups does NOT raise — it ranks the lone
+    # group vs an empty "rest" and returns meaningless group-vs-empty stats with a green
+    # determinism_grade, which would then flow into annotation as if it were real evidence.
+    # Gate it here so degenerate DE is never presented as valid marker evidence.
+    n_groups = int(adata.obs[groupby].astype(str).nunique())
+    if n_groups < 2:
+        return S.error("markers", "data_gate_failed",
+                       f"grouping '{groupby}' has only {n_groups} group(s) — rank_genes_groups needs "
+                       f"≥2 groups; a single-group DE ranks the lone group against an empty 'rest' "
+                       f"and yields meaningless stats. Re-cluster (e.g. higher resolution) or choose a "
+                       f"grouping with ≥2 categories before running markers.",
+                       recoverable=False,
+                       summary={"groupby": groupby, "n_clusters": n_groups},
+                       suggested_next_tools=["cluster_sweep", "cluster"])
     use_layer = layer if (layer and layer in adata.layers) else None
     warnings = [] if use_layer else [f"layer '{layer}' absent — ranking on X"]
 

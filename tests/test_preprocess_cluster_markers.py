@@ -138,6 +138,20 @@ def test_markers_full_ranking_when_cap_is_none(tmp_path):
     assert rm.artifacts[0].description == "full rank_genes_groups ranking"
 
 
+def test_markers_single_cluster_gate(tmp_path):
+    # A single-group DE is degenerate: sc.tl.rank_genes_groups does NOT raise — it ranks the lone
+    # group vs an empty "rest" and returns meaningless stats. markers must gate this so it never
+    # flows into annotation as valid evidence, instead of returning success + determinism_grade="A".
+    s = _session(tmp_path)
+    s.adata.obs["solo"] = "0"                       # exactly one category
+    rm = tools.run("markers", s, groupby="solo")
+    assert rm.status == "error"
+    assert rm.error_code == "data_gate_failed"
+    assert rm.recoverable is False
+    assert rm.summary["n_clusters"] == 1
+    assert "rank_genes_groups" not in s.adata.uns   # no degenerate DE written
+
+
 def test_cluster_defaults_resolution(tmp_path):
     # resolution defaults to 0.25 at every stage when the caller omits it
     from scpilot.core.cluster import DEFAULT_RESOLUTION

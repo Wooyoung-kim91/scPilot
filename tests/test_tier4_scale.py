@@ -34,6 +34,34 @@ def test_majority_vote_two_key_tie_is_ambiguous():
     assert np.allclose(agree, [1.0, 0.5])
 
 
+def test_majority_vote_ignores_nan_no_string_nan_winner():
+    # NaN/empty labels are "no opinion", NOT the literal category "nan". If they were coerced to
+    # "nan", that string could WIN the vote and be written as the consensus label.
+    a = _adata({"k1": ["T", np.nan, "T"],
+                "k2": ["T", np.nan, "B"],
+                "k3": [np.nan, np.nan, np.nan]})
+    out, agree, pairwise = majority_vote(a, ["k1", "k2", "k3"], min_agreement=0.5)
+    # "nan" must never appear as a chosen label
+    assert "nan" not in list(out)
+    # cell0: T,T over 2 valid → T (2/2 > 0.5). cell1: all missing → ambiguous.
+    # cell2: T,B over 2 valid → 1/2, not > 0.5 and tie → ambiguous.
+    assert list(out) == ["T", "ambiguous", "ambiguous"]
+    assert np.allclose(agree, [1.0, 0.0, 0.5])
+    # pairwise concordance is computed only over cells where BOTH columns have a real label:
+    # k1 vs k2 co-labelled at cell0 (T==T) and cell2 (T!=B) → 0.5; pairs with fully-missing k3 → 0.0
+    assert pairwise["k1__vs__k2"] == 0.5
+    assert pairwise["k1__vs__k3"] == 0.0 and pairwise["k2__vs__k3"] == 0.0
+
+
+def test_majority_vote_nan_never_wins_when_most_frequent():
+    # Even when the missing sentinel is the most frequent raw value, it must not become the winner.
+    a = _adata({"k1": [np.nan, "T"], "k2": [np.nan, "T"], "k3": ["B", np.nan]})
+    out, _, _ = majority_vote(a, ["k1", "k2", "k3"], min_agreement=0.5)
+    # cell0: only real label is B (1 valid) → B wins (1/1 > 0.5), NOT "nan"
+    # cell1: T,T over 2 valid → T
+    assert list(out) == ["B", "T"]
+
+
 def test_consensus_vote_writes_obs():
     a = _adata({"m1": ["A", "A", "B"], "m2": ["A", "B", "B"]})
     a, info = consensus_vote(a, keys=["m1", "m2"], out_key="cons")
