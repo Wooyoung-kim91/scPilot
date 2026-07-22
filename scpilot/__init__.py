@@ -10,4 +10,4 @@ Reproducibility/IO/figure primitives are vendored from scqc_pipeline under
 ``scpilot.vendor`` (see ``scpilot/vendor/VENDORING.md``).
 """
 
-__version__ = "0.0.1"
+__version__ = "0.1.0"
