@@ -285,6 +285,7 @@ def cluster_sweep(adata, *, use_rep: str = "X_pca", res_min: float = 0.1, res_ma
     finally:
         adata.obs.drop(columns=[lkey], errors="ignore", inplace=True)
         adata.uns.pop(nkey, None)
+        adata.uns.pop(lkey, None)      # sc.tl.leiden(key_added=lkey) also writes uns[lkey] (params dict)
         for k in (f"{nkey}_distances", f"{nkey}_connectivities"):
             if k in adata.obsp:
                 del adata.obsp[k]
