@@ -1306,7 +1306,7 @@ def apply_fine_annotation(session, *, groupby: str = "leiden", fine_labels: dict
                             params={"groupby": groupby, "fine_key": fine_key, "method": method})
     return S.success("apply_fine_annotation", summary=summary, warnings=warnings, checkpoint=cp.path,
                      determinism_grade="A", duration_s=round(time.time() - t0, 3),
-                     suggested_next_tools=["plots", "trajectory", "report"])
+                     suggested_next_tools=["plots", "report"])
 
 
 # --------------------------------------------------------------------------- #

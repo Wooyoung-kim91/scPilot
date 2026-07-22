@@ -22,3 +22,7 @@ sessions/
 
 # PoC/캐시 산출물
 .cache/
+
+# pybiomart 로컬 캐시 (런타임 생성물, git에 넣지 않음)
+.pybiomart.sqlite
+*.sqlite

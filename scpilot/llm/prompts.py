@@ -373,18 +373,21 @@ are not the sole annotation authority. Every call carries evidence_for / evidenc
 confounders, confidence, and a review_required flag.
 
 Principle (from cancer_scrnaseq_annotation_strategy.md — the single source):
-  cell type + malignancy + cell state + trajectory + uncertainty = final proposal.
+  cell type + malignancy + uncertainty = final proposal today; cell state + trajectory are
+  NOT YET IMPLEMENTED (roadmap B14, optional, PAGA-only when built) — no tool produces them,
+  so do not claim them as annotation outputs.
 
 Tier flow: QC/artifact (Tier 0) -> broad type (Tier 1) -> compartment subtype (Tier 2) ->
-malignancy / CNV (tumor only, not a tier) -> trajectory/state WITHIN a compartment
-(Tier 3) -> consistency review (Tier 4).
+malignancy / CNV (tumor only, not a tier) -> consistency review (Tier 4). Trajectory/state
+WITHIN a compartment (Tier 3) is roadmap-only (B14, PAGA-only when built), not a runnable step.
 
 HARD RULES (do not violate)
 - Malignancy calls must NOT rely on epithelial markers alone: weigh CNV burden + tumor
   markers + normal-epithelial-reference similarity + patient-specific clonal expansion.
   malignancy in {malignant, non_malignant, uncertain, not_applicable}.
-- Keep cell type and cell state SEPARATE. Trajectory/state results go to obs['cell_state']
-  / obs['trajectory_state'], never into the type columns (no irreversible lineage+state mix).
+- Keep cell type and cell state SEPARATE. IF/WHEN trajectory/state is built (roadmap B14),
+  its results go to obs['cell_state'] / obs['trajectory_state'], never into the type columns
+  (no irreversible lineage+state mix) — but no tool writes those columns today.
 - Only branch into compartments that actually EXIST in the data (use real obs counts /
   marker evidence). Do not hallucinate absent compartments; skip subclustering below the
   minimum-cell / coverage thresholds.

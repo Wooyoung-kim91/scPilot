@@ -152,6 +152,90 @@ def test_get_job_status_unknown_id(tmp_path, fake_tools):
         assert r["status"] == "error" and r["error_code"] == "missing_input"
 
 
+def test_tool_bodies_never_run_concurrently(tmp_path, monkeypatch):
+    """Mutual exclusion: even with two long tools launched overlapping, `_tool_lock` serializes
+    their BODIES — the process-global RNG/scanpy-settings invariant requires one-at-a-time."""
+    import threading
+
+    monkeypatch.setenv("SCPILOT_MCP_JOB_GRACE_SECONDS", "0.05")  # both exceed grace -> both go bg
+    from scpilot.mcp_server import build_server
+
+    state = {"cur": 0, "max": 0}
+    slock = threading.Lock()
+
+    def _overlap_body(session, **params):
+        with slock:                       # detect any window where two bodies are simultaneously in
+            state["cur"] += 1
+            state["max"] = max(state["max"], state["cur"])
+        time.sleep(0.4)                   # hold the body open long enough to expose an overlap
+        with slock:
+            state["cur"] -= 1
+        return S.success("overlap_probe", summary={"marker": "ok"})
+
+    for n in ("fake_ov_a", "fake_ov_b"):
+        tools.register(n, long_running=True, description="overlap probe")(_overlap_body)
+    try:
+        fns = _fns(build_server())
+        h5ad = _tiny_h5ad(tmp_path / "in.h5ad")
+        job_ids: list[str] = []
+        jlock = threading.Lock()
+
+        def _launch(tool: str) -> None:
+            res = anyio.run(fns[tool], h5ad, str(tmp_path / f"wd_{tool}"), None, 0)
+            with jlock:
+                job_ids.append(res["job_id"])
+
+        t1 = threading.Thread(target=_launch, args=("fake_ov_a_tool",))
+        t2 = threading.Thread(target=_launch, args=("fake_ov_b_tool",))
+        t1.start(); t2.start(); t1.join(); t2.join()
+        assert len(job_ids) == 2                                  # both handed back as bg jobs
+
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            if all(fns["get_job_status"](j)["state"] != "running" for j in job_ids):
+                break
+            time.sleep(0.1)
+        for j in job_ids:
+            assert fns["get_job_status"](j)["state"] == "succeeded"
+        assert state["max"] == 1     # never two bodies at once -> _tool_lock serialized them
+    finally:
+        for n in ("fake_ov_a", "fake_ov_b"):
+            tools.REGISTRY.pop(n, None)
+
+
+def test_long_tool_exception_becomes_failed_job(tmp_path, monkeypatch):
+    """A backgrounded long tool whose body raises ends in state 'failed', and get_job_result
+    returns a STRUCTURED error (not a raw unhandled exception, not a hang)."""
+    monkeypatch.setenv("SCPILOT_MCP_JOB_GRACE_SECONDS", "0.2")
+    from scpilot.mcp_server import build_server
+
+    @tools.register("fake_boom", long_running=True, description="mock long tool that raises")
+    def _fake_boom(session, **params):
+        time.sleep(0.5)                       # exceed the grace window before blowing up
+        raise RuntimeError("boom in tool body")
+
+    try:
+        fns = _fns(build_server())
+        h5ad = _tiny_h5ad(tmp_path / "in.h5ad")
+        res = anyio.run(fns["fake_boom_tool"], h5ad, str(tmp_path / "wd"), None, 0)
+        assert res["status"] == "running"
+        job_id = res["job_id"]
+
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            if fns["get_job_status"](job_id)["state"] != "running":
+                break
+            time.sleep(0.1)
+        assert fns["get_job_status"](job_id)["state"] == "failed"
+
+        rr = fns["get_job_result"](job_id)
+        assert rr["status"] == "error"                 # structured error envelope, no raw traceback
+        assert rr["error_code"] == "internal"
+        assert "boom in tool body" in rr["error"]
+    finally:
+        tools.REGISTRY.pop("fake_boom", None)
+
+
 def test_cancel_job_best_effort(tmp_path, fake_tools, monkeypatch):
     monkeypatch.setenv("SCPILOT_MCP_JOB_GRACE_SECONDS", "0.3")
     from scpilot.mcp_server import build_server

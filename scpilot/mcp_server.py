@@ -320,12 +320,16 @@ def build_server():
     def cancel_job(job_id: str) -> dict:
         """Best-effort cancel of a background job.
 
-        HONEST LIMITATION: this marks the job cancelled and discards its result, but it does NOT
-        guarantee instant CPU reclamation. Compute already handed to infercnvpy's INTERNAL
-        ProcessPoolExecutor (or any C/BLAS section) cannot be interrupted from here — that work may
-        run to completion; its CPU is fully reclaimed only when the pool/server shuts down (see the
-        atexit/SIGTERM cleanup). A job that has not yet acquired the tool lock is stopped before it
-        starts real work."""
+        HONEST LIMITATION: this marks the job cancelled and WITHHOLDS its returned result payload,
+        but it does NOT roll back persisted state and does NOT guarantee instant CPU reclamation.
+        If the tool had ALREADY finished its body by the time cancel is processed (a mutating tool
+        such as cnv_score/ingest), its checkpoint + run_log.jsonl entry were already committed via
+        record_tool_run before cancel took effect — those persist, and only the in-memory result
+        dict returned to the caller is withheld (so a naive re-run would DUPLICATE that checkpoint).
+        Compute already handed to infercnvpy's INTERNAL ProcessPoolExecutor (or any C/BLAS section)
+        cannot be interrupted from here — that work may run to completion; its CPU is fully reclaimed
+        only when the pool/server shuts down (see the atexit/SIGTERM cleanup). A job that has not yet
+        acquired the tool lock is stopped before it starts real work."""
         job = _registry.get(job_id)
         if job is None:
             return _unknown_job(job_id)
@@ -339,7 +343,10 @@ def build_server():
         return {"status": "cancelled", "job_id": job.job_id, "tool": job.tool,
                 "message": ("cancellation requested (best-effort). In-flight infercnvpy/BLAS "
                             "compute may run to completion; CPU is fully reclaimed on pool/server "
-                            "shutdown. The job result will be discarded.")}
+                            "shutdown. Only the returned result payload is withheld — if the tool "
+                            "body had already finished, its checkpoint + run_log entry are ALREADY "
+                            "committed and are NOT rolled back (a naive re-run would duplicate that "
+                            "checkpoint).")}
 
     def _cleanup_jobs_and_pools() -> None:
         """Best-effort shutdown reaper: mark running jobs cancelled + terminate any lingering
