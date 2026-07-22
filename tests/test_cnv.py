@@ -171,6 +171,16 @@ def test_cnv_score_advisory_when_no_reference(tmp_path):
     assert srg is None or isinstance(srg, list)
 
 
+def test_cnv_score_advisory_when_reference_cat_missing(tmp_path):
+    # reference_key set but reference_cat None/empty => still advisory (parity with
+    # malignancy_evidence's `not (reference_key and reference_cat)`).
+    s = _coord_session(tmp_path)
+    r = tools.run("cnv_score", s, reference_key="condition", window_size=10, step=2)
+    assert r.status == "success", r.error
+    assert r.summary["advisory_only"] is True
+    assert any("advisory-only" in w for w in r.warnings)
+
+
 # --------------------------------------------------------------------------- #
 # B12 malignancy call (evidence + apply)
 # --------------------------------------------------------------------------- #
@@ -212,6 +222,62 @@ def test_malignancy_evidence_requires_cnv_score(tmp_path):
     r = tools.run("malignancy_evidence", s, groupby="major_cell_type")
     assert r.status == "error" and r.error_code == "invalid_state"
     assert r.suggested_next_tools == ["cnv_score"]
+
+
+def _mock_evidence_session(tmp_path, *, ref_cnv=None):
+    """Minimal session with a PRECOMPUTED obs['cnv_score'] (no infercnvpy) for the
+    malignancy_evidence reference-gate / NaN-guard tests. Tumor cells = single clonal donor
+    (P1, high CNV); normal cells = shared donors (reference). ``ref_cnv`` overrides the
+    reference (Normal) cells' cnv_score (e.g. NaN to force a degenerate reference)."""
+    rng = np.random.default_rng(0)
+    n = 60
+    a = ad.AnnData(sparse.csr_matrix(rng.poisson(1.0, (n, 6)).astype("float32")))
+    a.var_names = [f"G{i}" for i in range(6)]
+    a.layers["counts"] = a.X.copy()
+    tumor = np.zeros(n, dtype=bool); tumor[30:] = True
+    a.obs["condition"] = np.where(tumor, "Tumor", "Normal")
+    a.obs["major_cell_type"] = np.where(tumor, "Epithelial", "T_cell")
+    a.obs["sample_id"] = np.where(tumor, "P1", np.array(["P2", "P3", "P4"])[np.arange(n) % 3])
+    cnv = np.where(tumor, 0.05, 0.01).astype(float)
+    if ref_cnv is not None:
+        cnv[~tumor] = ref_cnv
+    a.obs["cnv_score"] = cnv
+    p = tmp_path / "ev.h5ad"; a.write_h5ad(p)
+    s = Session.create(tmp_path / "evsess", input_path=str(p)); s.load_input()
+    return s
+
+
+def test_malignancy_evidence_rejects_bad_reference_cat(tmp_path):
+    """Bug A1: a case-wrong / mistyped reference_cat must fail the gate (mirroring cnv_score),
+    NOT return a degenerate 'success' scored against an empty (all-False) reference."""
+    s = _mock_evidence_session(tmp_path)
+    r = tools.run("malignancy_evidence", s, groupby="major_cell_type",
+                  reference_key="condition", reference_cat=["normal"])   # present value is "Normal"
+    assert r.status == "error" and r.error_code == "data_gate_failed"
+    assert "Normal" in r.error                       # lists the categories actually present
+    assert "malignancy" not in s.adata.obs.columns   # no call / no side effects
+
+
+def test_malignancy_evidence_degenerate_reference_none_not_nan(tmp_path):
+    """Bug A2: with a degenerate reference (ref cells' cnv_score = NaN -> ref_mean NaN),
+    ratio_to_reference is None (not NaN), the JSON parses under STRICT json (no 'NaN' token),
+    and the donor-confound guard fires for the single-donor tumor group."""
+    import json
+
+    s = _mock_evidence_session(tmp_path, ref_cnv=float("nan"))
+    r = tools.run("malignancy_evidence", s, groupby="major_cell_type",
+                  reference_key="condition", reference_cat=["Normal"], sample_key="sample_id")
+    assert r.status == "success", r.error
+    raw = open(r.summary["evidence_input"]).read()
+    assert "NaN" not in raw                              # invalid-JSON token must not leak
+    payload = json.loads(raw)                            # strict JSON (rejects NaN) must parse
+    by = {g["group"]: g for g in payload["groups"]}
+    for g in payload["groups"]:                          # degenerate reference -> ratio undefined
+        assert g["cnv_burden"]["ratio_to_reference"] is None
+    # donor-confound safeguard now fires (was silently bypassed by `nan <= 1.1` == False)
+    assert by["Epithelial"]["clonal_expansion"]["top_sample_fraction"] == 1.0
+    assert by["Epithelial"]["clonal_expansion"]["donor_confound_suspected"] is True
+    assert r.summary["reference_mean_cnv"] is None       # summary numeric guarded too
 
 
 def test_apply_malignancy_writes_call(tmp_path):
