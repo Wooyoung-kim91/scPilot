@@ -194,9 +194,14 @@ def annotate_genomic_positions(session, *, gtf: str | None = None, genome_build:
     n_mapped = int(mapped.sum())
 
     # Protein-coding coverage = the CNV-relevant gate (overall rate is noise-dominated).
+    # Measure protein_coding genes that ACTUALLY received coordinates (chromosome not-null), not
+    # mere symbol presence: a mapped var_name IS its own gene symbol (pass 1), except make_unique-
+    # recovered names, which carry their BASE symbol's coordinates (pass 2). This matches the
+    # docstring's definition ("genes the data gave coordinates to") — issue #4.
     pc_names = _protein_coding_names(gtf_path)
-    data_bases = set(var_names) | {b for b in base_of.values()}
-    pc_covered = len(pc_names & data_bases)
+    coordinated_symbols = {base_of.get(var_names[i], var_names[i])
+                           for i in range(n_total) if bool(mapped.iloc[i])}
+    pc_covered = len(pc_names & coordinated_symbols)
     pc_coverage = (pc_covered / len(pc_names)) if pc_names else 0.0
 
     # chromosome distribution + unmapped breakdown
@@ -204,7 +209,10 @@ def annotate_genomic_positions(session, *, gtf: str | None = None, genome_build:
     unmapped_names = [var_names[i] for i in range(n_total) if not bool(mapped.iloc[i])]
     from collections import Counter
     kinds = Counter(_classify_unmapped(n) for n in unmapped_names)
-    grade = "A" if source["type"] in ("gencode", "user") else "B"
+    # _resolve_gtf only ever yields a "user" or "gencode" source, both pinned / sha256 content-
+    # addressed, so the coordinate source is always grade "A". There is no biomart/network-heuristic
+    # fallback that would justify a lower grade, so the old grade-"B" branch was dead — removed (#4).
+    grade = "A"
 
     warnings = []
     if pc_coverage < pc_coverage_fail:

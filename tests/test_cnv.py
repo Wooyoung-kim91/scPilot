@@ -7,6 +7,8 @@ Uses a tiny synthetic GENCODE-style GTF (no network) to exercise:
 - non-destructive var (existing columns preserved, counts/X untouched).
 """
 
+import re
+
 import anndata as ad
 import numpy as np
 from scipy import sparse
@@ -93,6 +95,52 @@ def test_low_pc_coverage_warns(tmp_path):
     assert r.summary["gate_pass"] is False
     assert any("protein_coding_coverage" in w for w in r.warnings)
     assert r.suggested_next_tools == ["inspect"]
+
+
+def test_reproducibility_grade_always_A(tmp_path):
+    # issue #4: _resolve_gtf only ever yields a "user" or "gencode" source (both pinned / sha256
+    # content-addressed) -> the grade is always "A". The old grade-"B" branch was dead.
+    from scpilot.core import cnv as cnv_mod
+    gtf = _write_gtf(tmp_path / "grade.gtf")
+    # both source types resolvable by _resolve_gtf map to grade "A"; there is no other type.
+    _, src = cnv_mod._resolve_gtf(str(gtf), "GRCh38")
+    assert src["type"] == "user"
+    s = _session(tmp_path)
+    r = tools.run("annotate_genomic_positions", s, gtf=str(gtf))
+    assert r.status == "success", r.error
+    assert r.summary["reproducibility_grade"] == "A"
+    assert r.determinism_grade == "A"
+
+
+def test_pc_coverage_measures_coordinate_assignment(tmp_path):
+    # issue #4: protein_coding_coverage must count protein_coding genes that ACTUALLY received
+    # coordinates, NOT mere symbol presence. GTF pc universe = {AAA, BBB, CCC}; the data carries
+    # AAA (maps), BBB-1 (make_unique -> base BBB recovered), and junk that maps to nothing. CCC is
+    # absent from the data entirely, so it is NOT covered -> coverage = 2/3, not 1.0.
+    (tmp_path / "pc.gtf").write_text(
+        'chr1\tHAVANA\tgene\t1\t2\t.\t+\t.\tgene_id "E1"; gene_name "AAA"; gene_type "protein_coding";\n'
+        'chr2\tHAVANA\tgene\t3\t4\t.\t+\t.\tgene_id "E2"; gene_name "BBB"; gene_type "protein_coding";\n'
+        'chr3\tHAVANA\tgene\t5\t6\t.\t+\t.\tgene_id "E3"; gene_name "CCC"; gene_type "protein_coding";\n')
+    var_names = ["AAA", "BBB-1", "JUNK-9", "UNMAPPED"]
+    X = sparse.csr_matrix(np.random.default_rng(0).poisson(1.0, (6, len(var_names))).astype("float32"))
+    a = ad.AnnData(X); a.var_names = var_names; a.layers["counts"] = a.X.copy()
+    p = tmp_path / "pcin.h5ad"; a.write_h5ad(p)
+    s = Session.create(tmp_path / "pcsess", input_path=str(p)); s.load_input()
+
+    r = tools.run("annotate_genomic_positions", s, gtf=str(tmp_path / "pc.gtf"))
+    assert r.status == "success", r.error
+    su = r.summary
+    assert su["pc_total"] == 3
+    # AAA (pass1) + BBB (via BBB-1 pass2) received coordinates; CCC did not (absent from data).
+    assert su["pc_covered"] == 2
+    assert su["protein_coding_coverage"] == round(2 / 3, 4)
+    # cross-check the semantics directly: pc_covered == #(pc symbols among coordinated var).
+    var = s.adata.var
+    coordinated = set()
+    for nm in var.index[var["chromosome"].notna()]:
+        m = re.match(r"^(.+)-\d+$", str(nm))
+        coordinated.add(m.group(1) if (m and var.loc[nm, "gene_name"] == m.group(1)) else str(nm))
+    assert len({"AAA", "BBB", "CCC"} & coordinated) == su["pc_covered"]
 
 
 def test_missing_gtf_path(tmp_path):

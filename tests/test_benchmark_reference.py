@@ -105,6 +105,45 @@ def test_benchmark_reference_case_normalized_match(tmp_path):
     assert r.summary["ari"] == 1.0
 
 
+def test_benchmark_reference_metrics_json_artifact_kind(tmp_path):
+    # issue #1: the metrics JSON must be declared with kind="json" (NOT "csv"), and the table's
+    # full CSV must never point at the JSON — a consumer downloading "full CSV" must not get JSON.
+    s = _bench_session(tmp_path)
+    r = tools.run("benchmark_reference", s, pred_key="pred", ref_key="ref", label_map=_MAP)
+    assert r.status == "success", r.error
+    by_kind = {a.kind: a for a in r.artifacts}
+    # the metrics JSON is a JSON artifact, ending in .json
+    assert "json" in by_kind, [a.kind for a in r.artifacts]
+    assert by_kind["json"].path.endswith(".json")
+    # the ONLY csv artifact is the confusion matrix (a real CSV), never the metrics JSON
+    csvs = [a for a in r.artifacts if a.kind == "csv"]
+    assert len(csvs) == 1 and csvs[0].path.endswith(".csv")
+    assert not any(a.path.endswith(".json") for a in csvs)
+    # the per-class table's full CSV must not be the JSON (omitted here, so it is None)
+    tp = r.tables["per_class_strict"]
+    assert tp.full is None or tp.full.endswith(".csv")
+    assert not (tp.full or "").endswith(".json")
+
+
+def test_benchmark_reference_ref_case_variant_scorable(tmp_path):
+    # issue #2: when the REFERENCE column itself carries two case-spellings of the SAME class,
+    # a cell whose true label is the non-canonical spelling must still be scorable (not forced wrong).
+    # ref has "Tcell" and "tcell" for the same biological class; preds all say "tcell".
+    ref = ["Tcell", "tcell", "Tcell", "tcell", "Bcell", "Bcell"]
+    pred = ["tcell", "tcell", "tcell", "tcell", "Bcell", "Bcell"]
+    s = _bench_session(tmp_path, pred=pred, ref=ref)
+    r = tools.run("benchmark_reference", s, pred_key="pred", ref_key="ref")
+    assert r.status == "success", r.error
+    # case-variants of the reference are folded to one canonical class -> only {T, B} remain
+    assert r.summary["n_reference_classes"] == 2
+    # every cell is scored correct (case-only differences never count as a mismatch), including the
+    # cells whose TRUE label was the non-canonical "tcell" spelling — previously unscorable.
+    assert r.summary["n_unmatched_cells"] == 0
+    assert r.summary["strict_accuracy"] == 1.0
+    assert r.summary["ari"] == 1.0
+    assert any("case-variant" in w for w in r.warnings)
+
+
 def test_benchmark_reference_missing_column_structured_error(tmp_path):
     s = _bench_session(tmp_path)
     r_pred = tools.run("benchmark_reference", s, pred_key="does_not_exist", ref_key="ref")
