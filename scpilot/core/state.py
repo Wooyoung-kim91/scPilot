@@ -20,7 +20,7 @@ _ANNOTATION_COLS = ("major_cell_type", "fine_cell_type", "facs_style_label", "ma
 _STAGE_ORDER = ["raw", "normalized", "hvg", "pca", "neighbors", "clustered", "umap", "annotated"]
 _NEXT_TOOL = {
     "raw": "preprocess", "normalized": "preprocess", "hvg": "cluster", "pca": "cluster",
-    "neighbors": "cluster", "clustered": "markers", "umap": "annotate", "annotated": "report",
+    "neighbors": "cluster", "clustered": "markers", "umap": "annotate_broad", "annotated": "report",
 }
 
 

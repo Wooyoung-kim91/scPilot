@@ -14,6 +14,28 @@ LLM이 *프로그램 추론·충돌/아티팩트 판정·confidence 조정*을 �
 
 from __future__ import annotations
 
+import hashlib
+
+# ---------------------------------------------------------------------------
+# Prompt provenance (Improvement ①: decision provenance).
+# ---------------------------------------------------------------------------
+# Coarse manual version tag recorded on every LLM decision event. BUMP this whenever the
+# orchestration / annotation / audit prompt text in this module changes in a way that could
+# alter the model's decisions — so a run reproduced under a drifted prompt template is
+# detectable at the decision-event level. ``prompt_hash`` (below) captures the EXACT rendered
+# prompt text sent to the model for a given decision; this tag is the human-readable coordinate.
+PROMPT_VERSION = "1.0"
+
+
+def prompt_hash(text: str) -> str:
+    """Stable, deterministic hash of a rendered prompt string (Improvement ①).
+
+    Truncated sha256 hexdigest: the SAME prompt text always yields the SAME hash, so a decision
+    event can be tied to the exact prompt that produced it and a drifted prompt is detectable on
+    replay/audit. Not a security primitive — an identity/join key only."""
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
+
+
 # ---------------------------------------------------------------------------
 # Tier-1 DE-based annotation review (consumes annotation_review tool JSON).
 # Core design principle (proposal 2026-06-11): the reviewer must infer biological
@@ -373,18 +395,21 @@ are not the sole annotation authority. Every call carries evidence_for / evidenc
 confounders, confidence, and a review_required flag.
 
 Principle (from cancer_scrnaseq_annotation_strategy.md — the single source):
-  cell type + malignancy + cell state + trajectory + uncertainty = final proposal.
+  cell type + malignancy + uncertainty = final proposal today; cell state + trajectory are
+  NOT YET IMPLEMENTED (roadmap B14, optional, PAGA-only when built) — no tool produces them,
+  so do not claim them as annotation outputs.
 
 Tier flow: QC/artifact (Tier 0) -> broad type (Tier 1) -> compartment subtype (Tier 2) ->
-malignancy / CNV (tumor only, not a tier) -> trajectory/state WITHIN a compartment
-(Tier 3) -> consistency review (Tier 4).
+malignancy / CNV (tumor only, not a tier) -> consistency review (Tier 4). Trajectory/state
+WITHIN a compartment (Tier 3) is roadmap-only (B14, PAGA-only when built), not a runnable step.
 
 HARD RULES (do not violate)
 - Malignancy calls must NOT rely on epithelial markers alone: weigh CNV burden + tumor
   markers + normal-epithelial-reference similarity + patient-specific clonal expansion.
   malignancy in {malignant, non_malignant, uncertain, not_applicable}.
-- Keep cell type and cell state SEPARATE. Trajectory/state results go to obs['cell_state']
-  / obs['trajectory_state'], never into the type columns (no irreversible lineage+state mix).
+- Keep cell type and cell state SEPARATE. IF/WHEN trajectory/state is built (roadmap B14),
+  its results go to obs['cell_state'] / obs['trajectory_state'], never into the type columns
+  (no irreversible lineage+state mix) — but no tool writes those columns today.
 - Only branch into compartments that actually EXIST in the data (use real obs counts /
   marker evidence). Do not hallucinate absent compartments; skip subclustering below the
   minimum-cell / coverage thresholds.

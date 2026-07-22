@@ -394,3 +394,153 @@ def test_anthropic_prompt_caching_shaping():
     P._mark_last_cache(m2)
     assert m2[-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
     P._mark_last_cache([])   # empty -> no-op, no crash
+
+
+# --------------------------------------------------------------------------- #
+# Improvement ①: LLM decision provenance (schemas + prompt hash + write site)
+# --------------------------------------------------------------------------- #
+def test_decision_event_roundtrips_with_provenance_fields():
+    # a v2 DecisionEvent carrying the new provenance fields serializes + validates cleanly.
+    from scpilot import schemas as S
+
+    ev = S.DecisionEvent(
+        decision_type="hvg_npcs", choice={"n_pcs": 20}, candidates=[],
+        rationale="elbow at 20", model_id="claude-opus-4-8", prompt_version="1.0",
+        prompt_hash="deadbeefcafef00d", temperature=0.0, recipe_hash="0123456789abcdef",
+        alternatives_rejected=[{"n_pcs": 30, "why": "past elbow"}])
+    d = ev.to_dict()
+    assert d["schema_version"] == S.DECISION_SCHEMA_VERSION == 2
+    assert d["model_id"] == "claude-opus-4-8" and d["recipe_hash"] == "0123456789abcdef"
+    assert d["prompt_version"] == "1.0" and d["prompt_hash"] == "deadbeefcafef00d"
+    assert d["temperature"] == 0.0
+    assert d["alternatives_rejected"][0]["n_pcs"] == 30
+    assert S.validate_decision(d) == []
+
+
+def test_old_shape_decision_still_validates_and_loads():
+    # a v1 event (only the frozen required keys, no provenance / schema_version) must still be
+    # accepted so pre-existing decisions.jsonl files keep validating + replaying.
+    from scpilot import schemas as S
+
+    old = {"decision_type": "clustering_resolution", "choice": {"resolution": 0.25},
+           "candidates": [], "rationale": "knee at 0.25"}
+    assert S.validate_decision(old) == []
+    # constructs from the v1 keys with provenance defaulting to None (backward compatible)
+    ev = S.DecisionEvent(**old)
+    assert ev.model_id is None and ev.recipe_hash is None and ev.temperature is None
+    assert ev.schema_version == S.DECISION_SCHEMA_VERSION
+    # a malformed provenance value (wrong type) is the ONLY thing rejected
+    assert "recipe_hash must be a string or null" in S.validate_decision({**old, "recipe_hash": 123})
+
+
+def test_prompt_hash_is_stable_and_deterministic():
+    from scpilot.llm import prompts
+
+    assert prompts.prompt_hash("same text") == prompts.prompt_hash("same text")
+    assert prompts.prompt_hash("a") != prompts.prompt_hash("b")
+    assert isinstance(prompts.PROMPT_VERSION, str) and prompts.PROMPT_VERSION
+    # the orchestration system prompt hashes to a stable 16-char hex key
+    h = prompts.prompt_hash(prompts.ORCHESTRATION_PROMPT)
+    assert len(h) == 16 and all(c in "0123456789abcdef" for c in h)
+
+
+def test_write_site_populates_provenance_and_recipe_hash_join_key(tmp_path):
+    # the mode-2 write site stamps the resolved model id + prompt version/hash + temperature on the
+    # decision event, and its recipe_hash EQUALS the join key of the same step's run-log record.
+    from scpilot.llm import prompts
+
+    s = _session(tmp_path)
+    script = [
+        _resp(_tc(1, "preprocess", {"n_top_genes": 80, "n_pcs": 20})),
+        LLMResponse(text="done", tool_calls=[], stop_reason="end_turn", usage={}),
+    ]
+    # temperature flows from the provider config (provider.py resolution) onto the event
+    prov = FakeProvider(script)
+    prov.config = ProviderConfig(backend="fake", model="fake-model", temperature=0.0)
+    run_agent(s, prov, seed=0, max_iters=20, review=False)
+
+    decs = [json.loads(l) for l in s.decisions_path.read_text().splitlines() if l.strip()]
+    hvg = next(d for d in decs if d["decision_type"] == "hvg_npcs")
+    assert hvg["model_id"] == "fake-model"
+    assert hvg["prompt_version"] == prompts.PROMPT_VERSION
+    assert hvg["prompt_hash"] and len(hvg["prompt_hash"]) == 16
+    assert hvg["temperature"] == 0.0
+    assert hvg["schema_version"] == 2
+
+    # recipe_hash is the SAME value the preprocess run-log record carries (the evidence join key)
+    runs = [json.loads(l) for l in s.run_log_path.read_text().splitlines() if l.strip()]
+    pre_run = next(r for r in runs if r["tool"] == "preprocess" and r["status"] == "success")
+    assert hvg["recipe_hash"] and hvg["recipe_hash"] == pre_run["recipe_hash"]
+
+
+def test_in_tool_llm_label_call_is_provenance_stamped(tmp_path):
+    # Follow-up #6: the highest-value LLM decision — the tier1 cell-type CALL logged from INSIDE
+    # apply_annotation — carries WHO decided + on WHAT prompt basis when routed through the agent,
+    # while a DETERMINISTIC in-tool decision (finalize_annotation) keeps provenance None (honest).
+    from scpilot.llm import prompts
+
+    s = _session(tmp_path)
+    script = [
+        _resp(_tc(1, "preprocess", {"n_top_genes": 80, "n_pcs": 20})),
+        _resp(_tc(2, "cluster", {"resolution": 0.5})),
+        _resp(_tc(3, "apply_annotation",
+                  {"groupby": "leiden", "labels": {"0": "T cell", "1": "Epithelial cell"}})),
+        _resp(_tc(4, "finalize_annotation", {})),
+        LLMResponse(text="done", tool_calls=[], stop_reason="end_turn", usage={}),
+    ]
+    prov = FakeProvider(script)
+    prov.config = ProviderConfig(backend="fake", model="fake-model", temperature=0.0)
+    # review=False → no Tier-4 reviewer provider needed; keeps this test provider-only.
+    run_agent(s, prov, seed=0, max_iters=20, review=False)
+
+    decs = [json.loads(l) for l in s.decisions_path.read_text().splitlines() if l.strip()]
+
+    # LLM-DRIVEN in-tool CALL → provenance stamped (same field values as the ① orchestrator path)
+    call = next(d for d in decs if d["decision_type"] == "tier1_llm_labels")
+    assert call["model_id"] == "fake-model"
+    assert call["prompt_version"] == prompts.PROMPT_VERSION
+    assert call["prompt_hash"] and len(call["prompt_hash"]) == 16
+    assert call["temperature"] == 0.0
+    assert call["schema_version"] == 2
+
+    # DETERMINISTIC in-tool decision → provenance intentionally None (not fabricated)
+    fin = next(d for d in decs if d["decision_type"] == "annotation_finalized")
+    assert fin["model_id"] is None and fin["prompt_hash"] is None
+    assert fin["prompt_version"] is None and fin["temperature"] is None
+
+    # EXACTLY ONE provenance-bearing decision per LLM label call (no double-stamp: apply_annotation
+    # is NOT in _DECISION_TYPE, so the wrapper does not emit a second event for it).
+    assert sum(1 for d in decs if d["decision_type"] == "tier1_llm_labels") == 1
+    stamped_for_apply = [d for d in decs if d.get("stage") == "apply_annotation"
+                         and d.get("model_id") is not None]
+    assert len(stamped_for_apply) == 1
+
+    # provenance is NON-replayable: it must NOT leak into the run-log params / recipe (①'s contract).
+    runs = [json.loads(l) for l in s.run_log_path.read_text().splitlines() if l.strip()]
+    apply_run = next(r for r in runs if r["tool"] == "apply_annotation" and r["status"] == "success")
+    for k in ("model_id", "prompt_version", "prompt_hash", "temperature"):
+        assert k not in apply_run["params"]
+
+    # all decisions (v2 + the deterministic ones) still validate against the frozen schema
+    from scpilot import schemas as S
+    assert all(S.validate_decision(d) == [] for d in decs)
+
+
+def test_direct_in_tool_label_call_leaves_provenance_none(tmp_path):
+    # Follow-up #6: a DIRECT (non-agent) apply_annotation call — mode-1 host / CLI / replay — has no
+    # provider, so the same in-tool tier1_llm_labels event honestly records provenance as None.
+    from scpilot import schemas as S
+    from scpilot.core import annotate
+
+    s = _session(tmp_path)
+    tools.run("preprocess", s, n_top_genes=80, n_pcs=20)
+    tools.run("cluster", s, resolution=0.5)
+    res = annotate.apply_annotation(s, groupby="leiden",
+                                    labels={"0": "T cell", "1": "Epithelial cell"})
+    assert res.status == "success"
+
+    decs = [json.loads(l) for l in s.decisions_path.read_text().splitlines() if l.strip()]
+    call = next(d for d in decs if d["decision_type"] == "tier1_llm_labels")
+    assert call["model_id"] is None and call["prompt_hash"] is None
+    assert call["prompt_version"] is None and call["temperature"] is None
+    assert S.validate_decision(call) == []

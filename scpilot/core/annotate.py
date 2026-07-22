@@ -581,7 +581,10 @@ def apply_annotation(session, *, groupby: str = "leiden", labels: dict | None = 
                      review_required: dict | None = None, cell_state: dict | None = None,
                      marker_sets: dict | None = None,
                      tissue: str | None = None, method: str = "DE_LLM_marker_free",
-                     unassigned: str = "Unassigned", **params) -> S.ToolResult:
+                     unassigned: str = "Unassigned",
+                     model_id: str | None = None, prompt_version: str | None = None,
+                     prompt_hash: str | None = None, temperature: float | None = None,
+                     **params) -> S.ToolResult:
     t0 = time.time()
     adata = session.adata
     if groupby not in adata.obs.columns:
@@ -612,7 +615,11 @@ def apply_annotation(session, *, groupby: str = "leiden", labels: dict | None = 
             decision_type="tier1_llm_labels", choice=lab, candidates=[],
             rationale=f"DE-based marker-free Tier-1 labels (tissue={tissue})",
             stage="apply_annotation",
-            params={"groupby": groupby, "key": key, "marker_sets": msets}).to_dict())
+            params={"groupby": groupby, "key": key, "marker_sets": msets},
+            # Follow-up #6: this IS the LLM cell-type CALL — stamp WHO decided on WHAT prompt
+            # basis (the agent injects these; direct/deterministic callers leave them None).
+            model_id=model_id, prompt_version=prompt_version,
+            prompt_hash=prompt_hash, temperature=temperature).to_dict())
     except Exception:  # noqa: BLE001
         pass
 
@@ -1181,6 +1188,8 @@ def apply_fine_annotation(session, *, groupby: str = "leiden", fine_labels: dict
                           facs_key: str = "facs_style_label", merge_min_cells: int = 20,
                           min_evidence: int = 1, merge_label: str | None = None,
                           method: str = "DE_LLM_fine_marker_free", unassigned: str = "Unassigned",
+                          model_id: str | None = None, prompt_version: str | None = None,
+                          prompt_hash: str | None = None, temperature: float | None = None,
                           **params) -> S.ToolResult:
     t0 = time.time()
     adata = session.adata
@@ -1281,7 +1290,11 @@ def apply_fine_annotation(session, *, groupby: str = "leiden", fine_labels: dict
             decision_type="fine_llm_labels",
             choice={cl: fine_final[cl] for cl in clusters}, candidates=[],
             rationale=f"DE-based marker-free Tier-2 fine labels (compartment={overall_comp})",
-            stage="apply_fine_annotation", params={"groupby": groupby, "fine_key": fine_key}).to_dict())
+            stage="apply_fine_annotation", params={"groupby": groupby, "fine_key": fine_key},
+            # Follow-up #6: LLM-driven fine/FACS subtype CALL — stamp provenance (agent-injected;
+            # None for direct/deterministic callers).
+            model_id=model_id, prompt_version=prompt_version,
+            prompt_hash=prompt_hash, temperature=temperature).to_dict())
     except Exception:  # noqa: BLE001
         pass
 
@@ -1306,7 +1319,7 @@ def apply_fine_annotation(session, *, groupby: str = "leiden", fine_labels: dict
                             params={"groupby": groupby, "fine_key": fine_key, "method": method})
     return S.success("apply_fine_annotation", summary=summary, warnings=warnings, checkpoint=cp.path,
                      determinism_grade="A", duration_s=round(time.time() - t0, 3),
-                     suggested_next_tools=["plots", "trajectory", "report"])
+                     suggested_next_tools=["plots", "report"])
 
 
 # --------------------------------------------------------------------------- #

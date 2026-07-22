@@ -76,7 +76,9 @@ conda run -n scpilot pip install -e . --no-deps
 conda run -n scpilot scpilot version
 ```
 
-Optional Tier-2 (CNV) + trajectory extras (gated at runtime by `doctor`):
+Optional CNV + annotation extras (gated at runtime by `doctor`) — CNV scoring
+(`infercnvpy`), gene-position mapping (`gtfparse`, `pybiomart`), and CellTypist
+reference annotation (`celltypist`):
 
 ```bash
 pip install -e ".[extra]"         # infercnvpy, gtfparse, pybiomart, celltypist
@@ -299,7 +301,7 @@ Annotation (Tier 1–2): `annotation_review` · `apply_annotation` ·
 Malignancy (CNV): `annotate_genomic_positions` · `cnv_score` ·
 `malignancy_evidence` · `apply_malignancy`
 
-Reporting: `report`
+Reporting: `report` · `export_final`
 
 ---
 

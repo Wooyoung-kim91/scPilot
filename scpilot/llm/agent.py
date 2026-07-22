@@ -207,6 +207,22 @@ _DECISION_TYPE: dict[str, str] = {
     "integrate_harmony": "integration_method",
 }
 
+# Follow-up #6: LLM-DRIVEN label tools that log their OWN in-tool DecisionEvent (the actual
+# cell-type / subtype / malignancy CALL comes from the model, not a deterministic computation).
+# The agent stamps LLM provenance onto that in-tool event by passing model_id/prompt_version/
+# prompt_hash/temperature INTO the tool call (see _execute_registry_tool). These are deliberately
+# NOT in _DECISION_TYPE — the wrapper must not emit a SECOND event for them (no double-stamping).
+# Deterministic in-tool decisions (consensus_annotation / harmonize_annotations / finalize_annotation)
+# are absent here on purpose: their choice is tool-computed, so their provenance stays None (honest).
+_LLM_LABEL_TOOLS: frozenset[str] = frozenset({
+    "apply_annotation", "apply_fine_annotation", "apply_malignancy",
+})
+
+# Provenance kwargs threaded into the LLM-label tools. Kept OUT of the recorded run-log params /
+# recipe_hash (they are non-replayable provenance, consistent with ①) — injected into the tool
+# CALL only, so the tool stamps them on its DecisionEvent while the replayable recipe stays clean.
+_PROVENANCE_KEYS: tuple[str, ...] = ("model_id", "prompt_version", "prompt_hash", "temperature")
+
 
 @dataclass
 class RunStats:
@@ -360,13 +376,27 @@ def _system_prompt(goal: str | None, tissue: str | None = None,
 
 def _execute_registry_tool(session, name: str, args: dict, seed: int,
                            stats: RunStats, rationale: str = "",
-                           param_overrides: dict | None = None) -> S.ToolResult:
+                           param_overrides: dict | None = None,
+                           provider: "Provider | None" = None,
+                           system_prompt: str | None = None) -> S.ToolResult:
     """Run one registry tool and LOG it (run-log + decision) so replay reproduces it.
 
     ``rationale`` is the model's own prose from the tool-call turn — recorded verbatim
     as the decision rationale (we do NOT fabricate candidates/rationale). ``param_overrides``
     are the user's pre-set FIXED params: ``{tool: {param: value}}`` — they OVERRIDE whatever the
-    model passed for those knobs (human-in-the-loop), while unset params stay model-chosen."""
+    model passed for those knobs (human-in-the-loop), while unset params stay model-chosen.
+
+    ``provider``/``system_prompt`` (Improvement ①) supply the decision PROVENANCE stamped on the
+    logged DecisionEvent: the resolved model id + temperature from the provider config, and a
+    stable hash of the rendered system prompt the model reasoned over. Omitted (e.g. the internal
+    Tier-4 audit calls, which do not emit a _DECISION_TYPE event) leaves provenance unset.
+
+    Follow-up #6: for the LLM-DRIVEN label tools (``_LLM_LABEL_TOOLS`` — apply_annotation /
+    apply_fine_annotation / apply_malignancy) that log their OWN in-tool cell-type/malignancy
+    DecisionEvent, the same provenance is threaded INTO the tool call so that in-tool event carries
+    it. Those tools are NOT in ``_DECISION_TYPE`` (the wrapper emits no second event → no
+    double-stamping); the provenance kwargs are kept out of the recorded run-log params so the
+    replayable recipe stays provenance-free."""
     fixed = (param_overrides or {}).get(name) or {}
     if fixed:
         args = {**args, **fixed}                  # user-fixed params win over the model's choice
@@ -380,8 +410,25 @@ def _execute_registry_tool(session, name: str, args: dict, seed: int,
     problems = validate_params(name, args)
     if problems:
         return S.error(name, "invalid_params", "; ".join(problems), recoverable=True)
+
+    # Follow-up #6: for the LLM-DRIVEN label tools (they log their OWN cell-type/subtype/malignancy
+    # DecisionEvent), thread the SAME provenance ① stamps on orchestrator decisions — WHO decided
+    # (model_id/temperature from the provider) + on WHAT prompt basis (version + hash of the rendered
+    # system prompt). Passed into the tool CALL only (so the tool stamps its in-tool event), NOT into
+    # ``args`` recorded by record_tool_run → the replayable recipe/recipe_hash stays provenance-free.
+    call_kwargs = args
+    if name in _LLM_LABEL_TOOLS and provider is not None:
+        prov = {
+            "model_id": getattr(provider, "model", None),
+            "temperature": getattr(getattr(provider, "config", None), "temperature", None),
+            "prompt_version": prompts.PROMPT_VERSION,
+            "prompt_hash": prompts.prompt_hash(system_prompt) if system_prompt else None,
+        }
+        prov = {k: v for k, v in prov.items() if v is not None}
+        if prov:
+            call_kwargs = {**args, **prov}
     try:
-        result = spec.fn(session, **args)
+        result = spec.fn(session, **call_kwargs)
     except TypeError as exc:                       # unknown kwarg / bad signature → recoverable
         return S.error(name, "invalid_params", f"bad arguments for {name}: {exc}", recoverable=True)
     stats.errors += 0 if result.status == "success" else 1
@@ -395,8 +442,10 @@ def _execute_registry_tool(session, name: str, args: dict, seed: int,
     cps = session.manifest.checkpoints
     if len(cps) >= 2 and result.checkpoint:
         in_cp = cps[-2].get("id")
-    session.record_tool_run(result, params=args, seed=seed, input_checkpoint=in_cp,
-                            reasoning=(rationale.strip() or None))
+    # record_tool_run returns the step's recipe_hash — the SAME join key the RunLogRecord/
+    # OutputRecord carry — so the DecisionEvent below can link to this step's exact evidence (①).
+    rh = session.record_tool_run(result, params=args, seed=seed, input_checkpoint=in_cp,
+                                 reasoning=(rationale.strip() or None))
 
     # decision event for consequential choices (frozen schema; powers audit + replay note)
     dtype = _DECISION_TYPE.get(name)
@@ -404,11 +453,18 @@ def _execute_registry_tool(session, name: str, args: dict, seed: int,
         try:
             session.log_decision(S.DecisionEvent(
                 decision_type=dtype, choice=args,
-                # candidates are not enumerated by the model turn-by-turn; record [] rather
-                # than fabricating, and keep the model's actual prose as the rationale.
+                # candidates/alternatives_rejected are not enumerated by the model turn-by-turn;
+                # record [] rather than fabricating, and keep the model's actual prose as the
+                # rationale. (The considered alternatives simply aren't available at this site.)
                 candidates=[], rationale=(rationale.strip() or f"chose params for {name}"),
                 stage=name, params=args,
                 input_summary_ref=in_cp,
+                # Improvement ①: WHO chose + on WHAT basis + join key to the evidence numbers.
+                recipe_hash=rh,
+                model_id=getattr(provider, "model", None),
+                temperature=getattr(getattr(provider, "config", None), "temperature", None),
+                prompt_version=prompts.PROMPT_VERSION,
+                prompt_hash=(prompts.prompt_hash(system_prompt) if system_prompt else None),
             ).to_dict())
             stats.decisions_logged += 1
         except Exception:  # noqa: BLE001 — never let a decision-log issue abort the run
@@ -416,12 +472,19 @@ def _execute_registry_tool(session, name: str, args: dict, seed: int,
     return result
 
 
-def _persist_structured(session, name: str, args: dict, stats: RunStats) -> dict:
+def _persist_structured(session, name: str, args: dict, stats: RunStats,
+                        provider: "Provider | None" = None,
+                        system_prompt: str | None = None) -> dict:
     """Handle the forced-structured-output emit tools (annotation labels / DE design).
 
     These do not mutate the AnnData; they record a first-class decision event (so the
     structured choice is auditable + part of the replayable recipe metadata) and write
     a JSON artifact in the session.
+
+    ``provider``/``system_prompt`` (Improvement ①) stamp the LLM provenance on the event. These
+    emit tools have NO corresponding RunLogRecord (they neither run a registry tool nor
+    checkpoint), so ``recipe_hash`` is intentionally left unset — there is no step-recipe hash to
+    join to; the JSON artifact path in ``params`` is the evidence pointer.
     """
     from pathlib import Path
 
@@ -439,6 +502,11 @@ def _persist_structured(session, name: str, args: dict, stats: RunStats) -> dict
             candidates=[args],
             rationale=f"mode-2 agent emitted structured {kind}",
             stage=name, params={"artifact": str(out)},
+            # Improvement ①: WHO emitted + on WHAT prompt basis (recipe_hash N/A — see docstring).
+            model_id=getattr(provider, "model", None),
+            temperature=getattr(getattr(provider, "config", None), "temperature", None),
+            prompt_version=prompts.PROMPT_VERSION,
+            prompt_hash=(prompts.prompt_hash(system_prompt) if system_prompt else None),
         ).to_dict())
         stats.decisions_logged += 1
     except Exception:  # noqa: BLE001
@@ -530,12 +598,14 @@ def run_agent(session, provider: Provider, *, goal: str | None = None,
                 # everything else on the root parent (see _CHILD_SCOPED_TOOLS).
                 target = active_session if call.name in _CHILD_SCOPED_TOOLS else root_session
                 if call.name in _EMIT_SCHEMAS:
-                    payload = _persist_structured(target, call.name, call.arguments, stats)
+                    payload = _persist_structured(target, call.name, call.arguments, stats,
+                                                  provider=provider, system_prompt=system)
                     content = json.dumps(payload)
                 else:
                     result = _execute_registry_tool(target, call.name, call.arguments,
                                                      seed, stats, rationale=resp.text or "",
-                                                     param_overrides=param_overrides)
+                                                     param_overrides=param_overrides,
+                                                     provider=provider, system_prompt=system)
                     content = json.dumps(result.to_dict(), default=str)
                     # switch the active session as compartments open/close (child-session model)
                     if call.name == "compartment_subset" and result.status == "success":
@@ -552,7 +622,8 @@ def run_agent(session, provider: Provider, *, goal: str | None = None,
                         try:
                             rv = _run_stage_review(target, (annotator_provider or provider),
                                                    reviewer_provider, call_name=call.name,
-                                                   args=call.arguments, max_rounds=review_max_rounds, seed=seed)
+                                                   args=call.arguments, max_rounds=review_max_rounds, seed=seed,
+                                                   analysis_model=getattr(provider, "model", None))
                         except Exception as exc:  # noqa: BLE001
                             rv = {"status": "skipped", "error": f"{type(exc).__name__}: {exc}"}
                         content = json.dumps({"tool_result": result.to_dict(),
@@ -587,7 +658,8 @@ def force_structured(session, provider: Provider, *, schema_tool: str,
     if not resp.tool_calls:
         raise RuntimeError(f"model did not emit the forced {schema_tool} object")
     call = resp.tool_calls[0]
-    _persist_structured(session, schema_tool, call.arguments, RunStats())
+    _persist_structured(session, schema_tool, call.arguments, RunStats(),
+                        provider=provider, system_prompt=system)
     return call.arguments
 
 
@@ -605,7 +677,8 @@ def _cap_evidence(text: str, *, max_chars: int = 60000, what: str = "evidence") 
 
 
 def run_annotation_critique(session, reviewer_provider: Provider, *, groupby: str = "leiden",
-                            label_key: str = "major_cell_type", seed: int = 0) -> dict:
+                            label_key: str = "major_cell_type", seed: int = 0,
+                            analysis_model: str | None = None) -> dict:
     """One Tier-4 review pass (the verification/critique primitive).
 
     1) run `annotation_audit` (deterministic evidence) → 2) have ``reviewer_provider`` adversarially
@@ -635,13 +708,22 @@ def run_annotation_critique(session, reviewer_provider: Provider, *, groupby: st
                 for v in args.get("verdicts", []) if isinstance(v, dict) and "cluster_id" in v}
     rm = getattr(reviewer_provider, "model", None)
     gran = args.get("granularity") if isinstance(args.get("granularity"), dict) else None
+    # Improvement ③ (Part B): reviewer independence is recorded, never a silent fallback. When the
+    # reviewer model == the analysis model (e.g. the CLI role fell back to the analysis model), the
+    # verdict is a DEGRADED self-review; apply_annotation_audit records the machine-readable flag.
+    independent = (str(rm) != str(analysis_model)) if (rm is not None and analysis_model is not None) else None
+    review_mode = ("independent" if independent
+                   else "self-review-degraded" if independent is False else "unknown")
     applied = _execute_registry_tool(
         session, "apply_annotation_audit",
         {"groupby": groupby, "label_key": label_key, "verdicts": verdicts, "reviewer_model": rm,
+         "analysis_model": analysis_model, "reviewer_independent": independent, "review_mode": review_mode,
          "granularity": gran},
-        seed, stats, rationale=f"record Tier-4 reviewer verdicts for '{label_key}' (reviewer_model={rm})")
+        seed, stats, rationale=f"record Tier-4 reviewer verdicts for '{label_key}' "
+                               f"(reviewer_model={rm}, review_mode={review_mode})")
     sm = getattr(applied, "summary", None) or {}
     return {"status": applied.status, "summary": sm, "reviewer_model": rm,
+            "reviewer_independent": independent, "review_mode": review_mode,
             "refuted_clusters": sm.get("refuted_clusters", []),
             "refuted_reasons": sm.get("refuted_reasons", {}),
             "suspect_clusters": sm.get("suspect_clusters", []),
@@ -653,7 +735,7 @@ def run_annotation_critique(session, reviewer_provider: Provider, *, groupby: st
 def run_annotation_review_loop(session, annotator_provider: Provider, reviewer_provider: Provider, *,
                                groupby: str = "leiden", label_key: str = "major_cell_type",
                                max_rounds: int = 3, tissue: str | None = None, seed: int = 0,
-                               finalize_after: bool = True) -> dict:
+                               finalize_after: bool = True, analysis_model: str | None = None) -> dict:
     """BOUNDED annotation + verification loop (the converging review).
 
     Each round: audit → INDEPENDENT reviewer critique → if any label is REFUTED, the ANNOTATOR
@@ -669,7 +751,7 @@ def run_annotation_review_loop(session, annotator_provider: Provider, reviewer_p
     converged = False
     for r in range(1, max(1, max_rounds) + 1):
         crit = run_annotation_critique(session, reviewer_provider, groupby=groupby,
-                                       label_key=label_key, seed=seed)
+                                       label_key=label_key, seed=seed, analysis_model=analysis_model)
         if crit.get("status") == "skipped":
             return {"status": "skipped", "reason": crit.get("reason"), "rounds": rounds}
         refuted = list(crit.get("refuted_clusters", []))
@@ -719,20 +801,28 @@ def run_annotation_review_loop(session, annotator_provider: Provider, reviewer_p
             apply_args["tissue"] = tissue
         if tier1.get("marker_sets"):    # preserve the recorded marker_sets for the next audit
             apply_args["marker_sets"] = tier1["marker_sets"]
+        # Follow-up #6: the re-annotation is itself an LLM-driven tier1_llm_labels CALL (the
+        # annotator re-inferred these labels) — stamp its provenance too (system == the prompt the
+        # annotator reasoned over above).
         _execute_registry_tool(session, "apply_annotation", apply_args, seed, stats,
-                               rationale=f"re-annotate refuted clusters {sorted(new)} (round {r})")
+                               rationale=f"re-annotate refuted clusters {sorted(new)} (round {r})",
+                               provider=annotator_provider,
+                               system_prompt=prompts.ANNOTATION_REVIEW_PROMPT)
         if finalize_after and "final_annotation" in session.adata.obs.columns:
             _execute_registry_tool(session, "finalize_annotation", {}, seed, stats,
                                    rationale="re-consolidate after re-annotation")
     return {"status": "completed", "converged": converged, "n_rounds": len(rounds),
             "rounds": rounds, "reviewer_model": crit.get("reviewer_model"),
+            "reviewer_independent": crit.get("reviewer_independent"),
+            "review_mode": crit.get("review_mode"),
             "final_refuted": rounds[-1]["refuted_clusters"] if rounds else [],
             # ACTION items the loop did NOT auto-fix → surfaced for Tier-2 subtype / human review
             "final_suspect": crit.get("suspect_clusters", [])}
 
 
 def _run_stage_review(session, annotator: Provider, reviewer: Provider, *, call_name: str,
-                      args: dict, max_rounds: int = 3, seed: int = 0) -> dict:
+                      args: dict, max_rounds: int = 3, seed: int = 0,
+                      analysis_model: str | None = None) -> dict:
     """Route the post-apply Tier-4 review to the right label column. EVERY label-writing tool is
     reviewed (reliability of ALL annotation, not just the final table). BROAD (apply_annotation)
     auto-corrects refuted clusters via the bounded loop (no premature finalize mid-pipeline); every
@@ -743,7 +833,7 @@ def _run_stage_review(session, annotator: Provider, reviewer: Provider, *, call_
         return run_annotation_review_loop(
             session, annotator, reviewer, groupby=args.get("groupby", cur_gb),
             label_key=args.get("key", "major_cell_type"), max_rounds=max_rounds, seed=seed,
-            finalize_after=False)
+            finalize_after=False, analysis_model=analysis_model)
     # verify + flag on the column THIS tool wrote (groupby + label_key per tool)
     gb, label_key = cur_gb, "final_annotation"
     if call_name == "apply_fine_annotation":
@@ -758,4 +848,5 @@ def _run_stage_review(session, annotator: Provider, reviewer: Provider, *, call_
                                          else "celltype_harmonized")
     elif call_name == "finalize_annotation":
         gb, label_key = cur_gb, args.get("out_key", "final_annotation")
-    return run_annotation_critique(session, reviewer, groupby=gb, label_key=label_key, seed=seed)
+    return run_annotation_critique(session, reviewer, groupby=gb, label_key=label_key, seed=seed,
+                                   analysis_model=analysis_model)

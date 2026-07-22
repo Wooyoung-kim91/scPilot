@@ -223,6 +223,15 @@ def artifact_png(path: str, *, width_in: float | None = None, height_in: float |
 # --------------------------------------------------------------------------- #
 # Reproducibility harness schemas — scpilot plan A7 (FROZEN before B11+)
 # --------------------------------------------------------------------------- #
+# VERSIONED BUMP (Improvement ①, decision provenance): the ``DecisionEvent`` shape is a
+# FROZEN A7 contract, so it is extended only through an explicit version bump — never a silent
+# mutation. ``DECISION_SCHEMA_VERSION`` = 2 adds LLM provenance (model_id / prompt_version /
+# prompt_hash / temperature) + a ``recipe_hash`` join key back to the evidence. Every v2 field is
+# OPTIONAL with a backward-compatible default, so a v1 ``decisions.jsonl`` (no ``schema_version``,
+# no provenance fields) still ``validate_decision``s and still replays. ``RunLogRecord`` /
+# ``OutputRecord`` are unchanged (still v1-frozen). See the DecisionEvent docstring below.
+DECISION_SCHEMA_VERSION = 2
+
 # Canonical decision types the LLM/orchestrator records. Free-form str is allowed,
 # but new recurring kinds SHOULD be added here so replay/audit stay consistent.
 DECISION_TYPES = (
@@ -248,8 +257,18 @@ _DECISION_REQUIRED = ("decision_type", "choice", "candidates", "rationale")
 class DecisionEvent:
     """A first-class LLM decision (plan A7). Append to the session decision log.
 
-    FROZEN shape — recorded so ``scpilot replay`` can re-run a pipeline WITHOUT
+    FROZEN shape (versioned) — recorded so ``scpilot replay`` can re-run a pipeline WITHOUT
     re-querying the LLM (it consumes the recorded ``choice``/``params``).
+
+    v2 (Improvement ①) adds LLM PROVENANCE + an evidence join key, all OPTIONAL with
+    backward-compatible defaults so v1 logs still validate + replay:
+    - ``model_id`` / ``prompt_version`` / ``prompt_hash`` / ``temperature`` capture WHO decided
+      and on WHAT prompt basis, so a run reproduced under a drifted LLM/prompt is detectable.
+    - ``recipe_hash`` is the SAME value the step's ``RunLogRecord`` / ``OutputRecord`` carry, so
+      the decision links back to the exact evidence numbers that produced it.
+    A deterministic-tool decision (no LLM) leaves the provenance fields ``None`` — that is honest,
+    not missing data. The provenance fields are NOT recipe inputs; replay treats them like the
+    already-non-replayable LLM outputs (see ``repro.NON_REPLAYABLE_DECISIONS``).
     """
     decision_type: str                       # ∈ DECISION_TYPES (or free str)
     choice: Any                              # selected option (str or dict)
@@ -260,6 +279,13 @@ class DecisionEvent:
     params: dict = field(default_factory=dict)       # downstream params implied by the choice
     stage: str | None = None                 # tool/stage that prompted it
     alternatives_rejected: list = field(default_factory=list)
+    # --- v2 provenance (Improvement ①); all optional, default keeps v1 logs valid ---
+    schema_version: int = DECISION_SCHEMA_VERSION
+    model_id: str | None = None              # resolved provider model id (provider.model)
+    prompt_version: str | None = None        # version tag of the prompt template (prompts.PROMPT_VERSION)
+    prompt_hash: str | None = None           # stable hash of the rendered prompt text sent to the model
+    temperature: float | None = None         # sampling temperature used for the decision
+    recipe_hash: str | None = None           # join key to this step's RunLogRecord/OutputRecord evidence
 
     def to_dict(self) -> dict:
         return _sanitize(dataclasses.asdict(self))
@@ -321,7 +347,11 @@ class OutputRecord:
 
 
 def validate_decision(d: dict) -> list[str]:
-    """Return a list of problems (empty == valid) for a decision-event dict."""
+    """Return a list of problems (empty == valid) for a decision-event dict.
+
+    Accepts BOTH shapes: a v1 event (missing the v2 provenance fields) and a v2 event. The v2
+    fields are only checked WHEN PRESENT and non-None, so an old ``decisions.jsonl`` stays valid.
+    """
     problems = [f"missing required key: {k}" for k in _DECISION_REQUIRED if k not in d]
     if "confidence" in d and d["confidence"] is not None:
         c = d["confidence"]
@@ -329,6 +359,15 @@ def validate_decision(d: dict) -> list[str]:
             problems.append("confidence must be in [0,1]")
     if "candidates" in d and not isinstance(d["candidates"], list):
         problems.append("candidates must be a list")
+    if "alternatives_rejected" in d and not isinstance(d["alternatives_rejected"], list):
+        problems.append("alternatives_rejected must be a list")
+    # v2 provenance (Improvement ①): string-typed join keys/ids, numeric temperature — checked
+    # only when present + non-None so v1 events remain valid.
+    for key in ("model_id", "prompt_version", "prompt_hash", "recipe_hash"):
+        if d.get(key) is not None and not isinstance(d[key], str):
+            problems.append(f"{key} must be a string or null")
+    if d.get("temperature") is not None and not isinstance(d["temperature"], (int, float)):
+        problems.append("temperature must be a number or null")
     return problems
 
 
