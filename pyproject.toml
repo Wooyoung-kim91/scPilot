@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scpilot"
-version = "0.1.0"
+version = "0.1.1"
 description = "LLM-driven scRNA-seq analysis pipeline (MCP server + CLI agent)"
 readme = "README.md"
 requires-python = ">=3.11"
