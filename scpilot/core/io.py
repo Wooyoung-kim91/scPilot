@@ -16,6 +16,7 @@ from scpilot.tools import register
 # obs columns with at most this many distinct values get a value_counts breakdown.
 _MAX_CATEGORIES = 20
 _MAX_VALUE_ROWS = 15  # cap per-column category listing
+_X_STATE_SAMPLE = 200  # rows sampled (evenly, across all of X) to guess X's state
 
 
 # --------------------------------------------------------------------------- #
@@ -36,14 +37,32 @@ def save_h5ad(adata, path: str, *, compression: str = "gzip") -> str:  # I-5: gz
 
 
 def _guess_x_state(adata) -> str:
-    """Best-effort guess of what .X currently means (counts vs normalized)."""
+    """Best-effort guess of what .X currently means (counts vs normalized).
+
+    Samples rows spread EVENLY across the whole matrix (not just the leading
+    block) and ignores all-zero rows, so leading near-empty cells — which can
+    appear after some merges/sorts — do not make log-normalized data look like
+    integer counts. Deterministic (fixed even spacing, no RNG). Backed-safe:
+    reads at most ``_X_STATE_SAMPLE`` rows, never densifies all of X.
+    """
     layers = set(getattr(adata, "layers", {}).keys())
-    # backed read: peek a tiny slice to test integrality without loading all of X
     try:
         import numpy as np
-        sub = adata[:50].to_memory().X if hasattr(adata, "isbacked") and adata.isbacked else adata.X[:50]
+        n_obs = int(getattr(adata, "n_obs", 0))
+        if not n_obs:
+            return "unknown" if "counts" not in layers else "raw_counts"
+        # evenly-spaced row indices across the FULL matrix (representative, deterministic)
+        idx = np.unique(np.linspace(0, n_obs - 1, num=min(_X_STATE_SAMPLE, n_obs), dtype=int))
+        backed = bool(getattr(adata, "isbacked", False))
+        sub = adata[idx].to_memory().X if backed else adata.X[idx]
         arr = sub.toarray() if hasattr(sub, "toarray") else np.asarray(sub)
-        if arr.size and np.allclose(arr, np.round(arr)) and arr.min() >= 0:
+        if not arr.size:
+            return "normalized"
+        # drop all-zero rows (near-empty cells carry no signal about X's state)
+        if arr.ndim == 2:
+            nz = arr[np.abs(arr).sum(axis=1) > 0]
+            arr = nz if nz.size else arr
+        if np.allclose(arr, np.round(arr)) and arr.min() >= 0:
             return "raw_counts"
         return "normalized"
     except Exception:  # noqa: BLE001

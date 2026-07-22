@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import os
 import re
 import time
@@ -193,9 +194,14 @@ def annotate_genomic_positions(session, *, gtf: str | None = None, genome_build:
     n_mapped = int(mapped.sum())
 
     # Protein-coding coverage = the CNV-relevant gate (overall rate is noise-dominated).
+    # Measure protein_coding genes that ACTUALLY received coordinates (chromosome not-null), not
+    # mere symbol presence: a mapped var_name IS its own gene symbol (pass 1), except make_unique-
+    # recovered names, which carry their BASE symbol's coordinates (pass 2). This matches the
+    # docstring's definition ("genes the data gave coordinates to") — issue #4.
     pc_names = _protein_coding_names(gtf_path)
-    data_bases = set(var_names) | {b for b in base_of.values()}
-    pc_covered = len(pc_names & data_bases)
+    coordinated_symbols = {base_of.get(var_names[i], var_names[i])
+                           for i in range(n_total) if bool(mapped.iloc[i])}
+    pc_covered = len(pc_names & coordinated_symbols)
     pc_coverage = (pc_covered / len(pc_names)) if pc_names else 0.0
 
     # chromosome distribution + unmapped breakdown
@@ -203,7 +209,10 @@ def annotate_genomic_positions(session, *, gtf: str | None = None, genome_build:
     unmapped_names = [var_names[i] for i in range(n_total) if not bool(mapped.iloc[i])]
     from collections import Counter
     kinds = Counter(_classify_unmapped(n) for n in unmapped_names)
-    grade = "A" if source["type"] in ("gencode", "user") else "B"
+    # _resolve_gtf only ever yields a "user" or "gencode" source, both pinned / sha256 content-
+    # addressed, so the coordinate source is always grade "A". There is no biomart/network-heuristic
+    # fallback that would justify a lower grade, so the old grade-"B" branch was dead — removed (#4).
+    grade = "A"
 
     warnings = []
     if pc_coverage < pc_coverage_fail:
@@ -356,7 +365,9 @@ def cnv_score(session, *, reference_key: str | None = None, reference_cat: list 
                            f"(present: {sorted(present)[:10]})", recoverable=True)
 
     n_coord = int(adata.var["chromosome"].notna().sum())
-    advisory = reference_key is None
+    # advisory (average-of-all baseline) also when a reference_key is set but reference_cat is
+    # None/empty — matches malignancy_evidence's `not (reference_key and reference_cat)` parity.
+    advisory = reference_key is None or not reference_cat
     warnings = []
     if advisory:
         warnings.append("no reference_key/reference_cat: CNV is scored against the average of ALL cells "
@@ -522,6 +533,15 @@ def malignancy_evidence(session, *, groupby: str | None = None, reference_key: s
     if reference_key is not None and reference_key not in adata.obs.columns:
         return S.error("malignancy_evidence", "data_gate_failed",
                        f"reference_key '{reference_key}' absent in obs", recoverable=True)
+    # Mirror cnv_score's gate: reference_cat VALUES must exist in obs[reference_key], else the
+    # reference mask is all-False -> empty reference -> a degenerate (NaN) evidence packet.
+    if reference_key is not None and reference_cat:
+        present = set(adata.obs[reference_key].astype(str).unique())
+        missing = [c for c in reference_cat if str(c) not in present]
+        if missing:
+            return S.error("malignancy_evidence", "data_gate_failed",
+                           f"reference_cat {missing} not found in obs['{reference_key}'] "
+                           f"(present: {sorted(present)[:10]})", recoverable=True)
 
     obs_g = adata.obs[groupby].astype(str)
     cnv = adata.obs["cnv_score"].astype(float)
@@ -547,14 +567,21 @@ def malignancy_evidence(session, *, groupby: str | None = None, reference_key: s
         mask = obs_g.values == str(cl)
         n_cells = int(mask.sum())
         g_cnv = cnv.values[mask]
+        # NaN must be tested explicitly (nan != nan): a degenerate/empty reference makes ref_mean
+        # NaN, and `x/nan` would (1) leak the literal `NaN` token into the JSON (invalid for
+        # non-Python consumers) and (2) silently bypass the donor-confound guard (`nan <= 1.1` is
+        # False). Undefined numerics are emitted as None (JSON null), never NaN.
+        g_mean = float(g_cnv.mean())
+        ratio = (None if (math.isnan(g_mean) or math.isnan(ref_mean) or ref_mean == 0.0)
+                 else round(g_mean / ref_mean, 3))
+        frac_above = float((g_cnv > ref_p).mean())   # g_cnv > nan == False -> 0.0 (never NaN)
         evidence = {
             "group": str(cl), "n_cells": n_cells,
             "cnv_burden": {
-                "mean_cnv_score": round(float(g_cnv.mean()), 4),
-                "reference_mean": round(ref_mean, 4),
-                "ratio_to_reference": (round(float(g_cnv.mean() / ref_mean), 3)
-                                       if ref_mean not in (0.0, float("nan")) else None),
-                "frac_above_reference_q": round(float((g_cnv > ref_p).mean()), 3),
+                "mean_cnv_score": (None if math.isnan(g_mean) else round(g_mean, 4)),
+                "reference_mean": (None if math.isnan(ref_mean) else round(ref_mean, 4)),
+                "ratio_to_reference": ratio,
+                "frac_above_reference_q": (None if math.isnan(frac_above) else round(frac_above, 3)),
             },
         }
         # clonal expansion: a malignant clone is typically dominated by ONE patient;
@@ -567,7 +594,7 @@ def malignancy_evidence(session, *, groupby: str | None = None, reference_key: s
             # I-21: single-donor dominance WITHOUT elevated CNV vs the reference is more likely a
             # donor-specific NORMAL population than a malignant clone — flag so clonal-expansion isn't
             # over-read on normal/non-tumor tissue (the malignant call still needs concordant CNV).
-            ratio = evidence["cnv_burden"]["ratio_to_reference"]
+            # `ratio` (computed above) is None for a degenerate reference -> guard correctly fires.
             if top_frac >= 0.8 and (ratio is None or ratio <= 1.1):
                 ce["donor_confound_suspected"] = True
             evidence["clonal_expansion"] = ce
@@ -616,7 +643,8 @@ def malignancy_evidence(session, *, groupby: str | None = None, reference_key: s
 
     summary = {
         "groupby": groupby, "n_groups": len(payloads), "reference": ref_desc,
-        "advisory_only": advisory, "reference_mean_cnv": round(ref_mean, 4),
+        "advisory_only": advisory,
+        "reference_mean_cnv": (None if math.isnan(ref_mean) else round(ref_mean, 4)),
         "tumor_markers_used": tumor_used, "normal_markers_used": normal_used,
         "vocabulary": list(MALIGNANCY_VOCAB), "evidence_input": str(json_path),
         "note": "Evidence only — no malignancy call. The LLM judges from CNV burden + clonal expansion "

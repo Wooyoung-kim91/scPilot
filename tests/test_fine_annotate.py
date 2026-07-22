@@ -123,6 +123,39 @@ def test_apply_fine_merges_tiny_subclusters(tmp_path):
     assert any("merge_min_cells" in w for w in r.warnings)
 
 
+def test_apply_fine_demoted_cluster_drops_speculative_facs_label(tmp_path):
+    # Bug F: a tiny subcluster (< merge_min_cells) that the LLM gave a speculative FACS label to
+    # must be demoted to the '<compartment>_unresolved' fallback in facs_style_label too — NOT keep
+    # the speculative FACS label — so finalize_annotation (FACS > fine > major) can't resurrect the
+    # under-powered subtype in the human-facing final_annotation.
+    s = _prep_subset(tmp_path)
+    clusters = sorted(s.adata.obs["leiden"].astype(str).unique())
+    fine = {c: "Regulatory T cell" for c in clusters}
+    facs = {c: "CD4+ FOXP3+ Treg" for c in clusters}                 # speculative FACS subtype
+    # merge_min_cells huge → every subcluster is under the floor → merged + review
+    r = tools.run("apply_fine_annotation", s, groupby="leiden", fine_labels=fine,
+                  facs_labels=facs, evidence_for={c: ["x"] for c in clusters},
+                  merge_min_cells=10_000)
+    assert r.status == "success", r.error
+    fallback = f"T_NK_{FINE_UNRESOLVED}"
+    # facs_style_label is the fallback, NOT the speculative FACS label
+    facs_vals = set(s.adata.obs["facs_style_label"].astype(str).unique())
+    assert facs_vals == {fallback}
+    assert "CD4+ FOXP3+ Treg" not in facs_vals
+    tree = s.adata.uns[UNS_ANNO][UNS_TREE]["subclusters"]
+    for c in clusters:
+        assert tree[c]["facs_style_label"] == fallback
+        assert tree[c]["merged"] is True and tree[c]["review_required"] is True
+    assert bool(s.adata.obs["fine_cell_type_review_required"].all())
+
+    # finalize_annotation must consume the fallback, not the speculative subtype
+    rf = tools.run("finalize_annotation", s)
+    assert rf.status == "success", rf.error
+    final_vals = set(s.adata.obs["final_annotation"].astype(str).unique())
+    assert final_vals == {fallback}
+    assert "CD4+ FOXP3+ Treg" not in final_vals
+
+
 def test_apply_fine_insufficient_evidence_forces_review(tmp_path):
     s = _prep_subset(tmp_path)
     clusters = sorted(s.adata.obs["leiden"].astype(str).unique())

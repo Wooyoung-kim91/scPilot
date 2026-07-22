@@ -138,9 +138,22 @@ def benchmark(session, *, label_key: str = "major_cell_type", batch_key: str = "
     ranked = sorted((e for e in scores if scores[e].get("Total") is not None),
                     key=lambda e: scores[e]["Total"], reverse=True)
     best = ranked[0] if ranked else None
-    if best:                                                 # persist so autoplot/finalize/plots show
-        try:                                                 # labels on the BEST embedding's UMAP,
-            adata.uns.setdefault("scpilot", {})["best_embedding"] = str(best)  # not a fixed scVI-first default
+    if best:
+        # Record the best-embedding pick as a first-class DECISION EVENT (replayable, joined to
+        # this step's evidence via recipe_hash) so it is NOT a silent, unlogged state mutation.
+        # Downstream readers (autoplot / report / export_final) still consume
+        # uns['scpilot']['best_embedding'], so we ALSO expose it there — but the authoritative,
+        # logged record is the decision event, not the bare uns write.
+        try:
+            session.log_decision(S.DecisionEvent(
+                decision_type="integration_method", choice=str(best), candidates=ranked,
+                rationale=f"highest scib Total among {ranked} -> best embedding for downstream "
+                          "annotation/finalize/plots (not a fixed scVI-first default)",
+                stage="benchmark", params={"best_embedding": str(best)}))
+        except Exception:  # noqa: BLE001 — logging must never fail the read-only benchmark
+            pass
+        try:
+            adata.uns.setdefault("scpilot", {})["best_embedding"] = str(best)
         except Exception:  # noqa: BLE001
             pass
 
@@ -233,11 +246,20 @@ def benchmark_reference(session, *, pred_key: str, ref_key: str,
     lmap = {str(k): str(v) for k, v in (label_map or {}).items()}
     pred_mapped = np.array([lmap.get(p, p) for p in pred_s], dtype=object)
 
-    # reference vocabulary is FIXED (the ground truth); canonical label keyed by casefold
+    # reference vocabulary is FIXED (the ground truth). Case-variant spellings of the SAME label
+    # are FOLDED to one canonical spelling (first-seen) for BOTH y_true and the prediction rewrite,
+    # so a reference cell spelled in the non-canonical case is still scorable — otherwise a
+    # case-normalized prediction could never match it and that reference variant would be
+    # permanently unscorable (issue #2).
     ref_canon: dict[str, str] = {}
     for r in ref_s:
         ref_canon.setdefault(r.casefold(), r)
+    n_ref_raw_spellings = len(set(ref_s))
+    ref_s = np.array([ref_canon[r.casefold()] for r in ref_s], dtype=object)
     reference_classes = sorted(set(ref_s))
+    if len(reference_classes) < n_ref_raw_spellings:
+        warnings.append(f"reference case-variant spellings folded to {len(reference_classes)} "
+                        f"canonical label(s) (from {n_ref_raw_spellings}) so no case-variant is unscorable")
 
     matched = np.array([p.casefold() in ref_canon for p in pred_mapped], dtype=bool)
     n_matched = int(matched.sum())
@@ -316,7 +338,8 @@ def benchmark_reference(session, *, pred_key: str, ref_key: str,
     json_path.write_text(json.dumps(metrics, indent=2, default=str))
 
     artifacts = [
-        S.artifact_csv(str(json_path), description="reference-label benchmark metrics (ARI/AMI/accuracy/F1)"),
+        S.Artifact(path=str(json_path), kind="json",
+                   description="reference-label benchmark metrics (ARI/AMI/accuracy/F1)"),
         S.artifact_csv(str(conf_path), n_rows=int(cm_df.shape[0]), n_cols=int(cm_df.shape[1]),
                        description="confusion matrix (rows=reference, cols=predicted; UNMATCHED::* = no ref counterpart)"),
     ]
@@ -335,7 +358,10 @@ def benchmark_reference(session, *, pred_key: str, ref_key: str,
         "metrics_json": str(json_path),
     }
     tab = pd.DataFrame([{"reference_class": c, **strict["per_class"][c]} for c in strict["per_class"]])
-    tables = {"per_class_strict": S.table_preview(tab, full_csv=str(json_path))} if len(tab) else {}
+    # No standalone full CSV for this preview: do NOT point full_csv at the metrics JSON — a
+    # consumer downloading a table's "full CSV" must never receive JSON (issue #1). The CSV
+    # artifact is the confusion matrix; the full per-class metrics live in the JSON artifact.
+    tables = {"per_class_strict": S.table_preview(tab)} if len(tab) else {}
     return S.success("benchmark_reference", summary=summary, tables=tables, artifacts=artifacts,
                      warnings=warnings, determinism_grade="A", duration_s=round(time.time() - t0, 3),
                      params={"pred_key": pred_key, "ref_key": ref_key, "label_map": lmap},

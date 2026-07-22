@@ -138,6 +138,20 @@ def test_markers_full_ranking_when_cap_is_none(tmp_path):
     assert rm.artifacts[0].description == "full rank_genes_groups ranking"
 
 
+def test_markers_single_cluster_gate(tmp_path):
+    # A single-group DE is degenerate: sc.tl.rank_genes_groups does NOT raise — it ranks the lone
+    # group vs an empty "rest" and returns meaningless stats. markers must gate this so it never
+    # flows into annotation as valid evidence, instead of returning success + determinism_grade="A".
+    s = _session(tmp_path)
+    s.adata.obs["solo"] = "0"                       # exactly one category
+    rm = tools.run("markers", s, groupby="solo")
+    assert rm.status == "error"
+    assert rm.error_code == "data_gate_failed"
+    assert rm.recoverable is False
+    assert rm.summary["n_clusters"] == 1
+    assert "rank_genes_groups" not in s.adata.uns   # no degenerate DE written
+
+
 def test_cluster_defaults_resolution(tmp_path):
     # resolution defaults to 0.25 at every stage when the caller omits it
     from scpilot.core.cluster import DEFAULT_RESOLUTION
@@ -167,6 +181,32 @@ def test_cluster_preserves_reductions_per_model(tmp_path):
     assert "leiden" in a.obs and "leiden_scvi" in a.obs
     assert rc.summary["umap_key"] == "X_umap_scvi"
     assert rc.summary["cluster_key"] == "leiden_scvi"
+
+
+def test_cluster_sweep_leaves_no_scratch_state(tmp_path):
+    """Bug D: cluster_sweep is mutating=False, so it MUST leave the object's uns/obs/obsp
+    byte-identical. sc.tl.leiden(key_added='_sweep_leiden') also writes uns['_sweep_leiden']
+    (a params dict) which the finally block must pop, alongside the neighbors key + graphs +
+    obs column. A leaked _sweep_* key would get persisted by a later mutating checkpoint,
+    making the saved object order-dependent (non-content-addressed)."""
+    s = _session(tmp_path)
+    tools.run("preprocess", s, n_top_genes=100, n_pcs=20)
+    a = s.adata
+    uns_before = set(a.uns.keys())
+    obs_before = set(a.obs.columns)
+    obsp_before = set(a.obsp.keys())
+
+    r = tools.run("cluster_sweep", s, use_rep="X_pca")
+    assert r.status == "success"
+
+    # no temp scratch keys of ANY kind survive the sweep
+    assert not [k for k in a.uns if str(k).startswith("_sweep_")]
+    assert not [c for c in a.obs.columns if str(c).startswith("_sweep_")]
+    assert not [k for k in a.obsp if str(k).startswith("_sweep_")]
+    # object is unchanged: uns/obs/obsp identical to before the (non-mutating) sweep
+    assert set(a.uns.keys()) == uns_before
+    assert set(a.obs.columns) == obs_before
+    assert set(a.obsp.keys()) == obsp_before
 
 
 def test_registry_has_b4_b7():

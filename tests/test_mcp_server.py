@@ -136,3 +136,35 @@ def test_init_fork_safety_sets_forkserver():
     if _sys.platform == "win32":
         return  # POSIX-only; Windows already spawns
     assert mp.get_start_method(allow_none=False) == "forkserver"
+
+
+def test_numba_cache_env_set_before_forkserver_warmup(monkeypatch):
+    """Regression for the numba-cache-permission fix: NUMBA_CACHE_DIR / MPLCONFIGDIR must be set
+    BEFORE main() warms the forkserver daemon, or forkserver-spawned infercnvpy CNV workers inherit
+    an environment with no writable numba cache (the setdefaults used to land later, inside
+    build_server()->init_runtime, AFTER warmup). Capture the env AT the warmup call site."""
+    import os
+    import types
+
+    import scpilot.mcp_server as mcp
+
+    monkeypatch.delenv("NUMBA_CACHE_DIR", raising=False)
+    monkeypatch.delenv("MPLCONFIGDIR", raising=False)
+
+    captured = {}
+
+    def fake_fork_safety(lg=None):
+        captured["numba"] = os.environ.get("NUMBA_CACHE_DIR")
+        captured["mpl"] = os.environ.get("MPLCONFIGDIR")
+
+    fake_server = types.SimpleNamespace(_scpilot_cleanup=lambda: None,
+                                        run=lambda **kw: None)
+    monkeypatch.setattr(mcp, "_init_fork_safety", fake_fork_safety)
+    monkeypatch.setattr(mcp, "build_server", lambda: fake_server)
+    monkeypatch.setattr(mcp, "_install_cleanup_handlers", lambda c: None)
+
+    mcp.main()
+
+    # env present (and pointing at a real, writable dir) at the moment the daemon was warmed
+    assert captured["numba"] and os.path.isdir(captured["numba"])
+    assert captured["mpl"] and os.path.isdir(captured["mpl"])

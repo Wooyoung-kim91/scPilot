@@ -100,6 +100,43 @@ def test_annotation_audit_needs_labels(tmp_path):
     assert r.status == "error" and r.error_code == "invalid_state"
 
 
+def test_annotation_audit_flags_malignant_low_cnv_burden(tmp_path):
+    # check 7 (low-burden case): the CNV track EXISTS but a malignant cluster's per-cluster burden is
+    # NOT elevated above the (majority-normal) data-derived baseline → advisory malignant_low_cnv_burden.
+    # This is the gap the old code missed: it only flagged the MISSING-column case.
+    s = _audit_session(tmp_path)
+    leiden = s.adata.obs["leiden"].astype(str).values
+    # cluster 3 is the malignant cluster; give it LOW CNV burden while the population is HIGH so the
+    # median baseline sits above it. No hardcoded biological cutoff — the reference comes from the data.
+    s.adata.obs["cnv_score"] = np.where(leiden == "3", 0.02, 0.5).astype(float)
+    r = tools.run("annotation_audit", s, groupby="leiden", label_key="major_cell_type")
+    assert r.status == "success", r.error
+    sm = r.summary
+    assert sm["n_malignant_low_cnv_burden"] >= 1
+    assert sm["n_malignant_without_cnv"] == 0          # CNV track present → NOT the missing-column flag
+    assert sm["cnv_burden_baseline"] is not None
+    import json
+    by = {c["cluster_id"]: c for c in json.load(open(sm["audit_input"]))["clusters"]}
+    assert "malignant_low_cnv_burden" in by["3"]["flags"]
+    assert "malignant_without_cnv" not in by["3"]["flags"]
+
+
+def test_annotation_audit_no_low_cnv_flag_when_burden_elevated(tmp_path):
+    # a malignant cluster WITH CNV burden elevated above the population baseline must NOT be flagged
+    # (the advisory low-burden signal is evidence of a CONTRADICTION, not fired on every malignant call).
+    s = _audit_session(tmp_path)
+    leiden = s.adata.obs["leiden"].astype(str).values
+    s.adata.obs["cnv_score"] = np.where(leiden == "3", 0.6, 0.05).astype(float)
+    r = tools.run("annotation_audit", s, groupby="leiden", label_key="major_cell_type")
+    assert r.status == "success", r.error
+    sm = r.summary
+    assert sm["n_malignant_low_cnv_burden"] == 0
+    assert sm["n_malignant_without_cnv"] == 0
+    import json
+    by = {c["cluster_id"]: c for c in json.load(open(sm["audit_input"]))["clusters"]}
+    assert "malignant_low_cnv_burden" not in by["3"]["flags"]
+
+
 def test_apply_annotation_audit_records_verdicts_and_reasons(tmp_path):
     s = _audit_session(tmp_path)
     tools.run("annotation_audit", s, groupby="leiden", label_key="major_cell_type")
@@ -235,6 +272,32 @@ def test_harness_audit_governance_scorecard(tmp_path):
     assert {"tier4_review_ran", "marker_db_free"} <= set(r2.summary["violations"])
 
 
+def test_harness_audit_flags_lead_to_action_reads_the_tier4_column(tmp_path):
+    # A full run leaves MULTIPLE '*review_required' columns. The Tier-1 column
+    # (major_cell_type_review_required) is inserted FIRST and is all-False here; the Tier-4 column
+    # (annotation_review_required, written by apply_annotation_audit) carries the actual flag for the
+    # suspect cluster. Picking only the FIRST column by insertion order would read the decoy and warn;
+    # OR-ing across ALL columns must see the Tier-4 flag → pass.
+    s = _audit_session(tmp_path)
+    for tool in ["markers", "annotation_review", "apply_annotation", "annotation_audit",
+                 "apply_annotation_audit", "finalize_annotation"]:
+        s._append_jsonl(s.run_log_path, {"tool": tool, "status": "success", "seed": 0, "recipe_hash": tool})
+    s.adata.uns[UNS_ANNO]["tier4_audit"] = {"reviewer_model": "rev-model",
+                                            "refuted_clusters": [], "suspect_clusters": ["3"]}
+    s.adata.uns[UNS_ANNO]["tier4_reviews"] = {
+        "major_cell_type": {"reviewer_model": "rev-model", "refuted_clusters": [], "suspect_clusters": ["3"]},
+        "malignancy": {"reviewer_model": "rev-model", "refuted_clusters": [], "suspect_clusters": []},
+    }
+    # decoy Tier-1 column FIRST (all-False), then the real Tier-4 column flagging cluster 3
+    s.adata.obs["major_cell_type_review_required"] = False
+    s.adata.obs["annotation_review_required"] = (s.adata.obs["leiden"].astype(str) == "3")
+    r = tools.run("harness_audit", s)
+    st = {c["check"]: c["status"] for c in r.summary["checks"]}
+    assert st["flags_lead_to_action"] == "pass"        # Tier-4 flag seen despite the all-False Tier-1 decoy
+    detail = next(c["detail"] for c in r.summary["checks"] if c["check"] == "flags_lead_to_action")
+    assert "annotation_review_required" in detail and "review_required_cells" in detail
+
+
 def test_harness_audit_flags_unreviewed_annotation_column(tmp_path):
     # The exact reliability gap: a fine (Tier-2) annotation exists but was NEVER independently
     # reviewed. Even though broad + malignancy were reviewed, the present-but-unreviewed column
@@ -313,6 +376,70 @@ def test_review_loop_reannotates_refuted_then_converges(tmp_path):
     # the refuted cluster was re-annotated by the ANNOTATOR (not the reviewer) to TypeA
     c1 = s.adata.obs.loc[s.adata.obs["leiden"] == "1", "major_cell_type"].astype(str).unique()
     assert list(c1) == ["TypeA"]
+
+
+# ---------------------------------------------------------------------------
+# Bug E: a FAILED apply_annotation_audit (verdicts NOT recorded) must NOT be read as
+# "reviewed, nothing refuted". run_annotation_critique returns a NON-success status, and
+# run_annotation_review_loop must NOT claim convergence — it surfaces the failure instead,
+# so an unreviewed label is never shipped as clean (defeats the §4 independent-review invariant).
+# ---------------------------------------------------------------------------
+def test_critique_returns_non_success_when_apply_fails(tmp_path):
+    from scpilot.llm.agent import run_annotation_critique
+
+    s = _audit_session(tmp_path)
+    # reviewer OMITS cluster_id on every verdict -> the built verdicts map is empty ->
+    # apply_annotation_audit errors (missing_input). The verdicts were NOT recorded.
+    reviewer = _Fake([
+        _emit("emit_annotation_audit", {"reviewer_model": "rev", "verdicts": [
+            {"status": "confirmed", "review_required": False}]}),
+    ], model="reviewer-model")
+
+    crit = run_annotation_critique(s, reviewer, groupby="leiden", label_key="major_cell_type",
+                                   seed=0, analysis_model="annotator-model")
+    # NOT a success, and NOT a success-looking payload with an empty refuted set
+    assert crit["status"] != "success"
+    assert crit["status"] != "skipped"           # the audit DID run; it's the apply that failed
+    assert "refuted_clusters" not in crit         # never a fake "reviewed, nothing refuted"
+    assert crit.get("error")                       # the failure reason is surfaced
+
+
+def test_review_loop_does_not_converge_when_apply_fails(tmp_path):
+    from scpilot.llm.agent import run_annotation_review_loop
+
+    s = _audit_session(tmp_path)
+    reviewer = _Fake([
+        _emit("emit_annotation_audit", {"reviewer_model": "rev", "verdicts": [
+            {"status": "confirmed", "review_required": False}]}),
+    ], model="reviewer-model")
+    annotator = _Fake([], model="annotator-model")   # never reached — the round fails first
+
+    res = run_annotation_review_loop(s, annotator, reviewer, groupby="leiden",
+                                     label_key="major_cell_type", max_rounds=3, seed=0)
+    # the loop must NOT declare the annotation clean on a failed review round
+    assert res.get("converged") is not True
+    assert res["status"] != "completed"           # a real failure, not a silent "completed"
+    assert res["status"] != "skipped"
+    assert res.get("reason")                       # the failure reason is surfaced
+
+
+def test_review_loop_converges_on_clean_successful_review(tmp_path):
+    # Happy path (UNCHANGED): a SUCCESSFUL review that genuinely finds 0 refuted -> converged=True.
+    from scpilot.llm.agent import run_annotation_review_loop
+
+    s = _audit_session(tmp_path)
+    reviewer = _Fake([
+        _emit("emit_annotation_audit", {"reviewer_model": "rev", "verdicts": [
+            {"cluster_id": c, "status": "confirmed", "review_required": False}
+            for c in ["0", "1", "2", "3"]]}),
+    ], model="reviewer-model")
+    annotator = _Fake([], model="annotator-model")   # not reached — nothing refuted
+
+    res = run_annotation_review_loop(s, annotator, reviewer, groupby="leiden",
+                                     label_key="major_cell_type", max_rounds=3, seed=0)
+    assert res["status"] == "completed"
+    assert res["converged"] is True and res["final_refuted"] == []
+    assert res["n_rounds"] == 1
 
 
 def test_run_agent_reviews_after_broad_annotation(tmp_path):

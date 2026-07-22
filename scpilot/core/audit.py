@@ -166,6 +166,11 @@ def annotation_audit(session, *, groupby: str = "leiden", label_key: str = "majo
     malig_c, cnvst_c = _col(malignancy_key), _col(cnv_status_key)
     has_cnv_score = cnv_score_key in adata.obs.columns
     cnv_score = adata.obs[cnv_score_key].astype(float) if has_cnv_score else None
+    # data-derived population baseline (NOT a hardcoded biological cutoff): a malignant cluster is
+    # expected to carry CNV burden ELEVATED above the population; the median across all cells is a
+    # majority-normal reference, so a malignant label whose per-cluster burden sits at/below it is
+    # contradictory evidence to surface for the reviewer (check 7, low-burden case).
+    cnv_burden_baseline = round(float(np.median(cnv_score.values)), 4) if has_cnv_score else None
 
     def _mode(series, mask):
         vc = series[mask].value_counts()
@@ -249,10 +254,13 @@ def annotation_audit(session, *, groupby: str = "leiden", label_key: str = "majo
         if qc.get("median_pct_mt", 0.0) > max_pct_mt:
             flags.append("high_mt")                       # check 6
         if is_malignant and not has_cnv_score:
-            flags.append("malignant_without_cnv")         # check 7
-        elif is_malignant and cnv_burden is not None and cnvst_c is None and malig_c is not None:
-            # malignant called but no cnv_status track — surface burden for the reviewer
-            pass
+            flags.append("malignant_without_cnv")          # check 7: no CNV track at all — cannot verify
+        elif (is_malignant and cnv_burden is not None and cnv_burden_baseline is not None
+              and cnv_burden <= cnv_burden_baseline):
+            # check 7 (low-burden case): CNV track EXISTS but this malignant cluster's per-cluster burden
+            # is NOT elevated above the population baseline — advisory contradictory evidence (the reviewer
+            # confirms/refutes; not a hardcoded biological call).
+            flags.append("malignant_low_cnv_burden")
 
         status = "flagged" if flags else "clean"
         status_counts[status] += 1
@@ -330,6 +338,7 @@ def annotation_audit(session, *, groupby: str = "leiden", label_key: str = "majo
         "checks": ["marker_profile_collision", "label_marker_support", "hierarchy_triple",
                    "single_patient", "batch_specific", "doublet_stress_qc", "malignancy_without_cnv"],
         "marker_criteria": marker_criteria,   # pct/logFC/p-value bar each claimed marker is checked against
+        "cnv_burden_baseline": cnv_burden_baseline,   # data-derived reference for the low-burden malignancy check
         "marker_db_used": False, "verdict_vocabulary": list(AUDIT_STATUS),
         "granularity": granularity,           # resolution-feedback evidence (reviewer decides)
         "clusters": per_cluster,
@@ -347,6 +356,8 @@ def annotation_audit(session, *, groupby: str = "leiden", label_key: str = "majo
         "status_counts": status_counts,
         "n_marker_profile_collisions": len(collisions),
         "n_malignant_without_cnv": sum(1 for c in per_cluster if "malignant_without_cnv" in c["flags"]),
+        "n_malignant_low_cnv_burden": sum(1 for c in per_cluster if "malignant_low_cnv_burden" in c["flags"]),
+        "cnv_burden_baseline": cnv_burden_baseline,
         "granularity": granularity,   # resolution-feedback evidence; reviewer recommends raise/lower/none
         "audit_input": str(json_path),
         "reviewer_action": "critique each flagged label AND assess granularity (recommend a resolution "
@@ -422,13 +433,17 @@ def harness_audit(session, *, label_key: str = "major_cell_type", **params) -> S
                     else "unknown")
     chk("tier4_reviewer_independence", not degraded_cols,
         f"independence={independence}, by_column={independence_by_col}, degraded={degraded_cols}", sev="warn")
-    # 3) FLAGS → ACTION: every refuted/suspect cluster is surfaced + review_required set on cells
+    # 3) FLAGS → ACTION: every refuted/suspect cluster is surfaced + review_required set on cells.
+    # OR across ALL '*review_required' columns (any tier's flag counts): picking only the FIRST such
+    # column by insertion order would typically hit a Tier-1 column (e.g. major_cell_type_review_required)
+    # and miss the Tier-4 apply_annotation_audit column (annotation_review_required), yielding a false warn.
     ref = list(t4.get("refuted_clusters", []))   # uns round-trips lists to numpy arrays; len() avoids ambiguous bool
     sus = list(t4.get("suspect_clusters", []))
-    rr_col = next((c for c in adata.obs.columns if str(c).endswith("review_required")), None)
-    n_rr = int(adata.obs[rr_col].sum()) if rr_col else 0
+    rr_cols = [c for c in adata.obs.columns if str(c).endswith("review_required")]
+    n_rr = int(adata.obs[rr_cols].astype(bool).any(axis=1).sum()) if rr_cols else 0
     chk("flags_lead_to_action", (len(ref) == 0 and len(sus) == 0) or (n_rr > 0),
-        f"refuted={ref}, suspect={sus}, review_required_cells={n_rr}", sev="warn")
+        f"refuted={ref}, suspect={sus}, review_required_columns={rr_cols}, review_required_cells={n_rr}",
+        sev="warn")
     # 4) QC-artifact clusters get an explicit artifact label (not a biological cell type)
     lbls = set(adata.obs[label_key].astype(str).unique()) if label_key in adata.obs.columns else set()
     art_labeled = bool(lbls & {"Low_quality", "Doublet", "Doublet_Mixed", "Mixed/Artifact"})

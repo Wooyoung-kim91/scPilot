@@ -231,6 +231,14 @@ CANONICAL FLOW (skip steps already satisfied per detect_state; stop when the goa
    d. RE-ESTABLISH the final Tier-1 on the chosen reduction: cluster_sweep -> cluster(use_rep=<best>)
       -> markers -> annotation_review -> apply_annotation(key=major_cell_type) so the canonical
       major_cell_type is the best-reduction call. State the reduction choice (candidates=ranking).
+   e. CLEAN UP noisy cells BEFORE downstream tiers (opt-in, explicit): drop_noisy_cells(label_key=
+      major_cell_type) SUBSETS the object to REMOVE the QC-artifact-labeled cells (Low_quality /
+      Doublet / Doublet_Mixed / Mixed/Artifact, incl. composite labels like 'Malignant Low_quality')
+      so re-clustering / subtype / CNV / DE below no longer include them. Malignant TUMOUR cells are
+      KEPT (a cell is dropped only for a true QC-artifact label, never merely for being malignant —
+      same keep/drop logic as export_final). This is a real mutating/checkpointed step; call it once
+      here (after Tier-1 is finalized) rather than relying on the end-of-run export_final drop, so
+      downstream steps operate on the cleaned object. It is NEVER automatic — you invoke it.
 8. Subtype / fine annotation (Tier 2) — refine WITHIN each compartment (SAME method as Tier-1):
    a. compartment_plan(groupby=major_cell_type, batch_key, min_cells, min_samples) -> read REAL
       per-compartment counts/coverage + batch-mixing; the floor marks under-powered branches.

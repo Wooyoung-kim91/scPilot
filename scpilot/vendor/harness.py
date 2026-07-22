@@ -72,6 +72,25 @@ def bound_thread_env(n: int | None = None) -> None:
         os.environ.setdefault(var, val)
 
 
+def bound_cache_env() -> None:
+    """``setdefault`` the numba/matplotlib cache-dir env vars (+ mkdir) to a writable path.
+
+    Why: numba-backed packages (scanpy/umap and infercnvpy's njit kernels) fail at import/compile
+    if their cache dir is unusable, e.g. a detached session with an unwritable default.
+
+    Ordering INVARIANT (same as ``bound_thread_env``): this MUST run before the ``forkserver``
+    daemon is warmed, because forkserver-spawned workers inherit the environment captured at warmup
+    time — see ``scpilot/mcp_server.py:main()``. If ``NUMBA_CACHE_DIR`` is set only later (inside
+    ``build_server``→``init_runtime``), the already-warmed forkserver daemon — and thus every
+    infercnvpy CNV worker forked from it — misses it and can hit the numba-cache permission failure
+    this harness exists to prevent. Only a var the user has NOT set is touched (``setdefault``).
+    """
+    os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp/numba_cache")
+    os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib_cache")
+    Path(os.environ["NUMBA_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
+    Path(os.environ["MPLCONFIGDIR"]).mkdir(parents=True, exist_ok=True)
+
+
 def init_runtime() -> None:
     """Idempotent process setup: numba/matplotlib caches + numba njit patch.
 
@@ -81,14 +100,16 @@ def init_runtime() -> None:
     global _RUNTIME_READY
     if _RUNTIME_READY:
         return
-    os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp/numba_cache")
-    os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib_cache")
+    # Cache-dir env (idempotent setdefault). In the MCP server this has already run earlier in
+    # main() — BEFORE forkserver warmup — so workers inherit it; here it covers CLI/other entrypoints.
+    bound_cache_env()
     # Bound BLAS/OpenMP threads for CLI and any non-MCP entrypoint too. In the MCP server this has
     # already run earlier (main(), before forkserver warmup); here it is an idempotent setdefault.
     bound_thread_env()
-    Path(os.environ["NUMBA_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
-    Path(os.environ["MPLCONFIGDIR"]).mkdir(parents=True, exist_ok=True)
 
+    # NOTE: the njit no-cache monkeypatch below affects only THIS (main) process's own numba imports.
+    # Forkserver workers import numba fresh, so the worker-relevant fix is the inherited NUMBA_CACHE_DIR
+    # env (set above / in main() before warmup), which points their cache writes at a writable dir.
     import numba
 
     _orig_njit = numba.njit

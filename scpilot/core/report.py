@@ -314,3 +314,77 @@ def export_final(session, *, label_key: str = "final_annotation",
     return S.success("export_final", summary=summary, artifacts=arts,
                      determinism_grade="A", duration_s=round(time.time() - t0, 3),
                      suggested_next_tools=["report"])
+
+
+# Default QC-artifact labels to drop — MIRRORS export_final's remove_labels so the explicit
+# post-Tier-1 cleanup and the final export use the same removal semantics (single source of truth
+# for what "noisy" means). Malignant tumour cells are NOT in this set: a cell is dropped only for a
+# true QC-artifact label, never merely for being malignant.
+_QC_ARTIFACT_LABELS = ["Low_quality", "Doublet", "Doublet_Mixed", "Mixed/Artifact"]
+
+
+@register("drop_noisy_cells", mutating=True,
+          description="Explicit post-Tier-1 cleanup: SUBSET the object to REMOVE QC-artifact-labeled cells "
+                      "(Low_quality / Doublet / Doublet_Mixed / Mixed/Artifact, incl. composite labels like "
+                      "'Malignant Low_quality') so downstream re-clustering / subtype / CNV / DE no longer "
+                      "carry noisy cells. Malignant TUMOUR cells are KEPT — a cell is dropped ONLY for a true "
+                      "QC-artifact label, never merely for being malignant (same keep/drop logic as export_final). "
+                      "Mutating: subsets adata + checkpoints (counts layer stays consistent). OPT-IN — call after "
+                      "apply_annotation / finalize_annotation and BEFORE downstream steps; it is never automatic.")
+def drop_noisy_cells(session, *, label_key: str | None = None,
+                     remove_labels: list | None = None, **params) -> S.ToolResult:
+    """Remove QC-artifact-labeled cells after Tier-1 annotation (keeps malignant tumour cells).
+
+    Mirrors ``export_final``'s drop logic exactly (label set + composite-label catch + the
+    ``major_cell_type`` cross-check), but as a real MUTATING pipeline step that subsets + checkpoints
+    so downstream tools operate on the cleaned object.
+    """
+    t0 = time.time()
+    adata = session.adata
+
+    # Default to the finalized/major annotation column downstream steps read: prefer final_annotation
+    # (post-finalize) else the broad major_cell_type (post-Tier-1). Never guess a nonexistent column.
+    if label_key is None:
+        label_key = "final_annotation" if "final_annotation" in adata.obs.columns else "major_cell_type"
+    if label_key not in adata.obs.columns:
+        return S.error("drop_noisy_cells", "invalid_state",
+                       f"'{label_key}' not in obs — run annotation first (apply_annotation / "
+                       "finalize_annotation) before dropping noisy cells", recoverable=True,
+                       suggested_next_tools=["apply_annotation", "finalize_annotation"])
+
+    if remove_labels is None:
+        remove_labels = list(_QC_ARTIFACT_LABELS)
+    fa = adata.obs[label_key].astype(str)
+    drop_mask = fa.isin(remove_labels)
+    for lab in remove_labels:                          # also catch 'Malignant Low_quality' etc.
+        drop_mask = drop_mask | fa.str.contains(lab, regex=False)
+    if "major_cell_type" in adata.obs.columns:         # cell flagged artifact in the broad column too
+        drop_mask = drop_mask | adata.obs["major_cell_type"].astype(str).isin(remove_labels)
+
+    removed_counts = {k: int(v) for k, v in fa[drop_mask].value_counts().items() if v}
+    n0 = int(adata.n_obs)
+    n_drop = int(drop_mask.sum())
+
+    if n_drop == 0:
+        # Nothing to drop is a SUCCESS (idempotent) — not an error; make it explicit.
+        return S.success("drop_noisy_cells",
+                         summary={"label_key": label_key, "n_before": n0, "n_after": n0,
+                                  "n_dropped": 0, "removed_by_label": {},
+                                  "remove_labels": list(remove_labels)},
+                         warnings=[f"no QC-artifact-labeled cells found under '{label_key}' — nothing to "
+                                   "drop (n_dropped=0)"],
+                         determinism_grade="A", duration_s=round(time.time() - t0, 3),
+                         suggested_next_tools=["cluster_sweep", "cluster", "markers"])
+
+    adata._inplace_subset_obs(~drop_mask.values)
+    # invariants are enforced centrally in session.checkpoint() — no per-tool call.
+    summary = {
+        "label_key": label_key, "n_before": n0, "n_after": int(adata.n_obs),
+        "n_dropped": n0 - int(adata.n_obs), "removed_by_label": removed_counts,
+        "remove_labels": list(remove_labels),
+    }
+    cp = session.checkpoint("drop_noisy_cells", x_state=session.manifest.x_state,
+                            params={"label_key": label_key, "remove_labels": list(remove_labels)})
+    return S.success("drop_noisy_cells", summary=summary, checkpoint=cp.path,
+                     determinism_grade="A", duration_s=round(time.time() - t0, 3),
+                     suggested_next_tools=["cluster_sweep", "cluster", "markers"])

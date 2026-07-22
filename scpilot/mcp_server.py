@@ -42,6 +42,21 @@ def _grace_seconds() -> float:
         return 25.0
 
 
+def _max_retained_jobs() -> int:
+    """Cap on retained FINISHED (succeeded|failed|cancelled) jobs before LRU eviction (Bug C).
+
+    Every ``long_running`` call — even ones that finish inline within the grace window — creates a
+    ``_Job`` holding the full result dict, and nothing ever evicted them, so a long-lived server
+    leaked memory unboundedly. We keep only the most-recent N finished jobs (insertion-order
+    eviction); RUNNING jobs are never counted or evicted. Job state is process-local (not part of
+    the reproducible recipe), so eviction is safe. Env-configurable via
+    ``SCPILOT_MCP_MAX_RETAINED_JOBS`` (default 64)."""
+    try:
+        return max(1, int(os.environ.get("SCPILOT_MCP_MAX_RETAINED_JOBS", "64")))
+    except ValueError:
+        return 64
+
+
 class _Job:
     """One long-running tool invocation. State: running → succeeded | failed | cancelled."""
 
@@ -64,16 +79,31 @@ class _Job:
 class _JobRegistry:
     """In-process registry of long-running jobs, keyed by job_id (thread-safe)."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_retained: int | None = None) -> None:
         self._jobs: dict[str, _Job] = {}
         self._lock = threading.Lock()
         self._counter = itertools.count(1)
+        # Bug C: bound retained FINISHED jobs (LRU/insertion-order eviction); never a RUNNING job.
+        self._max_retained = max_retained if max_retained is not None else _max_retained_jobs()
 
     def create(self, tool: str) -> _Job:
         with self._lock:
             job = _Job(f"job-{next(self._counter)}", tool)
             self._jobs[job.job_id] = job
+            self._evict_locked()
             return job
+
+    def _evict_locked(self) -> None:
+        """Evict oldest FINISHED jobs beyond the retention cap (call under ``self._lock``).
+
+        A job is 'finished' iff its ``done`` event is set (succeeded|failed|cancelled) — a RUNNING
+        job never has ``done`` set, so it is never evicted (its body is still using its result slot
+        and cancel_job must still find it). ``dict`` preserves insertion order, so slicing the
+        finished ids from the front drops the least-recently-created ones first."""
+        finished = [jid for jid, j in self._jobs.items() if j.done.is_set()]
+        excess = len(finished) - self._max_retained
+        for jid in finished[:excess] if excess > 0 else ():
+            del self._jobs[jid]
 
     def get(self, job_id: str) -> _Job | None:
         with self._lock:
@@ -175,15 +205,33 @@ def build_server():
     # the pipeline. The full canonical flow is fetchable via prompt/resource/tool below.
     mcp = FastMCP("scpilot", instructions=prompts.MCP_INSTRUCTIONS)
 
-    def _run_blocking(name: str, input: str, workdir: str, params: dict | None, seed: int) -> dict:
+    def _run_blocking(name: str, input: str, workdir: str, params: dict | None, seed: int,
+                      job: "_Job | None" = None) -> dict:
         """The synchronous tool body — run in a worker thread (see offload comment above).
 
         Acquires `_tool_lock` so it never runs concurrently with any other tool body (inline or
         a background job), preserving the process-global RNG + scanpy-settings invariant. Always
-        returns a dict (structured error on failure), never throws — MCP requires that."""
+        returns a dict (structured error on failure), never throws — MCP requires that.
+
+        Bug B (pre-execution cancel): for a background job that was cancelled WHILE queued on
+        `_tool_lock`, the body must not run at all — no tool call, no `record_tool_run`, so no
+        checkpoint and no run_log entry are committed for a "cancelled" job. The check is the FIRST
+        thing done after acquiring `_tool_lock`, and reads `job.cancel_requested` under `job.lock`,
+        so it cannot race with `cancel_job` (which sets that flag under the same `job.lock`): either
+        cancel wins here (body skipped) or it arrives after the body has started and is handled by
+        the existing post-run cancel path in `_worker`. The inline (non-long) path passes job=None
+        and is unaffected."""
         from scpilot import schemas as S
         from scpilot.repro import set_global_seed
         with _tool_lock:
+            if job is not None:
+                with job.lock:
+                    if job.cancel_requested:
+                        lg.info("job %s cancelled before execution (tool=%s); body NOT run "
+                                "(no checkpoint, no run_log)", job.job_id, name)
+                        return {"status": "cancelled", "job_id": job.job_id, "tool": name,
+                                "message": ("job cancelled before execution; the tool body was "
+                                            "not run (no checkpoint, no run_log entry).")}
             lg.info("tool=%s input=%s seed=%s", name, input, seed)
             params = dict(params or {})
             # optional LLM narration for reasoning_log.md (not a tool param)
@@ -193,6 +241,9 @@ def build_server():
                 set_global_seed(seed)
                 wd = workdir or default_workdir_for_input(input)
                 session = Session.create(wd, input_path=input)
+                # Bug G: cache this step's recipe_hash BEFORE the tool runs so any in-tool
+                # DecisionEvent shares the SAME join key its run-log/outputs record will carry.
+                session.begin_step(params=params, seed=seed)
                 result = tools.run(name, session, **params)
                 # result-plot rule + run_log.jsonl + reasoning_log.md via the shared chokepoint
                 # (plan C1): IDENTICAL to the CLI `step` path, so mode-1 runs are fully
@@ -231,7 +282,7 @@ def build_server():
 
             def _worker() -> None:
                 try:
-                    res = _run_blocking(name, input, workdir, params, seed)
+                    res = _run_blocking(name, input, workdir, params, seed, job)
                 except BaseException as exc:  # noqa: BLE001 — a thread must not die silently
                     from scpilot import schemas as S
                     res = S.error(name, "internal", f"{type(exc).__name__}: {exc}").to_dict()
@@ -464,12 +515,16 @@ def _install_cleanup_handlers(cleanup) -> None:
 
 def main() -> None:
     """Entry point for ``scpilot mcp`` — run the stdio server."""
-    # Bound BLAS/OpenMP threads FIRST — before _init_fork_safety warms the forkserver daemon — so
-    # forkserver-spawned infercnvpy workers inherit the cap (the environment is captured at warmup/
-    # fork time). Setting it later would leave the already-warmed daemon, and thus every CNV worker,
-    # on cpu_count() threads and reintroduce the oversubscription runaway.
-    from scpilot.vendor.harness import bound_thread_env
+    # Bound BLAS/OpenMP threads AND pin the numba/matplotlib cache dirs FIRST — before
+    # _init_fork_safety warms the forkserver daemon — so forkserver-spawned infercnvpy CNV workers
+    # inherit BOTH (the environment is captured at warmup/fork time). Setting the thread cap later
+    # would leave the already-warmed daemon, and thus every CNV worker, on cpu_count() threads and
+    # reintroduce the oversubscription runaway; setting NUMBA_CACHE_DIR later (it otherwise lands in
+    # build_server()→init_runtime, AFTER warmup) would leave those same workers without a writable
+    # numba cache and hit the numba-cache permission failure the harness exists to prevent.
+    from scpilot.vendor.harness import bound_cache_env, bound_thread_env
     bound_thread_env()
+    bound_cache_env()
     _init_fork_safety()   # BEFORE build_server()/any thread: forkserver so tool pools are fork-safe
     server = build_server()
     _install_cleanup_handlers(server._scpilot_cleanup)   # reap jobs/pools on disconnect/exit

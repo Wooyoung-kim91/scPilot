@@ -22,6 +22,11 @@ def qc_filter_mask(adata, *, min_genes: int = 200, max_pct_mt: float = 20.0,
     Keeps cells with enough genes (``n_genes_by_counts >= min_genes``) and low mito
     (``pct_counts_mt <= max_pct_mt``); optional total-count floor, doublet-score ceiling
     (cells with no score are kept), and dropping predicted doublets.
+
+    ``drop_predicted_doublets`` removes only cells scrublet actually SCORED as doublets; UNSCORED
+    cells (NaN ``doublet_score`` — sample skipped / scrublet raised) have ``predicted_doublet``
+    False and are KEPT (conservative). The keeping is intentional but NOT screened, so the qc_filter
+    tool surfaces how many kept cells came from unscored samples (it is not a clean bill of health).
     """
     keep = (adata.obs["n_genes_by_counts"] >= min_genes) & (adata.obs["pct_counts_mt"] <= max_pct_mt)
     if min_counts > 0 and "total_counts" in adata.obs:
@@ -285,6 +290,7 @@ def cluster_sweep(adata, *, use_rep: str = "X_pca", res_min: float = 0.1, res_ma
     finally:
         adata.obs.drop(columns=[lkey], errors="ignore", inplace=True)
         adata.uns.pop(nkey, None)
+        adata.uns.pop(lkey, None)      # sc.tl.leiden(key_added=lkey) also writes uns[lkey] (params dict)
         for k in (f"{nkey}_distances", f"{nkey}_connectivities"):
             if k in adata.obsp:
                 del adata.obsp[k]
@@ -317,26 +323,51 @@ def majority_vote(adata, keys, *, min_agreement: float = 0.5, ambiguous_label: s
     import pandas as pd
 
     n_keys = len(keys)
-    cats = pd.unique(np.concatenate([adata.obs[k].astype(str).values for k in keys]))
+    n_obs = int(adata.n_obs)
+    # NaN / empty labels are "no opinion", NOT the literal string "nan": coercing them via
+    # .astype(str) would make "nan" a first-class category that could WIN the vote and be written
+    # as the consensus/harmonized label (and it is not in ARTIFACT_LABELS, so benchmark wouldn't
+    # drop it). We mask such positions as missing (code -1) and shrink the per-cell denominator.
+    _NULLISH = {"nan", "NaN", "None", "<NA>", "NA", ""}
+    str_cols = [adata.obs[k].astype(str).values for k in keys]
+    miss_cols = [
+        (pd.isna(adata.obs[k].values)) | np.isin(sv, list(_NULLISH))
+        for k, sv in zip(keys, str_cols)]
+    # category universe is built from NON-missing labels only, so "nan" never becomes a category.
+    present = ([sv[~m] for sv, m in zip(str_cols, miss_cols)] if n_keys else [])
+    cats = pd.unique(np.concatenate(present)) if present else np.array([], dtype=object)
     codes = np.column_stack([
-        pd.Categorical(adata.obs[k].astype(str).values, categories=cats).codes for k in keys])
+        pd.Categorical(sv, categories=cats).codes for sv in str_cols]) if n_keys \
+        else np.empty((n_obs, 0), dtype=int)
+    for j, m in enumerate(miss_cols):                     # force masked positions to missing (-1)
+        codes[m, j] = -1
+    valid = codes >= 0                                    # (n_obs, k): column j holds a real label
+    n_valid = valid.sum(axis=1)                           # effective denominator per cell
     # I-15: vectorized per-cell majority (was an O(n_obs) Python loop — minutes-to-hours at 5M cells).
     # n_keys is small (# annotation columns being voted, ~2–5), so the (n, k, k) equality tensor is cheap.
-    # freq[i,j] = how many of the k columns share column j's label for cell i.
-    eq = codes[:, :, None] == codes[:, None, :]           # (n_obs, k, k) bool
-    freq = eq.sum(axis=2)                                 # (n_obs, k)
-    mx = freq.max(axis=1)                                 # top label frequency per cell
-    agree = mx / n_keys
-    is_max = freq == mx[:, None]
+    # freq[i,j] = how many of the k columns share column j's (real) label for cell i.
+    eq = (codes[:, :, None] == codes[:, None, :]) & valid[:, :, None]   # (n_obs, k, k) bool
+    freq = eq.sum(axis=2)                                 # (n_obs, k); 0 for missing column j
+    mx = freq.max(axis=1) if n_keys else np.zeros(n_obs, dtype=int)     # top label frequency per cell
+    with np.errstate(invalid="ignore", divide="ignore"):
+        agree = np.where(n_valid > 0, mx / np.maximum(n_valid, 1), 0.0)
+    is_max = (freq == mx[:, None]) & valid                # only real-label columns can win
+    has_winner = is_max.any(axis=1)
     # a UNIQUE winner ⇔ all columns achieving mx carry the SAME label (min==max of their codes)
-    wmin = np.where(is_max, codes, codes.max() + 1).min(axis=1)
-    wmax = np.where(is_max, codes, -1).max(axis=1)
-    win_ok = (wmin == wmax) & (agree > min_agreement)
-    out = np.where(win_ok, cats[wmin], ambiguous_label).astype(object)
+    big = int(codes.max()) + 1 if codes.size else 1
+    wmin = np.where(is_max, codes, big).min(axis=1) if n_keys else np.full(n_obs, big)
+    wmax = np.where(is_max, codes, -1).max(axis=1) if n_keys else np.full(n_obs, -1)
+    win_ok = has_winner & (wmin == wmax) & (agree > min_agreement)
+    if len(cats):
+        out = np.where(win_ok, cats[np.where(win_ok, wmin, 0)], ambiguous_label).astype(object)
+    else:
+        out = np.full(n_obs, ambiguous_label, dtype=object)
     pairwise = {}
     for a in range(n_keys):
         for b in range(a + 1, n_keys):
-            pairwise[f"{keys[a]}__vs__{keys[b]}"] = round(float((codes[:, a] == codes[:, b]).mean()), 3)
+            both = valid[:, a] & valid[:, b]              # concordance over cells both columns labeled
+            conc = float((codes[both, a] == codes[both, b]).mean()) if both.any() else 0.0
+            pairwise[f"{keys[a]}__vs__{keys[b]}"] = round(conc, 3)
     return out, agree, pairwise
 
 

@@ -182,11 +182,26 @@ def qc_metrics(session, *, sample_key: str = "sample_id", mito_prefix: str | Non
     # --- per-sample scrublet ---
     scrublet_skipped = []
     have_sample = sample_key in adata.obs.columns
+    n_doublet_scored = n_doublet_unscored = None
     if run_scrublet and have_sample:
         scores, preds, scrublet_skipped = _per_sample_scrublet(adata, sample_key, seed=seed)
         adata.obs["doublet_score"] = scores
         adata.obs["predicted_doublet"] = preds
-        doublet_rate = float(np.nanmean(preds.astype(float))) if np.isfinite(scores).any() else None
+        # Only cells that were actually SCORED count toward the doublet rate. Unscored cells
+        # (samples skipped for <30 cells, or where scrublet raised) keep predicted_doublet=False
+        # but carry a NaN doublet_score — averaging over them would bias the rate LOW and hide the
+        # gap. So doublet_rate is computed over SCORED cells only and the unscored count is surfaced
+        # (§3: warn, never silent).
+        scored = np.isfinite(scores)
+        n_doublet_scored = int(scored.sum())
+        n_doublet_unscored = int((~scored).sum())
+        doublet_rate = float(preds[scored].mean()) if n_doublet_scored else None
+        if n_doublet_unscored:
+            warnings.append(
+                f"{n_doublet_unscored} cell(s) from {len(scrublet_skipped)} unscored sample(s) were NOT "
+                "doublet-screened (predicted_doublet=False, doublet_score=NaN) and will be KEPT by "
+                "qc_filter(drop_predicted_doublets=True); doublet_rate_overall is computed over the "
+                f"{n_doublet_scored} SCORED cells only")
     else:
         doublet_rate = None
         if run_scrublet and not have_sample:
@@ -246,6 +261,8 @@ def qc_metrics(session, *, sample_key: str = "sample_id", mito_prefix: str | Non
         "suggested_cutoffs": suggested,
         "n_mads": n_mads,
         "doublet_rate_overall": doublet_rate,
+        "n_doublet_scored_cells": n_doublet_scored,
+        "n_doublet_unscored_cells": n_doublet_unscored,
         "mixed_lineage_frac": mixed_frac,
         "scrublet_skipped_samples": scrublet_skipped,
     }
@@ -303,6 +320,22 @@ def qc_filter(session, *, min_genes: int = 200, max_pct_mt: float = 20.0,
                                             "drop_predicted_doublets": drop_predicted_doublets}},
                        suggested_next_tools=["qc_metrics"])
 
+    warnings: list[str] = []
+    # If dropping predicted doublets, make the unscored gap VISIBLE (§3: warn, never silent): cells
+    # with a NaN doublet_score were never screened (their sample was skipped / scrublet raised).
+    # qc_filter_mask KEEPS them (conservative), so report how many kept cells from how many unscored
+    # samples were NOT doublet-screened — a silent False must not read as "screened, clean".
+    if drop_predicted_doublets and "doublet_score" in adata.obs.columns:
+        unscored = adata.obs["doublet_score"].isna()
+        n_unscored = int(unscored.sum())
+        if n_unscored:
+            if sample_key in adata.obs.columns:
+                m = int(adata.obs.loc[unscored.values, sample_key].astype(str).nunique())
+            else:
+                m = 1
+            warnings.append(f"{n_unscored} cell(s) from {m} unscored sample(s) were NOT doublet-screened "
+                            "and are KEPT (drop_predicted_doublets only removes SCORED predicted doublets)")
+
     # per-sample kept/removed (batch-aware reporting)
     per_sample = {}
     if sample_key in adata.obs.columns:
@@ -323,7 +356,6 @@ def qc_filter(session, *, min_genes: int = 200, max_pct_mt: float = 20.0,
                     "drop_predicted_doublets": drop_predicted_doublets},
         "per_sample": per_sample,
     }
-    warnings = []
     empty = [s for s, v in per_sample.items() if v["after"] == 0]
     if empty:
         warnings.append(f"{len(empty)} sample(s) fully removed by cutoffs: {empty[:5]}")
