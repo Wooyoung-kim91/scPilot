@@ -254,3 +254,123 @@ def test_cancel_job_best_effort(tmp_path, fake_tools, monkeypatch):
     time.sleep(1.8)
     again = fns["cancel_job"](job_id)
     assert again["status"] == "cancelled"
+
+
+# --------------------------------------------------------------------------- #
+# Bug B — a job cancelled while queued on _tool_lock does NOT run its body
+# --------------------------------------------------------------------------- #
+def test_cancel_before_execution_skips_body_and_checkpoint(tmp_path, monkeypatch):
+    """A job cancelled WHILE it is still queued on `_tool_lock` (never started its body) must not
+    call the tool and must not record a checkpoint/run_log entry. We hold the lock with a blocker
+    job, queue a victim behind it, cancel the victim, then release the blocker; the victim then
+    acquires the lock, sees cancel_requested, and skips its body entirely."""
+    import threading
+
+    monkeypatch.setenv("SCPILOT_MCP_JOB_GRACE_SECONDS", "0.2")  # both exceed grace -> background
+    from scpilot.mcp_server import build_server
+
+    gate = threading.Event()
+    calls = {"blocker": 0, "victim": 0}
+
+    def _blocker(session, **params):
+        calls["blocker"] += 1
+        gate.wait(5)                      # hold _tool_lock until the test releases it
+        return S.success("blocker", summary={"marker": "ok"})
+
+    def _victim(session, **params):
+        calls["victim"] += 1              # MUST NOT run: cancelled while queued behind blocker
+        return S.success("victim", summary={"marker": "ran"})
+
+    tools.register("blk", long_running=True, description="holds the tool lock")(_blocker)
+    tools.register("vic", long_running=True, description="queued behind the blocker")(_victim)
+    try:
+        fns = _fns(build_server())
+        h5ad = _tiny_h5ad(tmp_path / "in.h5ad")
+
+        # 1) blocker starts and acquires _tool_lock (wait until its body actually entered)
+        rb = anyio.run(fns["blk_tool"], h5ad, str(tmp_path / "wd_b"), None, 0)
+        assert rb["status"] == "running"
+        deadline = time.monotonic() + 5
+        while calls["blocker"] == 0 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert calls["blocker"] == 1                       # blocker holds the lock now
+
+        # 2) victim launches; its worker blocks on _tool_lock (queued behind blocker)
+        victim_wd = tmp_path / "wd_v"
+        rv = anyio.run(fns["vic_tool"], h5ad, str(victim_wd), None, 0)
+        assert rv["status"] == "running"
+        victim_id = rv["job_id"]
+
+        # 3) cancel the victim WHILE it is still queued (before its body ran)
+        assert fns["cancel_job"](victim_id)["status"] == "cancelled"
+
+        # 4) release the blocker; the victim now acquires the lock and must skip its body
+        gate.set()
+
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            if fns["get_job_status"](victim_id)["done"]:
+                break
+            time.sleep(0.05)
+
+        st = fns["get_job_status"](victim_id)
+        assert st["done"] is True and st["state"] == "cancelled"
+        assert calls["victim"] == 0                        # body never ran
+        assert calls["blocker"] == 1
+        # no persisted state for the cancelled-before-start job: Session.create runs only AFTER the
+        # pre-exec check, so the victim's workdir / run_log were never written
+        assert not (victim_wd / "run_log.jsonl").exists()
+        assert fns["get_job_result"](victim_id)["status"] == "cancelled"
+    finally:
+        for n in ("blk", "vic"):
+            tools.REGISTRY.pop(n, None)
+
+
+# --------------------------------------------------------------------------- #
+# Bug C — bounded eviction of retained finished jobs (never a running one)
+# --------------------------------------------------------------------------- #
+def test_registry_evicts_finished_beyond_cap_but_never_running():
+    from scpilot.mcp_server import _JobRegistry
+
+    reg = _JobRegistry(max_retained=3)
+    finished_ids = []
+    for _ in range(6):
+        j = reg.create("t")
+        j.done.set()                      # mark finished so the next create can evict it
+        finished_ids.append(j.job_id)
+
+    running = reg.create("t")             # done NOT set -> must never be evicted
+    remaining = {j.job_id for j in reg.all()}
+
+    kept_finished = [i for i in finished_ids if i in remaining]
+    assert len(kept_finished) <= 3                     # capped
+    assert kept_finished == finished_ids[-3:]          # the most-recent finished are retained
+    assert reg.get(finished_ids[0]) is None            # oldest were purged
+    assert running.job_id in remaining                 # running job survived eviction
+    assert reg.get(running.job_id) is running
+
+
+def test_purged_job_id_returns_unknown(tmp_path, fake_tools, monkeypatch):
+    """A purged (evicted) job id is indistinguishable from a never-seen id: the job tools return
+    the normal structured unknown-id message. Uses the server's REAL registry (the one the job-tool
+    closures actually consult), with a tiny cap so real fast-job creates force an eviction."""
+    monkeypatch.setenv("SCPILOT_MCP_JOB_GRACE_SECONDS", "10")   # generous: fast tool finishes inline
+    monkeypatch.setenv("SCPILOT_MCP_MAX_RETAINED_JOBS", "1")    # keep only the most-recent finished
+    from scpilot.mcp_server import build_server
+
+    srv = build_server()
+    reg = srv._scpilot_jobs                              # the exact registry the handlers use
+    fns = _fns(srv)
+    h5ad = _tiny_h5ad(tmp_path / "in.h5ad")
+
+    # first fast job finishes inline; capture its id before later creates can evict it
+    assert anyio.run(fns["fake_fast_tool"], h5ad, str(tmp_path / "wd0"), None, 0)["status"] == "success"
+    first_id = reg.all()[-1].job_id
+    # two more fast jobs; the create sweeps evict the oldest finished job (cap 1)
+    for i in (1, 2):
+        anyio.run(fns["fake_fast_tool"], h5ad, str(tmp_path / f"wd{i}"), None, 0)
+
+    assert reg.get(first_id) is None                    # the earliest finished job was purged
+    for tool in ("get_job_status", "get_job_result", "cancel_job"):
+        r = fns[tool](first_id)
+        assert r["status"] == "error" and r["error_code"] == "missing_input"

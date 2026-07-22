@@ -42,6 +42,21 @@ def _grace_seconds() -> float:
         return 25.0
 
 
+def _max_retained_jobs() -> int:
+    """Cap on retained FINISHED (succeeded|failed|cancelled) jobs before LRU eviction (Bug C).
+
+    Every ``long_running`` call — even ones that finish inline within the grace window — creates a
+    ``_Job`` holding the full result dict, and nothing ever evicted them, so a long-lived server
+    leaked memory unboundedly. We keep only the most-recent N finished jobs (insertion-order
+    eviction); RUNNING jobs are never counted or evicted. Job state is process-local (not part of
+    the reproducible recipe), so eviction is safe. Env-configurable via
+    ``SCPILOT_MCP_MAX_RETAINED_JOBS`` (default 64)."""
+    try:
+        return max(1, int(os.environ.get("SCPILOT_MCP_MAX_RETAINED_JOBS", "64")))
+    except ValueError:
+        return 64
+
+
 class _Job:
     """One long-running tool invocation. State: running → succeeded | failed | cancelled."""
 
@@ -64,16 +79,31 @@ class _Job:
 class _JobRegistry:
     """In-process registry of long-running jobs, keyed by job_id (thread-safe)."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_retained: int | None = None) -> None:
         self._jobs: dict[str, _Job] = {}
         self._lock = threading.Lock()
         self._counter = itertools.count(1)
+        # Bug C: bound retained FINISHED jobs (LRU/insertion-order eviction); never a RUNNING job.
+        self._max_retained = max_retained if max_retained is not None else _max_retained_jobs()
 
     def create(self, tool: str) -> _Job:
         with self._lock:
             job = _Job(f"job-{next(self._counter)}", tool)
             self._jobs[job.job_id] = job
+            self._evict_locked()
             return job
+
+    def _evict_locked(self) -> None:
+        """Evict oldest FINISHED jobs beyond the retention cap (call under ``self._lock``).
+
+        A job is 'finished' iff its ``done`` event is set (succeeded|failed|cancelled) — a RUNNING
+        job never has ``done`` set, so it is never evicted (its body is still using its result slot
+        and cancel_job must still find it). ``dict`` preserves insertion order, so slicing the
+        finished ids from the front drops the least-recently-created ones first."""
+        finished = [jid for jid, j in self._jobs.items() if j.done.is_set()]
+        excess = len(finished) - self._max_retained
+        for jid in finished[:excess] if excess > 0 else ():
+            del self._jobs[jid]
 
     def get(self, job_id: str) -> _Job | None:
         with self._lock:
@@ -175,15 +205,33 @@ def build_server():
     # the pipeline. The full canonical flow is fetchable via prompt/resource/tool below.
     mcp = FastMCP("scpilot", instructions=prompts.MCP_INSTRUCTIONS)
 
-    def _run_blocking(name: str, input: str, workdir: str, params: dict | None, seed: int) -> dict:
+    def _run_blocking(name: str, input: str, workdir: str, params: dict | None, seed: int,
+                      job: "_Job | None" = None) -> dict:
         """The synchronous tool body — run in a worker thread (see offload comment above).
 
         Acquires `_tool_lock` so it never runs concurrently with any other tool body (inline or
         a background job), preserving the process-global RNG + scanpy-settings invariant. Always
-        returns a dict (structured error on failure), never throws — MCP requires that."""
+        returns a dict (structured error on failure), never throws — MCP requires that.
+
+        Bug B (pre-execution cancel): for a background job that was cancelled WHILE queued on
+        `_tool_lock`, the body must not run at all — no tool call, no `record_tool_run`, so no
+        checkpoint and no run_log entry are committed for a "cancelled" job. The check is the FIRST
+        thing done after acquiring `_tool_lock`, and reads `job.cancel_requested` under `job.lock`,
+        so it cannot race with `cancel_job` (which sets that flag under the same `job.lock`): either
+        cancel wins here (body skipped) or it arrives after the body has started and is handled by
+        the existing post-run cancel path in `_worker`. The inline (non-long) path passes job=None
+        and is unaffected."""
         from scpilot import schemas as S
         from scpilot.repro import set_global_seed
         with _tool_lock:
+            if job is not None:
+                with job.lock:
+                    if job.cancel_requested:
+                        lg.info("job %s cancelled before execution (tool=%s); body NOT run "
+                                "(no checkpoint, no run_log)", job.job_id, name)
+                        return {"status": "cancelled", "job_id": job.job_id, "tool": name,
+                                "message": ("job cancelled before execution; the tool body was "
+                                            "not run (no checkpoint, no run_log entry).")}
             lg.info("tool=%s input=%s seed=%s", name, input, seed)
             params = dict(params or {})
             # optional LLM narration for reasoning_log.md (not a tool param)
@@ -231,7 +279,7 @@ def build_server():
 
             def _worker() -> None:
                 try:
-                    res = _run_blocking(name, input, workdir, params, seed)
+                    res = _run_blocking(name, input, workdir, params, seed, job)
                 except BaseException as exc:  # noqa: BLE001 — a thread must not die silently
                     from scpilot import schemas as S
                     res = S.error(name, "internal", f"{type(exc).__name__}: {exc}").to_dict()
