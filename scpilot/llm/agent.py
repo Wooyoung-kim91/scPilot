@@ -207,6 +207,22 @@ _DECISION_TYPE: dict[str, str] = {
     "integrate_harmony": "integration_method",
 }
 
+# Follow-up #6: LLM-DRIVEN label tools that log their OWN in-tool DecisionEvent (the actual
+# cell-type / subtype / malignancy CALL comes from the model, not a deterministic computation).
+# The agent stamps LLM provenance onto that in-tool event by passing model_id/prompt_version/
+# prompt_hash/temperature INTO the tool call (see _execute_registry_tool). These are deliberately
+# NOT in _DECISION_TYPE — the wrapper must not emit a SECOND event for them (no double-stamping).
+# Deterministic in-tool decisions (consensus_annotation / harmonize_annotations / finalize_annotation)
+# are absent here on purpose: their choice is tool-computed, so their provenance stays None (honest).
+_LLM_LABEL_TOOLS: frozenset[str] = frozenset({
+    "apply_annotation", "apply_fine_annotation", "apply_malignancy",
+})
+
+# Provenance kwargs threaded into the LLM-label tools. Kept OUT of the recorded run-log params /
+# recipe_hash (they are non-replayable provenance, consistent with ①) — injected into the tool
+# CALL only, so the tool stamps them on its DecisionEvent while the replayable recipe stays clean.
+_PROVENANCE_KEYS: tuple[str, ...] = ("model_id", "prompt_version", "prompt_hash", "temperature")
+
 
 @dataclass
 class RunStats:
@@ -373,7 +389,14 @@ def _execute_registry_tool(session, name: str, args: dict, seed: int,
     ``provider``/``system_prompt`` (Improvement ①) supply the decision PROVENANCE stamped on the
     logged DecisionEvent: the resolved model id + temperature from the provider config, and a
     stable hash of the rendered system prompt the model reasoned over. Omitted (e.g. the internal
-    Tier-4 audit calls, which do not emit a _DECISION_TYPE event) leaves provenance unset."""
+    Tier-4 audit calls, which do not emit a _DECISION_TYPE event) leaves provenance unset.
+
+    Follow-up #6: for the LLM-DRIVEN label tools (``_LLM_LABEL_TOOLS`` — apply_annotation /
+    apply_fine_annotation / apply_malignancy) that log their OWN in-tool cell-type/malignancy
+    DecisionEvent, the same provenance is threaded INTO the tool call so that in-tool event carries
+    it. Those tools are NOT in ``_DECISION_TYPE`` (the wrapper emits no second event → no
+    double-stamping); the provenance kwargs are kept out of the recorded run-log params so the
+    replayable recipe stays provenance-free."""
     fixed = (param_overrides or {}).get(name) or {}
     if fixed:
         args = {**args, **fixed}                  # user-fixed params win over the model's choice
@@ -387,8 +410,25 @@ def _execute_registry_tool(session, name: str, args: dict, seed: int,
     problems = validate_params(name, args)
     if problems:
         return S.error(name, "invalid_params", "; ".join(problems), recoverable=True)
+
+    # Follow-up #6: for the LLM-DRIVEN label tools (they log their OWN cell-type/subtype/malignancy
+    # DecisionEvent), thread the SAME provenance ① stamps on orchestrator decisions — WHO decided
+    # (model_id/temperature from the provider) + on WHAT prompt basis (version + hash of the rendered
+    # system prompt). Passed into the tool CALL only (so the tool stamps its in-tool event), NOT into
+    # ``args`` recorded by record_tool_run → the replayable recipe/recipe_hash stays provenance-free.
+    call_kwargs = args
+    if name in _LLM_LABEL_TOOLS and provider is not None:
+        prov = {
+            "model_id": getattr(provider, "model", None),
+            "temperature": getattr(getattr(provider, "config", None), "temperature", None),
+            "prompt_version": prompts.PROMPT_VERSION,
+            "prompt_hash": prompts.prompt_hash(system_prompt) if system_prompt else None,
+        }
+        prov = {k: v for k, v in prov.items() if v is not None}
+        if prov:
+            call_kwargs = {**args, **prov}
     try:
-        result = spec.fn(session, **args)
+        result = spec.fn(session, **call_kwargs)
     except TypeError as exc:                       # unknown kwarg / bad signature → recoverable
         return S.error(name, "invalid_params", f"bad arguments for {name}: {exc}", recoverable=True)
     stats.errors += 0 if result.status == "success" else 1
@@ -761,8 +801,13 @@ def run_annotation_review_loop(session, annotator_provider: Provider, reviewer_p
             apply_args["tissue"] = tissue
         if tier1.get("marker_sets"):    # preserve the recorded marker_sets for the next audit
             apply_args["marker_sets"] = tier1["marker_sets"]
+        # Follow-up #6: the re-annotation is itself an LLM-driven tier1_llm_labels CALL (the
+        # annotator re-inferred these labels) — stamp its provenance too (system == the prompt the
+        # annotator reasoned over above).
         _execute_registry_tool(session, "apply_annotation", apply_args, seed, stats,
-                               rationale=f"re-annotate refuted clusters {sorted(new)} (round {r})")
+                               rationale=f"re-annotate refuted clusters {sorted(new)} (round {r})",
+                               provider=annotator_provider,
+                               system_prompt=prompts.ANNOTATION_REVIEW_PROMPT)
         if finalize_after and "final_annotation" in session.adata.obs.columns:
             _execute_registry_tool(session, "finalize_annotation", {}, seed, stats,
                                    rationale="re-consolidate after re-annotation")

@@ -471,3 +471,76 @@ def test_write_site_populates_provenance_and_recipe_hash_join_key(tmp_path):
     runs = [json.loads(l) for l in s.run_log_path.read_text().splitlines() if l.strip()]
     pre_run = next(r for r in runs if r["tool"] == "preprocess" and r["status"] == "success")
     assert hvg["recipe_hash"] and hvg["recipe_hash"] == pre_run["recipe_hash"]
+
+
+def test_in_tool_llm_label_call_is_provenance_stamped(tmp_path):
+    # Follow-up #6: the highest-value LLM decision — the tier1 cell-type CALL logged from INSIDE
+    # apply_annotation — carries WHO decided + on WHAT prompt basis when routed through the agent,
+    # while a DETERMINISTIC in-tool decision (finalize_annotation) keeps provenance None (honest).
+    from scpilot.llm import prompts
+
+    s = _session(tmp_path)
+    script = [
+        _resp(_tc(1, "preprocess", {"n_top_genes": 80, "n_pcs": 20})),
+        _resp(_tc(2, "cluster", {"resolution": 0.5})),
+        _resp(_tc(3, "apply_annotation",
+                  {"groupby": "leiden", "labels": {"0": "T cell", "1": "Epithelial cell"}})),
+        _resp(_tc(4, "finalize_annotation", {})),
+        LLMResponse(text="done", tool_calls=[], stop_reason="end_turn", usage={}),
+    ]
+    prov = FakeProvider(script)
+    prov.config = ProviderConfig(backend="fake", model="fake-model", temperature=0.0)
+    # review=False → no Tier-4 reviewer provider needed; keeps this test provider-only.
+    run_agent(s, prov, seed=0, max_iters=20, review=False)
+
+    decs = [json.loads(l) for l in s.decisions_path.read_text().splitlines() if l.strip()]
+
+    # LLM-DRIVEN in-tool CALL → provenance stamped (same field values as the ① orchestrator path)
+    call = next(d for d in decs if d["decision_type"] == "tier1_llm_labels")
+    assert call["model_id"] == "fake-model"
+    assert call["prompt_version"] == prompts.PROMPT_VERSION
+    assert call["prompt_hash"] and len(call["prompt_hash"]) == 16
+    assert call["temperature"] == 0.0
+    assert call["schema_version"] == 2
+
+    # DETERMINISTIC in-tool decision → provenance intentionally None (not fabricated)
+    fin = next(d for d in decs if d["decision_type"] == "annotation_finalized")
+    assert fin["model_id"] is None and fin["prompt_hash"] is None
+    assert fin["prompt_version"] is None and fin["temperature"] is None
+
+    # EXACTLY ONE provenance-bearing decision per LLM label call (no double-stamp: apply_annotation
+    # is NOT in _DECISION_TYPE, so the wrapper does not emit a second event for it).
+    assert sum(1 for d in decs if d["decision_type"] == "tier1_llm_labels") == 1
+    stamped_for_apply = [d for d in decs if d.get("stage") == "apply_annotation"
+                         and d.get("model_id") is not None]
+    assert len(stamped_for_apply) == 1
+
+    # provenance is NON-replayable: it must NOT leak into the run-log params / recipe (①'s contract).
+    runs = [json.loads(l) for l in s.run_log_path.read_text().splitlines() if l.strip()]
+    apply_run = next(r for r in runs if r["tool"] == "apply_annotation" and r["status"] == "success")
+    for k in ("model_id", "prompt_version", "prompt_hash", "temperature"):
+        assert k not in apply_run["params"]
+
+    # all decisions (v2 + the deterministic ones) still validate against the frozen schema
+    from scpilot import schemas as S
+    assert all(S.validate_decision(d) == [] for d in decs)
+
+
+def test_direct_in_tool_label_call_leaves_provenance_none(tmp_path):
+    # Follow-up #6: a DIRECT (non-agent) apply_annotation call — mode-1 host / CLI / replay — has no
+    # provider, so the same in-tool tier1_llm_labels event honestly records provenance as None.
+    from scpilot import schemas as S
+    from scpilot.core import annotate
+
+    s = _session(tmp_path)
+    tools.run("preprocess", s, n_top_genes=80, n_pcs=20)
+    tools.run("cluster", s, resolution=0.5)
+    res = annotate.apply_annotation(s, groupby="leiden",
+                                    labels={"0": "T cell", "1": "Epithelial cell"})
+    assert res.status == "success"
+
+    decs = [json.loads(l) for l in s.decisions_path.read_text().splitlines() if l.strip()]
+    call = next(d for d in decs if d["decision_type"] == "tier1_llm_labels")
+    assert call["model_id"] is None and call["prompt_hash"] is None
+    assert call["prompt_version"] is None and call["temperature"] is None
+    assert S.validate_decision(call) == []

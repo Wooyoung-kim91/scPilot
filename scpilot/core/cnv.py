@@ -671,7 +671,10 @@ def _save_cnv_status_plots(session, adata, *, status_key="cnv_status"):
 def apply_malignancy(session, *, groupby: str = "cnv_leiden", labels: dict | None = None,
                      confidence: dict | None = None, review_required: dict | None = None,
                      key: str = "malignancy", method: str = "CNV_marker_expansion_LLM",
-                     unassigned: str = "not_applicable", **params) -> S.ToolResult:
+                     unassigned: str = "not_applicable",
+                     model_id: str | None = None, prompt_version: str | None = None,
+                     prompt_hash: str | None = None, temperature: float | None = None,
+                     **params) -> S.ToolResult:
     t0 = time.time()
     adata = session.adata
     if groupby not in adata.obs.columns:
@@ -719,7 +722,11 @@ def apply_malignancy(session, *, groupby: str = "cnv_leiden", labels: dict | Non
         session.log_decision(S.DecisionEvent(
             decision_type="malignancy_call", choice=lab, candidates=list(MALIGNANCY_VOCAB),
             rationale=f"malignancy call from CNV+marker+expansion evidence (cnv_evidence={has_cnv})",
-            stage="apply_malignancy", params={"groupby": groupby, "key": key}).to_dict())
+            stage="apply_malignancy", params={"groupby": groupby, "key": key},
+            # Follow-up #6: LLM-driven malignant/normal CALL — stamp provenance (agent-injected;
+            # None for direct/deterministic callers).
+            model_id=model_id, prompt_version=prompt_version,
+            prompt_hash=prompt_hash, temperature=temperature).to_dict())
     except Exception:  # noqa: BLE001
         pass
 
