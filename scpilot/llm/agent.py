@@ -360,13 +360,20 @@ def _system_prompt(goal: str | None, tissue: str | None = None,
 
 def _execute_registry_tool(session, name: str, args: dict, seed: int,
                            stats: RunStats, rationale: str = "",
-                           param_overrides: dict | None = None) -> S.ToolResult:
+                           param_overrides: dict | None = None,
+                           provider: "Provider | None" = None,
+                           system_prompt: str | None = None) -> S.ToolResult:
     """Run one registry tool and LOG it (run-log + decision) so replay reproduces it.
 
     ``rationale`` is the model's own prose from the tool-call turn — recorded verbatim
     as the decision rationale (we do NOT fabricate candidates/rationale). ``param_overrides``
     are the user's pre-set FIXED params: ``{tool: {param: value}}`` — they OVERRIDE whatever the
-    model passed for those knobs (human-in-the-loop), while unset params stay model-chosen."""
+    model passed for those knobs (human-in-the-loop), while unset params stay model-chosen.
+
+    ``provider``/``system_prompt`` (Improvement ①) supply the decision PROVENANCE stamped on the
+    logged DecisionEvent: the resolved model id + temperature from the provider config, and a
+    stable hash of the rendered system prompt the model reasoned over. Omitted (e.g. the internal
+    Tier-4 audit calls, which do not emit a _DECISION_TYPE event) leaves provenance unset."""
     fixed = (param_overrides or {}).get(name) or {}
     if fixed:
         args = {**args, **fixed}                  # user-fixed params win over the model's choice
@@ -395,8 +402,10 @@ def _execute_registry_tool(session, name: str, args: dict, seed: int,
     cps = session.manifest.checkpoints
     if len(cps) >= 2 and result.checkpoint:
         in_cp = cps[-2].get("id")
-    session.record_tool_run(result, params=args, seed=seed, input_checkpoint=in_cp,
-                            reasoning=(rationale.strip() or None))
+    # record_tool_run returns the step's recipe_hash — the SAME join key the RunLogRecord/
+    # OutputRecord carry — so the DecisionEvent below can link to this step's exact evidence (①).
+    rh = session.record_tool_run(result, params=args, seed=seed, input_checkpoint=in_cp,
+                                 reasoning=(rationale.strip() or None))
 
     # decision event for consequential choices (frozen schema; powers audit + replay note)
     dtype = _DECISION_TYPE.get(name)
@@ -404,11 +413,18 @@ def _execute_registry_tool(session, name: str, args: dict, seed: int,
         try:
             session.log_decision(S.DecisionEvent(
                 decision_type=dtype, choice=args,
-                # candidates are not enumerated by the model turn-by-turn; record [] rather
-                # than fabricating, and keep the model's actual prose as the rationale.
+                # candidates/alternatives_rejected are not enumerated by the model turn-by-turn;
+                # record [] rather than fabricating, and keep the model's actual prose as the
+                # rationale. (The considered alternatives simply aren't available at this site.)
                 candidates=[], rationale=(rationale.strip() or f"chose params for {name}"),
                 stage=name, params=args,
                 input_summary_ref=in_cp,
+                # Improvement ①: WHO chose + on WHAT basis + join key to the evidence numbers.
+                recipe_hash=rh,
+                model_id=getattr(provider, "model", None),
+                temperature=getattr(getattr(provider, "config", None), "temperature", None),
+                prompt_version=prompts.PROMPT_VERSION,
+                prompt_hash=(prompts.prompt_hash(system_prompt) if system_prompt else None),
             ).to_dict())
             stats.decisions_logged += 1
         except Exception:  # noqa: BLE001 — never let a decision-log issue abort the run
@@ -416,12 +432,19 @@ def _execute_registry_tool(session, name: str, args: dict, seed: int,
     return result
 
 
-def _persist_structured(session, name: str, args: dict, stats: RunStats) -> dict:
+def _persist_structured(session, name: str, args: dict, stats: RunStats,
+                        provider: "Provider | None" = None,
+                        system_prompt: str | None = None) -> dict:
     """Handle the forced-structured-output emit tools (annotation labels / DE design).
 
     These do not mutate the AnnData; they record a first-class decision event (so the
     structured choice is auditable + part of the replayable recipe metadata) and write
     a JSON artifact in the session.
+
+    ``provider``/``system_prompt`` (Improvement ①) stamp the LLM provenance on the event. These
+    emit tools have NO corresponding RunLogRecord (they neither run a registry tool nor
+    checkpoint), so ``recipe_hash`` is intentionally left unset — there is no step-recipe hash to
+    join to; the JSON artifact path in ``params`` is the evidence pointer.
     """
     from pathlib import Path
 
@@ -439,6 +462,11 @@ def _persist_structured(session, name: str, args: dict, stats: RunStats) -> dict
             candidates=[args],
             rationale=f"mode-2 agent emitted structured {kind}",
             stage=name, params={"artifact": str(out)},
+            # Improvement ①: WHO emitted + on WHAT prompt basis (recipe_hash N/A — see docstring).
+            model_id=getattr(provider, "model", None),
+            temperature=getattr(getattr(provider, "config", None), "temperature", None),
+            prompt_version=prompts.PROMPT_VERSION,
+            prompt_hash=(prompts.prompt_hash(system_prompt) if system_prompt else None),
         ).to_dict())
         stats.decisions_logged += 1
     except Exception:  # noqa: BLE001
@@ -530,12 +558,14 @@ def run_agent(session, provider: Provider, *, goal: str | None = None,
                 # everything else on the root parent (see _CHILD_SCOPED_TOOLS).
                 target = active_session if call.name in _CHILD_SCOPED_TOOLS else root_session
                 if call.name in _EMIT_SCHEMAS:
-                    payload = _persist_structured(target, call.name, call.arguments, stats)
+                    payload = _persist_structured(target, call.name, call.arguments, stats,
+                                                  provider=provider, system_prompt=system)
                     content = json.dumps(payload)
                 else:
                     result = _execute_registry_tool(target, call.name, call.arguments,
                                                      seed, stats, rationale=resp.text or "",
-                                                     param_overrides=param_overrides)
+                                                     param_overrides=param_overrides,
+                                                     provider=provider, system_prompt=system)
                     content = json.dumps(result.to_dict(), default=str)
                     # switch the active session as compartments open/close (child-session model)
                     if call.name == "compartment_subset" and result.status == "success":
@@ -587,7 +617,8 @@ def force_structured(session, provider: Provider, *, schema_tool: str,
     if not resp.tool_calls:
         raise RuntimeError(f"model did not emit the forced {schema_tool} object")
     call = resp.tool_calls[0]
-    _persist_structured(session, schema_tool, call.arguments, RunStats())
+    _persist_structured(session, schema_tool, call.arguments, RunStats(),
+                        provider=provider, system_prompt=system)
     return call.arguments
 
 

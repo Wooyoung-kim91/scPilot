@@ -394,3 +394,80 @@ def test_anthropic_prompt_caching_shaping():
     P._mark_last_cache(m2)
     assert m2[-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
     P._mark_last_cache([])   # empty -> no-op, no crash
+
+
+# --------------------------------------------------------------------------- #
+# Improvement ①: LLM decision provenance (schemas + prompt hash + write site)
+# --------------------------------------------------------------------------- #
+def test_decision_event_roundtrips_with_provenance_fields():
+    # a v2 DecisionEvent carrying the new provenance fields serializes + validates cleanly.
+    from scpilot import schemas as S
+
+    ev = S.DecisionEvent(
+        decision_type="hvg_npcs", choice={"n_pcs": 20}, candidates=[],
+        rationale="elbow at 20", model_id="claude-opus-4-8", prompt_version="1.0",
+        prompt_hash="deadbeefcafef00d", temperature=0.0, recipe_hash="0123456789abcdef",
+        alternatives_rejected=[{"n_pcs": 30, "why": "past elbow"}])
+    d = ev.to_dict()
+    assert d["schema_version"] == S.DECISION_SCHEMA_VERSION == 2
+    assert d["model_id"] == "claude-opus-4-8" and d["recipe_hash"] == "0123456789abcdef"
+    assert d["prompt_version"] == "1.0" and d["prompt_hash"] == "deadbeefcafef00d"
+    assert d["temperature"] == 0.0
+    assert d["alternatives_rejected"][0]["n_pcs"] == 30
+    assert S.validate_decision(d) == []
+
+
+def test_old_shape_decision_still_validates_and_loads():
+    # a v1 event (only the frozen required keys, no provenance / schema_version) must still be
+    # accepted so pre-existing decisions.jsonl files keep validating + replaying.
+    from scpilot import schemas as S
+
+    old = {"decision_type": "clustering_resolution", "choice": {"resolution": 0.25},
+           "candidates": [], "rationale": "knee at 0.25"}
+    assert S.validate_decision(old) == []
+    # constructs from the v1 keys with provenance defaulting to None (backward compatible)
+    ev = S.DecisionEvent(**old)
+    assert ev.model_id is None and ev.recipe_hash is None and ev.temperature is None
+    assert ev.schema_version == S.DECISION_SCHEMA_VERSION
+    # a malformed provenance value (wrong type) is the ONLY thing rejected
+    assert "recipe_hash must be a string or null" in S.validate_decision({**old, "recipe_hash": 123})
+
+
+def test_prompt_hash_is_stable_and_deterministic():
+    from scpilot.llm import prompts
+
+    assert prompts.prompt_hash("same text") == prompts.prompt_hash("same text")
+    assert prompts.prompt_hash("a") != prompts.prompt_hash("b")
+    assert isinstance(prompts.PROMPT_VERSION, str) and prompts.PROMPT_VERSION
+    # the orchestration system prompt hashes to a stable 16-char hex key
+    h = prompts.prompt_hash(prompts.ORCHESTRATION_PROMPT)
+    assert len(h) == 16 and all(c in "0123456789abcdef" for c in h)
+
+
+def test_write_site_populates_provenance_and_recipe_hash_join_key(tmp_path):
+    # the mode-2 write site stamps the resolved model id + prompt version/hash + temperature on the
+    # decision event, and its recipe_hash EQUALS the join key of the same step's run-log record.
+    from scpilot.llm import prompts
+
+    s = _session(tmp_path)
+    script = [
+        _resp(_tc(1, "preprocess", {"n_top_genes": 80, "n_pcs": 20})),
+        LLMResponse(text="done", tool_calls=[], stop_reason="end_turn", usage={}),
+    ]
+    # temperature flows from the provider config (provider.py resolution) onto the event
+    prov = FakeProvider(script)
+    prov.config = ProviderConfig(backend="fake", model="fake-model", temperature=0.0)
+    run_agent(s, prov, seed=0, max_iters=20, review=False)
+
+    decs = [json.loads(l) for l in s.decisions_path.read_text().splitlines() if l.strip()]
+    hvg = next(d for d in decs if d["decision_type"] == "hvg_npcs")
+    assert hvg["model_id"] == "fake-model"
+    assert hvg["prompt_version"] == prompts.PROMPT_VERSION
+    assert hvg["prompt_hash"] and len(hvg["prompt_hash"]) == 16
+    assert hvg["temperature"] == 0.0
+    assert hvg["schema_version"] == 2
+
+    # recipe_hash is the SAME value the preprocess run-log record carries (the evidence join key)
+    runs = [json.loads(l) for l in s.run_log_path.read_text().splitlines() if l.strip()]
+    pre_run = next(r for r in runs if r["tool"] == "preprocess" and r["status"] == "success")
+    assert hvg["recipe_hash"] and hvg["recipe_hash"] == pre_run["recipe_hash"]

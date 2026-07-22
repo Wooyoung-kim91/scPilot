@@ -818,9 +818,13 @@ class Session:
     def record_run(self, result, *, params: dict | None = None, seed: int | None = None,
                    input_checkpoint: str | None = None, lib_versions: dict | None = None,
                    stage: str | None = None, reasoning: str | None = None,
-                   compute_recipe_hash: bool = True) -> None:
+                   compute_recipe_hash: bool = True) -> str | None:
         """Build a FULLY-populated RunLogRecord from a ToolResult and append it, then bind
         the step's OUTPUTS + reasoning to ``outputs.jsonl`` and regenerate the repro pipeline.
+
+        Returns the computed ``recipe_hash`` (or ``None``) so a caller can attach the SAME
+        join key to a related DecisionEvent (Improvement ①) — the RunLogRecord/OutputRecord
+        for this step already carry it.
 
         The single run-logging chokepoint shared by all four drivers (CLI ``step`` +
         ``run``-report, the MCP handler, the mode-2 agent) so their records can no
@@ -884,10 +888,11 @@ class Session:
             self.save()
         except Exception:  # noqa: BLE001 — repro-artifact emission must never break the result
             pass
+        return rh
 
     def record_tool_run(self, result, *, params: dict | None = None, seed: int | None = None,
                         input_checkpoint: str | None = None, lib_versions: dict | None = None,
-                        reasoning: str | None = None, attach_plots: bool = True) -> None:
+                        reasoning: str | None = None, attach_plots: bool = True) -> str | None:
         """Full per-step record for the human-facing drivers (CLI ``step`` + MCP handler):
         attach a stage-appropriate auto-plot, append the run-log record, and write the
         Markdown reasoning entry — all in one place so ``step`` and MCP stay identical.
@@ -906,8 +911,8 @@ class Session:
             except Exception:  # noqa: BLE001 — a missing plot must never break the step
                 pass
         # record_run binds artifacts(+sha) + reasoning to outputs.jsonl and regenerates the pipeline
-        self.record_run(result, params=params, seed=seed, input_checkpoint=input_checkpoint,
-                        lib_versions=lib_versions, reasoning=reasoning)
+        rh = self.record_run(result, params=params, seed=seed, input_checkpoint=input_checkpoint,
+                             lib_versions=lib_versions, reasoning=reasoning)
         try:
             plot_paths = [a.path for a in (result.artifacts or [])
                           if getattr(a, "kind", None) == "png"]
@@ -916,6 +921,7 @@ class Session:
                                checkpoint=result.checkpoint, plots=plot_paths)
         except Exception:  # noqa: BLE001 — logging must never break the result
             pass
+        return rh   # Improvement ①: the recipe_hash join key for a related DecisionEvent
 
     def log_consistency(self) -> dict:
         """run_log ↔ outputs.jsonl coupling check (C-2): every logged run should have one
